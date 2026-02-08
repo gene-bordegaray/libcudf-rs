@@ -3,12 +3,13 @@ use crate::data_type::cudf_type_to_arrow;
 use crate::{slice_column, CuDFError};
 use arrow::array::{Array, ArrayData, ArrayRef};
 use arrow::buffer::NullBuffer;
+use arrow::compute::is_null;
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow_schema::DataType;
 use cxx::UniquePtr;
 use std::any::Any;
 use std::fmt::{Debug, Formatter};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// A view into a cuDF column stored in GPU memory
 ///
@@ -23,6 +24,7 @@ pub struct CuDFColumnView {
     pub(crate) _ref: Option<Arc<dyn CuDFRef>>,
     inner: UniquePtr<libcudf_sys::ffi::ColumnView>,
     dt: DataType,
+    null_buf: OnceLock<Option<NullBuffer>>,
 }
 
 impl CuDFColumnView {
@@ -36,7 +38,12 @@ impl CuDFColumnView {
         let cudf_dtype = inner.data_type();
         let dt = cudf_type_to_arrow(&cudf_dtype);
         let dt = dt.unwrap_or(DataType::Null);
-        Self { _ref, inner, dt }
+        Self {
+            _ref,
+            inner,
+            dt,
+            null_buf: OnceLock::new(),
+        }
     }
 
     pub(crate) fn inner(&self) -> &UniquePtr<libcudf_sys::ffi::ColumnView> {
@@ -107,6 +114,7 @@ impl Clone for CuDFColumnView {
             _ref: self._ref.clone(),
             inner: cloned_inner,
             dt: self.dt.clone(),
+            null_buf: self.null_buf.clone(),
         }
     }
 }
@@ -128,11 +136,13 @@ impl Array for CuDFColumnView {
     }
 
     fn to_data(&self) -> ArrayData {
-        ArrayData::new_empty(&self.dt)
+        self.to_arrow_host()
+            .expect("Failed to convert GPU column to host Arrow")
+            .to_data()
     }
 
     fn into_data(self) -> ArrayData {
-        ArrayData::new_empty(&self.dt)
+        self.to_data()
     }
 
     fn data_type(&self) -> &DataType {
@@ -152,31 +162,61 @@ impl Array for CuDFColumnView {
     }
 
     fn offset(&self) -> usize {
-        todo!()
+        self.inner.offset()
     }
 
     fn nulls(&self) -> Option<&NullBuffer> {
-        todo!()
+        // TODO: This should use FFI to transfer ONLY the null bitmap from GPU,
+        // not the entire column data.
+        // Add column_view_get_null_buffer() to libcudf-sys and call it here.
+        self.null_buf
+            .get_or_init(|| {
+                if self.null_count() == 0 {
+                    return None;
+                }
+                let array_data = self.to_data();
+                array_data.nulls().cloned()
+            })
+            .as_ref()
     }
 
     fn get_buffer_memory_size(&self) -> usize {
-        todo!()
+        // TODO: This should use FFI to query cuDF metadata directly instead of
+        // transferring all data from GPU to CPU (no allocation)
+        // Add column_view_get_buffer_memory_size() to libcudf-sys and call it here.
+        let data = self.to_data();
+        data.buffers().iter().map(|b| b.len()).sum()
     }
 
     fn get_array_memory_size(&self) -> usize {
-        todo!()
+        // TODO: This should use FFI to query cuDF metadata directly instead of
+        // transferring all data from GPU to CPU (no allocation).
+        // Add column_view_get_array_memory_size() to libcudf-sys and call it here.
+        let data = self.to_data();
+        let buffer_size: usize = data.buffers().iter().map(|b| b.len()).sum();
+        let null_size = data.nulls().map(|n| n.buffer().len()).unwrap_or(0);
+        let child_size: usize = (0..data.num_children())
+            .filter_map(|i| data.child_data().get(i))
+            .map(|child| child.get_array_memory_size())
+            .sum();
+        buffer_size + null_size + child_size
     }
 
     fn logical_nulls(&self) -> Option<NullBuffer> {
-        todo!()
+        // TODO: For now only primitive types are supported
+        // In this case logical_nulls == physical_nulls
+        self.nulls().cloned()
     }
 
-    fn is_null(&self, _index: usize) -> bool {
-        todo!()
+    fn is_null(&self, index: usize) -> bool {
+        match self.nulls() {
+            Some(nulls) => nulls.is_null(index),
+            None => false,
+        }
     }
 
-    fn is_valid(&self, _index: usize) -> bool {
-        todo!()
+    fn is_valid(&self, index: usize) -> bool {
+        !self.is_null(index)
     }
 
     fn null_count(&self) -> usize {
@@ -184,11 +224,14 @@ impl Array for CuDFColumnView {
     }
 
     fn logical_null_count(&self) -> usize {
-        todo!()
+        // TODO: For now only primitive types are supported
+        // In this case logical_null_count == physical_null_count
+        self.null_count()
     }
 
     fn is_nullable(&self) -> bool {
-        todo!()
+        // All cuDF columns can potentially have nulls
+        true
     }
 }
 
