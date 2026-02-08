@@ -187,6 +187,18 @@ pub mod ffi {
         /// Get the number of null values in the column
         fn null_count(self: &ColumnView) -> i32;
 
+        /// Get buffer memory size (data + offsets, no null mask)
+        fn get_buffer_memory_size(self: &ColumnView) -> usize;
+
+        /// Get total array memory size (data + offsets + null mask + children)
+        fn get_array_memory_size(self: &ColumnView) -> usize;
+
+        /// Transfer the null buffer
+        fn get_null_buffer(self: &ColumnView) -> Vec<u8>;
+
+        /// Get null buffer size
+        fn get_null_buffer_size(self: &ColumnView) -> usize;
+
         // DataType methods
         /// Get the type_id
         fn id(self: &DataType) -> i32;

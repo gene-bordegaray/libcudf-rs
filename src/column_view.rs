@@ -2,8 +2,7 @@ use crate::cudf_reference::CuDFRef;
 use crate::data_type::cudf_type_to_arrow;
 use crate::{slice_column, CuDFError};
 use arrow::array::{Array, ArrayData, ArrayRef};
-use arrow::buffer::NullBuffer;
-use arrow::compute::is_null;
+use arrow::buffer::{BooleanBuffer, Buffer, NullBuffer};
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow_schema::DataType;
 use cxx::UniquePtr;
@@ -162,44 +161,33 @@ impl Array for CuDFColumnView {
     }
 
     fn offset(&self) -> usize {
-        self.inner.offset()
+        self.inner.offset() as usize
     }
 
     fn nulls(&self) -> Option<&NullBuffer> {
-        // TODO: This should use FFI to transfer ONLY the null bitmap from GPU,
-        // not the entire column data.
-        // Add column_view_get_null_buffer() to libcudf-sys and call it here.
         self.null_buf
             .get_or_init(|| {
                 if self.null_count() == 0 {
                     return None;
                 }
-                let array_data = self.to_data();
-                array_data.nulls().cloned()
+
+                let null_bytes = self.inner().get_null_buffer();
+                let offset = self.inner().offset() as usize;
+                let length = self.inner().size();
+
+                let buffer = Buffer::from_vec(null_bytes);
+                let boolean_buffer = BooleanBuffer::new(buffer, offset, length);
+                Some(NullBuffer::new(boolean_buffer))
             })
             .as_ref()
     }
 
     fn get_buffer_memory_size(&self) -> usize {
-        // TODO: This should use FFI to query cuDF metadata directly instead of
-        // transferring all data from GPU to CPU (no allocation)
-        // Add column_view_get_buffer_memory_size() to libcudf-sys and call it here.
-        let data = self.to_data();
-        data.buffers().iter().map(|b| b.len()).sum()
+        self.inner().get_buffer_memory_size()
     }
 
     fn get_array_memory_size(&self) -> usize {
-        // TODO: This should use FFI to query cuDF metadata directly instead of
-        // transferring all data from GPU to CPU (no allocation).
-        // Add column_view_get_array_memory_size() to libcudf-sys and call it here.
-        let data = self.to_data();
-        let buffer_size: usize = data.buffers().iter().map(|b| b.len()).sum();
-        let null_size = data.nulls().map(|n| n.buffer().len()).unwrap_or(0);
-        let child_size: usize = (0..data.num_children())
-            .filter_map(|i| data.child_data().get(i))
-            .map(|child| child.get_array_memory_size())
-            .sum();
-        buffer_size + null_size + child_size
+        self.inner().get_array_memory_size()
     }
 
     fn logical_nulls(&self) -> Option<NullBuffer> {
