@@ -11,6 +11,10 @@
 namespace libcudf_bridge {
     struct DataType;
 
+    // Helper functions for memory size calculations
+    size_t calculate_buffer_memory_size(const cudf::column_view& view);
+    size_t calculate_array_memory_size(const cudf::column_view& view);
+
     // Opaque wrapper for cuDF column_view
     struct ColumnView {
         std::unique_ptr<cudf::column_view> inner;

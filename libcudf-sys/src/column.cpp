@@ -88,16 +88,9 @@ namespace libcudf_bridge {
         return 0;
     }
 
-    // Get buffer memory size (data + offsets, no null mask)
-    [[nodiscard]] size_t ColumnView::get_buffer_memory_size() const {
-        if (!inner) {
-            return 0;
-        }
-
-        const auto& view = *inner;
-
+    size_t calculate_buffer_memory_size(const cudf::column_view& view) {
         // Calculate size based on data type
-        size_t data_size = cudf::size_of(view.type()) *view.size();
+        size_t data_size = cudf::size_of(view.type()) * view.size();
 
         // For strings add offset buffer size
         if (view.type().id() == cudf::type_id::STRING) {
@@ -106,23 +99,14 @@ namespace libcudf_bridge {
 
         // For nested types recursively add child buffer sizes
         for (cudf::size_type i = 0; i < view.num_children(); ++i) {
-            ColumnView child_wrapper;
-            child_wrapper.inner = std::make_unique<cudf::column_view>(view.child(i));
-            data_size += child_wrapper.get_buffer_memory_size();
+            data_size += calculate_buffer_memory_size(view.child(i));
         }
 
         return data_size;
     }
 
-    // Get total array memory size (data + offsets + null mask + children)
-    [[nodiscard]] size_t ColumnView::get_array_memory_size() const {
-        if (!inner) {
-            return 0;
-        }
-
-        size_t total_size = this->get_buffer_memory_size();
-
-        const auto& view = *inner;
+    size_t calculate_array_memory_size(const cudf::column_view& view) {
+        size_t total_size = calculate_buffer_memory_size(view);
 
         // Add null mask size
         if (view.nullable()) {
@@ -132,10 +116,28 @@ namespace libcudf_bridge {
         // For nested types add child null masks recursively
         for (cudf::size_type i = 0; i < view.num_children(); ++i) {
             auto child = view.child(i);
-            total_size += cudf::bitmask_allocation_size_bytes(child.size());
+            if (child.nullable()) {
+                total_size += cudf::bitmask_allocation_size_bytes(child.size());
+            }
         }
 
         return total_size;
+    }
+
+    // Get buffer memory size (data + offsets, no null mask)
+    [[nodiscard]] size_t ColumnView::get_buffer_memory_size() const {
+        if (!inner) {
+            return 0;
+        }
+        return calculate_buffer_memory_size(*inner);
+    }
+
+    // Get total array memory size (data + offsets + null mask + children)
+    [[nodiscard]] size_t ColumnView::get_array_memory_size() const {
+        if (!inner) {
+            return 0;
+        }
+        return calculate_array_memory_size(*inner);
     }
 
     [[nodiscard]] rust::Vec<uint8_t> ColumnView::get_null_buffer() const {
