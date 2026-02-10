@@ -13,6 +13,7 @@ namespace libcudf_bridge {
 
     // Helper functions for memory size calculations
     size_t calculate_buffer_memory_size(const cudf::column_view& view);
+    size_t calculate_null_mask_size(const cudf::column_view& view);
     size_t calculate_array_memory_size(const cudf::column_view& view);
 
     // Opaque wrapper for cuDF column_view

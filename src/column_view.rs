@@ -135,6 +135,7 @@ impl Array for CuDFColumnView {
     }
 
     fn to_data(&self) -> ArrayData {
+        // WARNING: This performs a full GPU to CPU data transfer.
         self.to_arrow_host()
             .expect("Failed to convert GPU column to host Arrow")
             .to_data()

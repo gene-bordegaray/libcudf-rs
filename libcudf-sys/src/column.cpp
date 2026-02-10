@@ -105,23 +105,22 @@ namespace libcudf_bridge {
         return data_size;
     }
 
-    size_t calculate_array_memory_size(const cudf::column_view& view) {
-        size_t total_size = calculate_buffer_memory_size(view);
+    size_t calculate_null_mask_size(const cudf::column_view& view) {
+        size_t size = 0;
 
-        // Add null mask size
         if (view.nullable()) {
-            total_size += cudf::bitmask_allocation_size_bytes(view.size());
+            size += cudf::bitmask_allocation_size_bytes(view.size());
         }
 
-        // For nested types add child null masks recursively
         for (cudf::size_type i = 0; i < view.num_children(); ++i) {
-            auto child = view.child(i);
-            if (child.nullable()) {
-                total_size += cudf::bitmask_allocation_size_bytes(child.size());
-            }
+            size += calculate_null_mask_size(view.child(i));
         }
 
-        return total_size;
+        return size;
+    }
+
+    size_t calculate_array_memory_size(const cudf::column_view& view) {
+        return calculate_buffer_memory_size(view) + calculate_null_mask_size(view);
     }
 
     // Get buffer memory size (data + offsets, no null mask)
