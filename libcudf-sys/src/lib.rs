@@ -196,9 +196,6 @@ pub mod ffi {
         /// Transfer the null buffer
         fn get_null_buffer(self: &ColumnView) -> Vec<u8>;
 
-        /// Get null buffer size
-        fn get_null_buffer_size(self: &ColumnView) -> usize;
-
         // DataType methods
         /// Get the type_id
         fn id(self: &DataType) -> i32;

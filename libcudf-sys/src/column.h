@@ -52,9 +52,6 @@ namespace libcudf_bridge {
 
         /// Transfer the null buffer
         [[nodiscard]] rust::Vec<uint8_t> get_null_buffer() const;
-
-        /// Get null buffer size in bytes
-        [[nodiscard]] size_t get_null_buffer_size() const;
     };
 
     // Opaque wrapper for cuDF column

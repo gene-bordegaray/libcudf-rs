@@ -172,14 +172,6 @@ namespace libcudf_bridge {
         return host_buffer;
     }
 
-    [[nodiscard]] size_t ColumnView::get_null_buffer_size() const {
-        if (!inner || inner->null_count() == 0) {
-            return 0;
-        }
-
-        return cudf::bitmask_allocation_size_bytes(inner->size());
-    }
-
     // Column implementation
     Column::Column() : inner(nullptr) {
     }
