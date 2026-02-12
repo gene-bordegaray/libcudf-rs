@@ -2,13 +2,13 @@ use crate::cudf_reference::CuDFRef;
 use crate::data_type::cudf_type_to_arrow;
 use crate::{slice_column, CuDFError};
 use arrow::array::{Array, ArrayData, ArrayRef};
-use arrow::buffer::NullBuffer;
+use arrow::buffer::{BooleanBuffer, Buffer, NullBuffer};
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow_schema::DataType;
 use cxx::UniquePtr;
 use std::any::Any;
 use std::fmt::{Debug, Formatter};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// A view into a cuDF column stored in GPU memory
 ///
@@ -23,6 +23,7 @@ pub struct CuDFColumnView {
     pub(crate) _ref: Option<Arc<dyn CuDFRef>>,
     inner: UniquePtr<libcudf_sys::ffi::ColumnView>,
     dt: DataType,
+    null_buf: OnceLock<Option<NullBuffer>>,
 }
 
 impl CuDFColumnView {
@@ -36,7 +37,12 @@ impl CuDFColumnView {
         let cudf_dtype = inner.data_type();
         let dt = cudf_type_to_arrow(&cudf_dtype);
         let dt = dt.unwrap_or(DataType::Null);
-        Self { _ref, inner, dt }
+        Self {
+            _ref,
+            inner,
+            dt,
+            null_buf: OnceLock::new(),
+        }
     }
 
     pub(crate) fn inner(&self) -> &UniquePtr<libcudf_sys::ffi::ColumnView> {
@@ -107,6 +113,7 @@ impl Clone for CuDFColumnView {
             _ref: self._ref.clone(),
             inner: cloned_inner,
             dt: self.dt.clone(),
+            null_buf: self.null_buf.clone(),
         }
     }
 }
@@ -128,11 +135,14 @@ impl Array for CuDFColumnView {
     }
 
     fn to_data(&self) -> ArrayData {
-        ArrayData::new_empty(&self.dt)
+        // WARNING: This performs a full GPU to CPU data transfer.
+        self.to_arrow_host()
+            .expect("Failed to convert GPU column to host Arrow")
+            .to_data()
     }
 
     fn into_data(self) -> ArrayData {
-        ArrayData::new_empty(&self.dt)
+        self.to_data()
     }
 
     fn data_type(&self) -> &DataType {
@@ -152,31 +162,50 @@ impl Array for CuDFColumnView {
     }
 
     fn offset(&self) -> usize {
-        todo!()
+        self.inner.offset() as usize
     }
 
     fn nulls(&self) -> Option<&NullBuffer> {
-        todo!()
+        self.null_buf
+            .get_or_init(|| {
+                if self.null_count() == 0 {
+                    return None;
+                }
+
+                let null_bytes = self.inner().get_null_buffer();
+                let offset = self.inner().offset() as usize;
+                let length = self.inner().size();
+
+                let buffer = Buffer::from_vec(null_bytes);
+                let boolean_buffer = BooleanBuffer::new(buffer, offset, length);
+                Some(NullBuffer::new(boolean_buffer))
+            })
+            .as_ref()
     }
 
     fn get_buffer_memory_size(&self) -> usize {
-        todo!()
+        self.inner().get_buffer_memory_size()
     }
 
     fn get_array_memory_size(&self) -> usize {
-        todo!()
+        self.inner().get_array_memory_size()
     }
 
     fn logical_nulls(&self) -> Option<NullBuffer> {
-        todo!()
+        // TODO: For now only primitive types are supported
+        // In this case logical_nulls == physical_nulls
+        self.nulls().cloned()
     }
 
-    fn is_null(&self, _index: usize) -> bool {
-        todo!()
+    fn is_null(&self, index: usize) -> bool {
+        match self.nulls() {
+            Some(nulls) => nulls.is_null(index),
+            None => false,
+        }
     }
 
-    fn is_valid(&self, _index: usize) -> bool {
-        todo!()
+    fn is_valid(&self, index: usize) -> bool {
+        !self.is_null(index)
     }
 
     fn null_count(&self) -> usize {
@@ -184,11 +213,14 @@ impl Array for CuDFColumnView {
     }
 
     fn logical_null_count(&self) -> usize {
-        todo!()
+        // TODO: For now only primitive types are supported
+        // In this case logical_null_count == physical_null_count
+        self.null_count()
     }
 
     fn is_nullable(&self) -> bool {
-        todo!()
+        // All cuDF columns can potentially have nulls
+        true
     }
 }
 
@@ -280,6 +312,238 @@ mod tests {
             cuda_runtime_sys::cudaMemoryType::cudaMemoryTypeUnregistered => {}
             _ => {
                 panic!("Unexpected memory type: {:?}", attrs.type_);
+            }
+        }
+    }
+
+    #[test]
+    fn test_get_buffer_memory_size_int32() {
+        let array = Int32Array::from(vec![1, 2, 3, 4, 5]);
+        let column = CuDFColumn::from_arrow_host(&array)
+            .expect("Failed to convert Arrow array to column")
+            .into_view();
+
+        let size = column.get_buffer_memory_size();
+        assert_eq!(size, 20, "Int32 column should be 20 bytes");
+    }
+
+    #[test]
+    fn test_get_buffer_memory_size_large() {
+        let data: Vec<i32> = (0..1_000_000).collect();
+        let array = Int32Array::from(data);
+        let column = CuDFColumn::from_arrow_host(&array)
+            .expect("Failed to convert Arrow array to column")
+            .into_view();
+
+        let size = column.get_buffer_memory_size();
+        assert_eq!(size, 4_000_000, "1M Int32 elements should be 4MB");
+    }
+
+    #[test]
+    fn test_get_array_memory_size_no_nulls() {
+        let array = Int32Array::from(vec![1, 2, 3, 4, 5]);
+        let column = CuDFColumn::from_arrow_host(&array)
+            .expect("Failed to convert Arrow array to column")
+            .into_view();
+
+        let buffer_size = column.get_buffer_memory_size();
+        let array_size = column.get_array_memory_size();
+
+        // With no nulls, array_size should equal buffer_size
+        assert_eq!(
+            array_size, buffer_size,
+            "Array size should equal buffer size when no nulls"
+        );
+    }
+
+    #[test]
+    fn test_get_array_memory_size_with_nulls() {
+        let array = Int32Array::from(vec![Some(1), None, Some(3), None, Some(5)]);
+        let column = CuDFColumn::from_arrow_host(&array)
+            .expect("Failed to convert Arrow array to column")
+            .into_view();
+
+        let buffer_size = column.get_buffer_memory_size();
+        let array_size = column.get_array_memory_size();
+
+        // With nulls -> array_size = buffer_size + null_mask_size
+        assert!(
+            array_size > buffer_size,
+            "Array size should be larger than buffer size when nulls present"
+        );
+
+        let null_overhead = array_size - buffer_size;
+        assert!(
+            null_overhead >= 1 && null_overhead <= 128,
+            "Null mask overhead should be between 1 and 128 bytes, got {}",
+            null_overhead
+        );
+    }
+
+    #[test]
+    fn test_nulls_no_nulls_returns_none() {
+        let array = Int32Array::from(vec![1, 2, 3, 4, 5]);
+        let column = CuDFColumn::from_arrow_host(&array)
+            .expect("Failed to convert Arrow array to column")
+            .into_view();
+
+        let nulls = column.nulls();
+        assert!(nulls.is_none(), "Column with no nulls should return None");
+    }
+
+    #[test]
+    fn test_nulls_with_nulls_returns_buffer() {
+        let array = Int32Array::from(vec![Some(1), None, Some(3), None, Some(5)]);
+        let column = CuDFColumn::from_arrow_host(&array)
+            .expect("Failed to convert Arrow array to column")
+            .into_view();
+
+        let nulls = column.nulls();
+        assert!(
+            nulls.is_some(),
+            "Column with nulls should return Some(NullBuffer)"
+        );
+    }
+
+    #[test]
+    fn test_nulls_correct_bit_pattern() {
+        let array = Int32Array::from(vec![Some(10), None, Some(30), None, Some(50)]);
+        let column = CuDFColumn::from_arrow_host(&array)
+            .expect("Failed to convert Arrow array to column")
+            .into_view();
+
+        let nulls = column.nulls().expect("Should have null buffer");
+        assert!(nulls.is_valid(0), "Element 0 should be valid (Some(10))");
+        assert!(nulls.is_null(1), "Element 1 should be null");
+        assert!(nulls.is_valid(2), "Element 2 should be valid (Some(30))");
+        assert!(nulls.is_null(3), "Element 3 should be null");
+        assert!(nulls.is_valid(4), "Element 4 should be valid (Some(50))");
+    }
+
+    #[test]
+    fn test_nulls_cached_same_reference() {
+        let array = Int32Array::from(vec![Some(1), None, Some(3)]);
+        let column = CuDFColumn::from_arrow_host(&array)
+            .expect("Failed to convert Arrow array to column")
+            .into_view();
+
+        let nulls1 = column.nulls();
+        let nulls2 = column.nulls();
+
+        // Should return references to the same cached NullBuffer
+        assert!(nulls1.is_some());
+        assert!(nulls2.is_some());
+
+        let ptr1 = nulls1.unwrap() as *const _;
+        let ptr2 = nulls2.unwrap() as *const _;
+        assert_eq!(
+            ptr1, ptr2,
+            "Subsequent calls should return same cached buffer"
+        );
+    }
+
+    #[test]
+    fn test_is_null_uses_null_buffer() {
+        let array = Int32Array::from(vec![Some(1), None, Some(3), None, Some(5)]);
+        let column = CuDFColumn::from_arrow_host(&array)
+            .expect("Failed to convert Arrow array to column")
+            .into_view();
+
+        assert!(!column.is_null(0), "Index 0 should not be null");
+        assert!(column.is_null(1), "Index 1 should be null");
+        assert!(!column.is_null(2), "Index 2 should not be null");
+        assert!(column.is_null(3), "Index 3 should be null");
+        assert!(!column.is_null(4), "Index 4 should not be null");
+    }
+
+    #[test]
+    fn test_is_valid_inverse_of_is_null() {
+        let array = Int32Array::from(vec![Some(1), None, Some(3)]);
+        let column = CuDFColumn::from_arrow_host(&array)
+            .expect("Failed to convert Arrow array to column")
+            .into_view();
+
+        for i in 0..3 {
+            assert_eq!(
+                column.is_valid(i),
+                !column.is_null(i),
+                "is_valid should be inverse of is_null at index {}",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_null_count_matches_null_buffer() {
+        let array = Int32Array::from(vec![Some(1), None, Some(3), None, Some(5), None]);
+        let column = CuDFColumn::from_arrow_host(&array)
+            .expect("Failed to convert Arrow array to column")
+            .into_view();
+
+        let null_count = column.null_count();
+
+        // Should have 3 nulls (indices 1, 3, 5)
+        assert_eq!(null_count, 3, "Should have 3 nulls");
+
+        let manual_count = (0..column.len()).filter(|&i| column.is_null(i)).count();
+        assert_eq!(
+            null_count, manual_count,
+            "null_count() should match manual count"
+        );
+    }
+
+    #[test]
+    fn test_nulls_with_large_column() {
+        let data: Vec<Option<i32>> = (0..10_000)
+            .map(|i| if i % 2 == 0 { Some(i) } else { None })
+            .collect();
+        let array = Int32Array::from(data);
+        let column = CuDFColumn::from_arrow_host(&array)
+            .expect("Failed to convert Arrow array to column")
+            .into_view();
+
+        let nulls = column.nulls().expect("Should have null buffer");
+
+        // Verify pattern: even indices valid, odd indices null
+        for i in 0..100 {
+            if i % 2 == 0 {
+                assert!(nulls.is_valid(i), "Even index {} should be valid", i);
+            } else {
+                assert!(nulls.is_null(i), "Odd index {} should be null", i);
+            }
+        }
+
+        assert_eq!(column.null_count(), 5_000, "Should have 5,000 nulls");
+    }
+
+    #[test]
+    fn test_logical_nulls_equals_physical_nulls() {
+        // For primitive types, logical_nulls should equal physical nulls
+        let array = Int32Array::from(vec![Some(1), None, Some(3)]);
+        let column = CuDFColumn::from_arrow_host(&array)
+            .expect("Failed to convert Arrow array to column")
+            .into_view();
+
+        let physical = column.nulls();
+        let logical = column.logical_nulls();
+
+        match (physical, logical) {
+            (Some(p), Some(l)) => {
+                // Both should have same null pattern
+                for i in 0..3 {
+                    assert_eq!(
+                        p.is_null(i),
+                        l.is_null(i),
+                        "Physical and logical nulls should match at index {}",
+                        i
+                    );
+                }
+            }
+            (None, None) => {
+                // Both None is valid
+            }
+            _ => {
+                panic!("Physical and logical nulls should both be Some or both None");
             }
         }
     }

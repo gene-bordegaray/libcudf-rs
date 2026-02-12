@@ -187,6 +187,15 @@ pub mod ffi {
         /// Get the number of null values in the column
         fn null_count(self: &ColumnView) -> i32;
 
+        /// Get buffer memory size (data + offsets, no null mask)
+        fn get_buffer_memory_size(self: &ColumnView) -> usize;
+
+        /// Get total array memory size (data + offsets + null mask + children)
+        fn get_array_memory_size(self: &ColumnView) -> usize;
+
+        /// Transfer the null buffer
+        fn get_null_buffer(self: &ColumnView) -> Vec<u8>;
+
         // DataType methods
         /// Get the type_id
         fn id(self: &DataType) -> i32;
@@ -254,10 +263,7 @@ pub mod ffi {
         ///
         /// Reorders the rows of `source_table` according to the indices in `gather_map`.
         /// The resulting table will have the same number of rows as `gather_map` has elements.
-        fn gather(
-            source_table: &TableView,
-            gather_map: &ColumnView,
-        ) -> Result<UniquePtr<Table>>;
+        fn gather(source_table: &TableView, gather_map: &ColumnView) -> Result<UniquePtr<Table>>;
 
         /// Create a sliced view of a column
         ///
@@ -854,12 +860,8 @@ mod tests {
         let col2 = table_view.column(2);
 
         let output_type = ffi::new_data_type(TypeId::Float64 as i32);
-        let result = ffi::binary_operation_col_col(
-            &col1,
-            &col2,
-            BinaryOperator::Add as i32,
-            &output_type,
-        )?;
+        let result =
+            ffi::binary_operation_col_col(&col1, &col2, BinaryOperator::Add as i32, &output_type)?;
 
         assert_eq!(result.size(), col1.size());
         assert_eq!(result.size(), col2.size());
@@ -877,12 +879,8 @@ mod tests {
         let col2 = table_view.column(2);
 
         let output_type = ffi::new_data_type(TypeId::Float64 as i32);
-        let result = ffi::binary_operation_col_col(
-            &col1,
-            &col2,
-            BinaryOperator::Mul as i32,
-            &output_type,
-        )?;
+        let result =
+            ffi::binary_operation_col_col(&col1, &col2, BinaryOperator::Mul as i32, &output_type)?;
 
         assert_eq!(result.size(), col1.size());
         assert_snapshot!(pretty_column(&result.view(), DataType::Float64)?);
