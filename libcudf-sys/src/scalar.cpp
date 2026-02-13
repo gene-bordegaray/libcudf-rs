@@ -13,6 +13,7 @@ namespace libcudf_bridge {
 
     Scalar::~Scalar() = default;
 
+    // Check if the scalar is valid (not null)
     bool Scalar::is_valid() const {
         if (!inner) {
             return false;
@@ -20,6 +21,7 @@ namespace libcudf_bridge {
         return inner->is_valid();
     }
 
+    // Get the data type of the scalar
     [[nodiscard]] std::unique_ptr<DataType> Scalar::data_type() const {
         auto dtype = inner->type();
         auto type_id = static_cast<int32_t>(dtype.id());
@@ -34,6 +36,7 @@ namespace libcudf_bridge {
         }
     }
 
+    // Clone this scalar (deep copy)
     [[nodiscard]] std::unique_ptr<Scalar> Scalar::clone() const {
         auto cloned = std::make_unique<Scalar>();
 
