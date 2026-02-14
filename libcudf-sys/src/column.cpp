@@ -38,7 +38,7 @@ namespace libcudf_bridge {
             throw std::runtime_error("Cannot convert null column view to arrow array");
         }
         auto device_array_unique = cudf::to_arrow_host(*this->inner);
-        auto *out_array = reinterpret_cast<ArrowDeviceArray *>(out_array_ptr);
+        auto *out_array = reinterpret_cast<ArrowDeviceArray*>(out_array_ptr);
         *out_array = *device_array_unique.get();
         device_array_unique.release();
     }

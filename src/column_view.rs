@@ -77,13 +77,7 @@ impl CuDFColumnView {
     /// # Ok::<(), libcudf_rs::CuDFError>(())
     /// ```
     pub fn to_arrow_host(&self) -> Result<ArrayRef, CuDFError> {
-        let mut device_array = libcudf_sys::ArrowDeviceArray {
-            array: FFI_ArrowArray::empty(),
-            device_id: -1,
-            device_type: 1, // CPU
-            sync_event: std::ptr::null_mut(),
-            reserved: [0; 3],
-        };
+        let mut device_array = libcudf_sys::ArrowDeviceArray::new_cpu();
 
         // Create schema from the column's data type
         let ffi_schema = FFI_ArrowSchema::try_from(self.data_type())?;
