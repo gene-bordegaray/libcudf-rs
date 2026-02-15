@@ -3,7 +3,7 @@ use crate::data_type::cudf_type_to_arrow;
 use crate::{slice_column, CuDFError};
 use arrow::array::{Array, ArrayData, ArrayRef};
 use arrow::buffer::{BooleanBuffer, Buffer, NullBuffer};
-use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
+use arrow::ffi::FFI_ArrowSchema;
 use arrow_schema::DataType;
 use cxx::UniquePtr;
 use std::any::Any;
@@ -77,13 +77,7 @@ impl CuDFColumnView {
     /// # Ok::<(), libcudf_rs::CuDFError>(())
     /// ```
     pub fn to_arrow_host(&self) -> Result<ArrayRef, CuDFError> {
-        let mut device_array = libcudf_sys::ArrowDeviceArray {
-            array: FFI_ArrowArray::empty(),
-            device_id: -1,
-            device_type: 1, // CPU
-            sync_event: std::ptr::null_mut(),
-            reserved: [0; 3],
-        };
+        let mut device_array = libcudf_sys::ArrowDeviceArray::new_cpu();
 
         // Create schema from the column's data type
         let ffi_schema = FFI_ArrowSchema::try_from(self.data_type())?;

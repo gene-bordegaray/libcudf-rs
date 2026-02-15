@@ -45,13 +45,13 @@ namespace libcudf_bridge {
         // Returns how many nulls this column has
         [[nodiscard]] int32_t null_count() const;
 
-        /// Get buffer memory size (data + offsets, no null mask)
+        // Get buffer memory size (data + offsets, no null mask)
         [[nodiscard]] size_t get_buffer_memory_size() const;
 
-        /// Get total array memory size (data + offsets + null mask + children)
+        // Get total array memory size (data + offsets + null mask + children)
         [[nodiscard]] size_t get_array_memory_size() const;
 
-        /// Transfer the null buffer
+        // Transfer the null buffer
         [[nodiscard]] rust::Vec<uint8_t> get_null_buffer() const;
     };
 

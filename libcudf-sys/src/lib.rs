@@ -3,6 +3,8 @@
 //! This crate provides unsafe bindings to the cuDF C++ library.
 //! For a safe, idiomatic Rust API, use the `libcudf-rs` crate instead.
 
+use arrow::ffi::FFI_ArrowArray;
+
 #[cxx::bridge(namespace = "libcudf_bridge")]
 pub mod ffi {
     // Opaque C++ types
@@ -204,6 +206,9 @@ pub mod ffi {
         fn scale(self: &DataType) -> i32;
 
         // Scalar methods
+        /// Get the scalar data as an FFI ArrowArray
+        unsafe fn to_arrow_array(self: &Scalar, out_array_ptr: *mut u8);
+
         /// Check if the scalar is valid (not null)
         fn is_valid(self: &Scalar) -> bool;
 
@@ -634,6 +639,105 @@ pub struct ArrowDeviceArray {
     pub sync_event: *mut std::ffi::c_void,
     /// Reserved bytes for future expansion
     pub reserved: [i64; 3],
+}
+
+/// Arrow C Device Data Interface device types
+///
+/// These values correspond to the device types defined in the Arrow C Device
+/// Data Interface specification.
+///
+/// See: <https://arrow.apache.org/docs/format/CDeviceDataInterface.html>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum ArrowDeviceType {
+    Cpu = 1,
+    Cuda = 2,
+    CudaHost = 3,
+    OpenCL = 4,
+    Vulkan = 5,
+    Metal = 6,
+    VulkanHost = 7,
+    OpenCLHost = 8,
+    CudaManaged = 9,
+    OneAPI = 10,
+    WebGPU = 11,
+    Hexagon = 12,
+}
+
+impl ArrowDeviceType {
+    /// Device ID for CPU devices (-1 indicates no specific device)
+    pub const CPU_DEVICE_ID: i64 = -1;
+}
+
+impl From<ArrowDeviceType> for i32 {
+    fn from(dt: ArrowDeviceType) -> i32 {
+        dt as i32
+    }
+}
+
+impl ArrowDeviceArray {
+    /// Create a new CPU-resident ArrowDeviceArray
+    ///
+    /// Initializes an empty array structure for CPU (host) memory.
+    /// The device_id is set to -1 (no specific device) and device_type to CPU.
+    pub fn new_cpu() -> Self {
+        Self {
+            array: arrow::ffi::FFI_ArrowArray::empty(),
+            device_id: ArrowDeviceType::CPU_DEVICE_ID,
+            device_type: ArrowDeviceType::Cpu.into(),
+            sync_event: std::ptr::null_mut(),
+            reserved: [0; 3],
+        }
+    }
+
+    /// Create a new CUDA device ArrowDeviceArray
+    ///
+    /// Initializes an empty array structure for CUDA GPU memory.
+    ///
+    /// # Arguments
+    ///
+    /// * `device_id` - The CUDA device ID (0, 1, 2, etc.)
+    pub fn new_cuda(device_id: i64) -> Self {
+        Self {
+            array: arrow::ffi::FFI_ArrowArray::empty(),
+            device_id,
+            device_type: ArrowDeviceType::Cuda.into(),
+            sync_event: std::ptr::null_mut(),
+            reserved: [0; 3],
+        }
+    }
+
+    /// Sets the array field (builder pattern)
+    ///
+    /// # Arguments
+    ///
+    /// * `array` - The Arrow C FFI array structure
+    pub fn with_array(mut self, array: FFI_ArrowArray) -> Self {
+        self.array = array;
+        self
+    }
+
+    /// Sets the sync event field (builder pattern)
+    ///
+    /// # Arguments
+    ///
+    /// * `sync_event` - Pointer to a synchronization event (e.g., CUDA event)
+    pub fn with_sync_event(mut self, sync_event: *mut std::ffi::c_void) -> Self {
+        self.sync_event = sync_event;
+        self
+    }
+
+    /// Sets the device ID field (builder pattern)
+    ///
+    /// Useful for changing the device ID after initial construction.
+    ///
+    /// # Arguments
+    ///
+    /// * `device_id` - The device ID (-1 for CPU, 0+ for GPU devices)
+    pub fn with_device_id(mut self, device_id: i64) -> Self {
+        self.device_id = device_id;
+        self
+    }
 }
 
 // Thread safety implementations for cuDF types

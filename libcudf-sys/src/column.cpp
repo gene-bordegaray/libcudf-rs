@@ -24,6 +24,7 @@ namespace libcudf_bridge {
 
     ColumnView::~ColumnView() = default;
 
+    // Get number of elements
     size_t ColumnView::size() const {
         if (!inner) {
             return 0;
@@ -31,16 +32,18 @@ namespace libcudf_bridge {
         return inner->size();
     }
 
+    // Get the column's data as an FFI Arrow Array
     void ColumnView::to_arrow_array(uint8_t *out_array_ptr) const {
         if (!inner) {
             throw std::runtime_error("Cannot convert null column view to arrow array");
         }
         auto device_array_unique = cudf::to_arrow_host(*this->inner);
-        auto *out_array = reinterpret_cast<ArrowDeviceArray *>(out_array_ptr);
+        auto *out_array = reinterpret_cast<ArrowDeviceArray*>(out_array_ptr);
         *out_array = *device_array_unique.get();
         device_array_unique.release();
     }
 
+    // Get the raw device pointer to the column view's data
     [[nodiscard]] uint64_t ColumnView::data_ptr() const {
         if (!inner) {
             return 0;
@@ -48,6 +51,7 @@ namespace libcudf_bridge {
         return reinterpret_cast<uint64_t>(inner->head());
     }
 
+    // Get the data type of the column view
     [[nodiscard]] std::unique_ptr<DataType> ColumnView::data_type() const {
         if (!inner) {
             throw std::runtime_error("Cannot get data type of null column view");
@@ -64,6 +68,7 @@ namespace libcudf_bridge {
         return std::make_unique<DataType>(type_id);
     }
 
+    // Clone this column view
     [[nodiscard]] std::unique_ptr<ColumnView> ColumnView::clone() const {
         auto cloned = std::make_unique<ColumnView>();
         if (inner) {
@@ -72,7 +77,7 @@ namespace libcudf_bridge {
         return cloned;
     }
 
-    // Gets the current offset in case this column is a slice of another one
+    // Get the offset of the current ColumnView in case it was a slice of another one
     int32_t ColumnView::offset() const {
         if (!inner) {
             throw std::runtime_error("Cannot offset of null column view");
@@ -88,6 +93,7 @@ namespace libcudf_bridge {
         return 0;
     }
 
+    // Helper functions for memory size calculations
     size_t calculate_buffer_memory_size(const cudf::column_view& view) {
         // Calculate size based on data type
         size_t data_size = cudf::size_of(view.type()) * view.size();
@@ -139,6 +145,7 @@ namespace libcudf_bridge {
         return calculate_array_memory_size(*inner);
     }
 
+    // Transfer the null buffer
     [[nodiscard]] rust::Vec<uint8_t> ColumnView::get_null_buffer() const {
         if (!inner || inner->null_count() == 0) {
             return rust::Vec<uint8_t>();
@@ -177,6 +184,7 @@ namespace libcudf_bridge {
 
     Column::~Column() = default;
 
+    // Get number of elements
     size_t Column::size() const {
         if (!inner) {
             return 0;
@@ -184,6 +192,7 @@ namespace libcudf_bridge {
         return inner->size();
     }
 
+    // Get the column as a read-only view
     [[nodiscard]] std::unique_ptr<ColumnView> Column::view() const {
         if (!inner) {
             throw std::runtime_error("Cannot get view of null column");
@@ -193,6 +202,7 @@ namespace libcudf_bridge {
         return result;
     }
 
+    // Get the data type of the column
     [[nodiscard]] std::unique_ptr<DataType> Column::data_type() const {
         if (!inner) {
             throw std::runtime_error("Cannot get data type of null column");
@@ -209,7 +219,7 @@ namespace libcudf_bridge {
         return std::make_unique<DataType>(type_id);
     }
 
-    // Helper function to create Column from unique_ptr
+    // Helper function to create Column from unique_ptr<cudf::column>
     Column column_from_unique_ptr(std::unique_ptr<cudf::column> col) {
         Column c;
         c.inner = std::move(col);
