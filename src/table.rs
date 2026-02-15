@@ -6,7 +6,7 @@ use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::ArrowError;
 use cxx::UniquePtr;
-use libcudf_sys::{ffi, ArrowDeviceArray, ArrowDeviceType};
+use libcudf_sys::{ffi, ArrowDeviceArray};
 use std::path::Path;
 use std::sync::Arc;
 

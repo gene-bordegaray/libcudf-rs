@@ -3,7 +3,7 @@ use crate::data_type::cudf_type_to_arrow;
 use crate::{slice_column, CuDFError};
 use arrow::array::{Array, ArrayData, ArrayRef};
 use arrow::buffer::{BooleanBuffer, Buffer, NullBuffer};
-use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
+use arrow::ffi::FFI_ArrowSchema;
 use arrow_schema::DataType;
 use cxx::UniquePtr;
 use std::any::Any;
