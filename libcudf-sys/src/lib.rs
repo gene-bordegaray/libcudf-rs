@@ -5,6 +5,16 @@
 
 use arrow::ffi::FFI_ArrowArray;
 
+/// FFI bindings to cuDF C++ library
+///
+/// This is a thin wrapper over cuDF C++ APIs. Safety documentation is provided
+/// at the higher-level `libcudf-rs` wrapper layer where safe APIs are exposed.
+///
+/// The cxx macro generates code that clippy cannot see source documentation for,
+/// so we allow missing_safety_doc here. All safety contracts are documented in:
+/// - The C++ cuDF library headers
+/// - The safe wrapper functions in `libcudf-rs`
+#[allow(clippy::missing_safety_doc)]
 #[cxx::bridge(namespace = "libcudf_bridge")]
 pub mod ffi {
     // Opaque C++ types
@@ -97,6 +107,9 @@ pub mod ffi {
         /// Get the number of columns in the helper
         fn len(self: &ColumnVectorHelper) -> usize;
 
+        /// Check if the helper contains no columns
+        fn is_empty(self: &ColumnVectorHelper) -> bool;
+
         /// Release and take ownership of a column at the specified index
         fn release(self: Pin<&mut ColumnVectorHelper>, index: usize) -> UniquePtr<Column>;
 
@@ -115,6 +128,9 @@ pub mod ffi {
 
         /// Get the number of aggregation requests
         fn len(self: &GroupByResult) -> usize;
+
+        /// Check if there are no aggregation results
+        fn is_empty(self: &GroupByResult) -> bool;
 
         /// Release and take ownership of the aggregation result at the specified index
         fn release_result(
@@ -149,12 +165,24 @@ pub mod ffi {
         fn column(self: &TableView, index: i32) -> UniquePtr<ColumnView>;
 
         /// Get the table view schema as an FFI ArrowSchema
+        ///
+        /// # Safety
+        ///
+        /// `out_schema_ptr` must point to a valid `ArrowSchema`. Caller must release it.
         unsafe fn to_arrow_schema(self: &TableView, out_schema_ptr: *mut u8);
 
         /// Get the table view data as an FFI ArrowArray
+        ///
+        /// # Safety
+        ///
+        /// `out_array_ptr` must point to a valid `ArrowArray`. Caller must release it.
         unsafe fn to_arrow_array(self: &TableView, out_array_ptr: *mut u8);
 
         /// Clone this table view
+        ///
+        /// Note: Cannot implement `Clone` trait due to cxx FFI limitations.
+        /// This creates a deep copy of the view structure (not the underlying data).
+        #[allow(clippy::should_implement_trait)]
         fn clone(self: &TableView) -> UniquePtr<TableView>;
 
         // Column methods
@@ -172,6 +200,10 @@ pub mod ffi {
         fn view(self: &Column) -> UniquePtr<ColumnView>;
 
         /// Get the column view data as an FFI ArrowArray
+        ///
+        /// # Safety
+        ///
+        /// `out_array_ptr` must point to a valid `ArrowArray`. Caller must release it.
         unsafe fn to_arrow_array(self: &ColumnView, out_array_ptr: *mut u8);
 
         /// Get the raw device pointer to the column view's data
@@ -181,6 +213,10 @@ pub mod ffi {
         fn data_type(self: &ColumnView) -> UniquePtr<DataType>;
 
         /// Clone this column view
+        ///
+        /// Note: Cannot implement `Clone` trait due to cxx FFI limitations.
+        /// This creates a deep copy of the view structure (not the underlying data).
+        #[allow(clippy::should_implement_trait)]
         fn clone(self: &ColumnView) -> UniquePtr<ColumnView>;
 
         /// Get the offset of the current ColumnView in case it was a slice of another one
@@ -207,6 +243,10 @@ pub mod ffi {
 
         // Scalar methods
         /// Get the scalar data as an FFI ArrowArray
+        ///
+        /// # Safety
+        ///
+        /// `out_array_ptr` must point to a valid `ArrowArray`. Caller must release it.
         unsafe fn to_arrow_array(self: &Scalar, out_array_ptr: *mut u8);
 
         /// Check if the scalar is valid (not null)
@@ -216,6 +256,10 @@ pub mod ffi {
         fn data_type(self: &Scalar) -> UniquePtr<DataType>;
 
         /// Clone this scalar (deep copy)
+        ///
+        /// Note: Cannot implement `Clone` trait due to cxx FFI limitations.
+        /// This creates a deep copy of the scalar and its data.
+        #[allow(clippy::should_implement_trait)]
         fn clone(self: &Scalar) -> UniquePtr<Scalar>;
 
         // Factory functions
@@ -444,12 +488,20 @@ pub mod ffi {
         // Arrow interop - direct cuDF calls
 
         /// Convert an Arrow DeviceArray to a cuDF table
+        ///
+        /// # Safety
+        ///
+        /// Pointers must be valid Arrow C Data Interface structures.
         unsafe fn table_from_arrow_host(
             schema_ptr: *const u8,
             device_array_ptr: *const u8,
         ) -> Result<UniquePtr<Table>>;
 
         /// Convert an Arrow array to a cuDF column
+        ///
+        /// # Safety
+        ///
+        /// Pointers must be valid Arrow C Data Interface structures.
         unsafe fn column_from_arrow(
             schema_ptr: *const u8,
             array_ptr: *const u8,
