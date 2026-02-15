@@ -31,9 +31,6 @@ mod sort;
 mod table;
 mod table_view;
 
-#[cfg(test)]
-pub mod test_utils;
-
 pub use binary_op::{cudf_binary_op, CuDFBinaryOp};
 pub use column::CuDFColumn;
 pub use column_view::CuDFColumnView;

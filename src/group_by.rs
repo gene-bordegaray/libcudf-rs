@@ -176,10 +176,22 @@ impl AggregationOp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::make_keys_table;
-    use arrow::array::{Array, Float64Array, Int32Array, Int64Array};
+    use arrow::array::{make_array, Array, Float64Array, Int32Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+
+    /// Helper to create a keys table for groupby operations
+    fn make_keys_table(keys: &dyn Array) -> Result<CuDFTable> {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "key",
+            keys.data_type().clone(),
+            false,
+        )]));
+        let keys_data = keys.to_data();
+        let batch = RecordBatch::try_new(schema, vec![make_array(keys_data)])?;
+        CuDFTable::from_arrow_host(batch)
+    }
 
     /// Helper to run a single aggregation on a single group
     fn run_single_group_agg<T: Array + Clone + 'static>(
