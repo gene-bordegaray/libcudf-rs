@@ -368,8 +368,8 @@ mod tests {
 
         let null_overhead = array_size - buffer_size;
         assert!(
-            null_overhead >= 1 && null_overhead <= 128,
-            "Null mask overhead should be between 1 and 128 bytes, got {}",
+            (1..=128).contains(&null_overhead),
+            "Null mask overhead should be between 2 and 128 bytes, got {}",
             null_overhead
         );
     }
