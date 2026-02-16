@@ -51,12 +51,6 @@ namespace libcudf_bridge {
         return result;
     }
 
-    std::unique_ptr<Aggregation> make_nunique_aggregation() {
-        auto result = std::make_unique<Aggregation>();
-        result->inner = cudf::make_nunique_aggregation<cudf::reduce_aggregation>();
-        return result;
-    }
-
     std::unique_ptr<Aggregation> make_median_aggregation() {
         auto result = std::make_unique<Aggregation>();
         result->inner = cudf::make_median_aggregation<cudf::reduce_aggregation>();
@@ -103,12 +97,6 @@ namespace libcudf_bridge {
     std::unique_ptr<Aggregation> make_std_aggregation_groupby(int32_t ddof) {
         auto result = std::make_unique<Aggregation>();
         result->inner = cudf::make_std_aggregation<cudf::groupby_aggregation>(ddof);
-        return result;
-    }
-
-    std::unique_ptr<Aggregation> make_nunique_aggregation_groupby() {
-        auto result = std::make_unique<Aggregation>();
-        result->inner = cudf::make_nunique_aggregation<cudf::groupby_aggregation>();
         return result;
     }
 
