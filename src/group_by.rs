@@ -6,8 +6,7 @@ use cxx::UniquePtr;
 use libcudf_sys::ffi::{
     self, aggregation_request_create, make_count_aggregation_groupby, make_max_aggregation_groupby,
     make_mean_aggregation_groupby, make_median_aggregation_groupby, make_min_aggregation_groupby,
-    make_nunique_aggregation_groupby, make_std_aggregation_groupby, make_sum_aggregation_groupby,
-    make_variance_aggregation_groupby,
+    make_std_aggregation_groupby, make_sum_aggregation_groupby, make_variance_aggregation_groupby,
 };
 use std::sync::Arc;
 
@@ -140,8 +139,6 @@ pub enum AggregationOp {
     /// - `ddof = 0`: Population std dev
     /// - `ddof = 1`: Sample std dev
     STD { ddof: i32 },
-    /// Count of distinct, non-null values
-    NUNIQUE,
     /// Median value
     MEDIAN,
 }
@@ -167,7 +164,6 @@ impl AggregationOp {
             COUNT => Aggregation::new(make_count_aggregation_groupby()),
             VARIANCE { ddof } => Aggregation::new(make_variance_aggregation_groupby(*ddof)),
             STD { ddof } => Aggregation::new(make_std_aggregation_groupby(*ddof)),
-            NUNIQUE => Aggregation::new(make_nunique_aggregation_groupby()),
             MEDIAN => Aggregation::new(make_median_aggregation_groupby()),
         }
     }
@@ -303,15 +299,6 @@ mod tests {
         let result = run_single_group_agg::<Float64Array>(&values, AggregationOp::STD { ddof: 1 })?;
         let expected = (2.5_f64).sqrt();
         assert!((result.value(0) - expected).abs() < 1e-6);
-        Ok(())
-    }
-
-    #[test]
-    fn test_nunique() -> Result<()> {
-        // NUNIQUE([1, 2, 2, 3, 3, 3]) = 3
-        let values = Int32Array::from(vec![1, 2, 2, 3, 3, 3]);
-        let result = run_single_group_agg::<Int32Array>(&values, AggregationOp::NUNIQUE)?;
-        assert_eq!(result.value(0), 3);
         Ok(())
     }
 

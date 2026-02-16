@@ -449,9 +449,6 @@ pub mod ffi {
         /// Create a STD aggregation
         fn make_std_aggregation(ddof: i32) -> UniquePtr<Aggregation>;
 
-        /// Create a NUNIQUE aggregation
-        fn make_nunique_aggregation() -> UniquePtr<Aggregation>;
-
         /// Create a MEDIAN aggregation
         fn make_median_aggregation() -> UniquePtr<Aggregation>;
 
@@ -477,9 +474,6 @@ pub mod ffi {
 
         /// Create a STD aggregation for groupby operations
         fn make_std_aggregation_groupby(ddof: i32) -> UniquePtr<Aggregation>;
-
-        /// Create a NUNIQUE aggregation for groupby operations
-        fn make_nunique_aggregation_groupby() -> UniquePtr<Aggregation>;
 
         /// Create a MEDIAN aggregation for groupby operations
         fn make_median_aggregation_groupby() -> UniquePtr<Aggregation>;
