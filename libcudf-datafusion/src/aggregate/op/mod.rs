@@ -2,6 +2,7 @@ use datafusion::error::Result;
 use libcudf_rs::{AggregationRequest, CuDFColumnView};
 use std::fmt::Debug;
 
+pub mod avg;
 pub mod count;
 pub mod max;
 pub mod min;

@@ -146,6 +146,7 @@ impl ExecutionPlan for CuDFAggregateExec {
 }
 #[cfg(test)]
 mod test {
+    use crate::aggregate::op::avg::avg;
     use crate::aggregate::op::count::count;
     use crate::aggregate::op::max::max;
     use crate::aggregate::op::min::min;
@@ -269,6 +270,22 @@ mod test {
         | world | 3        |
         | hello | 6        |
         +-------+----------+
+        ");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_group_by_avg() -> Result<(), Box<dyn Error>> {
+        let output = run_group_by_test(avg(), "a", "AVG(a)").await?;
+
+        assert_snapshot!(output, @r"
+        +-------+--------+
+        | c     | AVG(a) |
+        +-------+--------+
+        | world | 3.0    |
+        | hello | 2.5    |
+        +-------+--------+
         ");
 
         Ok(())
