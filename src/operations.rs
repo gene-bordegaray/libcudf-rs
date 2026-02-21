@@ -140,7 +140,7 @@ pub fn slice_column(
 /// Cast a column to a different data type on the GPU
 ///
 /// Uses cuDF's native `cudf::cast()` to perform type conversion entirely on the GPU,
-/// avoiding any GPU→CPU→GPU round-trips.
+/// avoiding any GPU->CPU->GPU round-trips.
 ///
 /// # Arguments
 ///
