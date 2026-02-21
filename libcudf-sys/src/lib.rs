@@ -525,6 +525,9 @@ pub mod ffi {
             array_ptr: *const u8,
         ) -> Result<UniquePtr<Column>>;
 
+        /// Cast a column to a different data type using GPU-native cudf::cast
+        fn cast_column(input: &ColumnView, target_type: &DataType) -> Result<UniquePtr<Column>>;
+
         /// Extract a scalar from a column at the specified index
         fn get_element(column: &ColumnView, index: usize) -> UniquePtr<Scalar>;
 
