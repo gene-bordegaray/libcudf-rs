@@ -6,7 +6,7 @@ use datafusion::common::exec_err;
 use datafusion::error::Result;
 use datafusion::functions_aggregate::count::Count;
 use datafusion_expr::AggregateUDF;
-use libcudf_rs::{AggregationOp, AggregationRequest, CuDFColumnView};
+use libcudf_rs::{AggregationOp, AggregationRequest, CuDFColumn, CuDFColumnView};
 use std::sync::Arc;
 
 pub fn count() -> Arc<AggregateUDF> {
@@ -43,6 +43,13 @@ impl CuDFAggregationOp for CuDFCount {
         let mut request = AggregationRequest::from_column_view(state_cols[0].clone());
         request.add(AggregationOp::SUM.group_by());
         Ok(vec![request])
+    }
+
+    fn normalize_partial_state(&self, mut cols: Vec<CuDFColumn>) -> Result<Vec<CuDFColumn>> {
+        // cuDF COUNT returns Int32 -> cast to Int64 to match merge_requests (SUM) output type
+        let casted =
+            libcudf_rs::cast(&cols.remove(0).into_view(), &DataType::Int64).map_err(cudf_to_df)?;
+        Ok(vec![casted])
     }
 
     fn finalize(&self, state_cols: &[CuDFColumnView]) -> Result<CuDFColumnView> {

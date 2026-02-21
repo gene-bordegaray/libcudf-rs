@@ -7,7 +7,7 @@ use datafusion::error::Result;
 use datafusion::functions_aggregate::average::Avg;
 use datafusion_expr::AggregateUDF;
 use libcudf_rs::{
-    cudf_binary_op, AggregationOp, AggregationRequest, CuDFBinaryOp, CuDFColumnView,
+    cudf_binary_op, AggregationOp, AggregationRequest, CuDFBinaryOp, CuDFColumn, CuDFColumnView,
     CuDFColumnViewOrScalar,
 };
 use std::sync::Arc;
@@ -37,6 +37,15 @@ impl CuDFAggregationOp for CuDFAvg {
         sum_request.add(AggregationOp::SUM.group_by());
 
         Ok(vec![count_request, sum_request])
+    }
+
+    fn normalize_partial_state(&self, mut cols: Vec<CuDFColumn>) -> Result<Vec<CuDFColumn>> {
+        // count column: cuDF COUNT returns Int32 -> cast to Int64 to match merge_requests output
+        let sum = cols.remove(1);
+        let count = cols.remove(0);
+        let casted_count =
+            libcudf_rs::cast(&count.into_view(), &DataType::Int64).map_err(cudf_to_df)?;
+        Ok(vec![casted_count, sum])
     }
 
     fn merge_requests(&self, state_cols: &[CuDFColumnView]) -> Result<Vec<AggregationRequest>> {
