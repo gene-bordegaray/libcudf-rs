@@ -28,9 +28,9 @@ pub trait CuDFAggregationOp: Debug + Send + Sync {
     /// Build cuDF aggregation requests for raw input data.
     fn partial_requests(&self, args: &[CuDFColumnView]) -> Result<Vec<AggregationRequest>>;
 
-    /// Normalize state columns after `partial_requests` so their types match what
-    /// `merge_requests` produces. This ensures rolling merge can concatenate running
-    /// state with new batch state without type mismatches.
+    /// Normalize state columns produced by `partial_requests` so their types are
+    /// compatible with `merge_requests` for subsequent merge cycles, and match the
+    /// DataFusion UDF's `state_fields()` contract when emitting `Partial` mode output.
     ///
     /// Override when the cuDF operation used in `partial_requests` returns a narrower
     /// type than the one used in `merge_requests` (e.g. COUNT → Int32, SUM → Int64).

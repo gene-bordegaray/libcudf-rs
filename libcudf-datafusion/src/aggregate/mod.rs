@@ -14,11 +14,11 @@ use std::sync::Arc;
 mod op;
 mod stream;
 
-pub(crate) use op::avg::avg;
-pub(crate) use op::count::count;
-pub(crate) use op::max::max;
-pub(crate) use op::min::min;
-pub(crate) use op::sum::sum;
+pub use op::avg::avg;
+pub use op::count::count;
+pub use op::max::max;
+pub use op::min::min;
+pub use op::sum::sum;
 pub(crate) use op::udf::CuDFAggregateUDF;
 pub(crate) use op::CuDFAggregationOp;
 
@@ -256,8 +256,8 @@ mod test {
         +-------+--------+
         | c     | SUM(a) |
         +-------+--------+
-        | hello | 15     |
         | world | 9      |
+        | hello | 15     |
         +-------+--------+
         ");
 
@@ -272,8 +272,8 @@ mod test {
         +-------+--------+
         | c     | MIN(a) |
         +-------+--------+
-        | hello | 1      |
         | world | 3      |
+        | hello | 1      |
         +-------+--------+
         ");
 
@@ -288,8 +288,8 @@ mod test {
         +-------+--------+
         | c     | MAX(a) |
         +-------+--------+
-        | hello | 4      |
         | world | 3      |
+        | hello | 4      |
         +-------+--------+
         ");
 
@@ -304,8 +304,8 @@ mod test {
         +-------+----------+
         | c     | COUNT(a) |
         +-------+----------+
-        | hello | 6        |
         | world | 3        |
+        | hello | 6        |
         +-------+----------+
         ");
 
@@ -320,8 +320,8 @@ mod test {
         +-------+--------+
         | c     | AVG(a) |
         +-------+--------+
-        | hello | 2.5    |
         | world | 3.0    |
+        | hello | 2.5    |
         +-------+--------+
         ");
 

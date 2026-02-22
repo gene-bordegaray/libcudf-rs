@@ -17,6 +17,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+/// Number of input batches to accumulate before running a single aggregate and merge cycle.
+const AGGREGATE_CHUNK_BATCHES: usize = 1024;
+
 enum StreamState {
     ReadingInput,
     ProducingOutput,
@@ -41,20 +44,17 @@ struct RunningState {
     state_columns: Vec<CuDFColumn>, // flat, indexed via ColumnMapping
 }
 
-/// GPU-accelerated GROUP BY aggregation stream using rolling merge.
+/// GPU-accelerated GROUP BY aggregation stream using chunked aggregation.
 ///
-/// Each input batch is aggregated on the GPU, then immediately merged into a
-/// running state that holds only the unique group keys and their intermediate
-/// state columns.
+/// Input batches are accumulated into a pending buffer. Once the buffer reaches
+/// `AGGREGATE_CHUNK_BATCHES` batches (or input is exhausted), all pending batches
+/// are concatenated on the GPU into a single table and aggregated in one kernel call.
+/// The result (at most G rows, where G is the group cardinality) is merged into the
+/// running state using the standard partial-state merge.
 ///
 /// After all input is consumed, a single output batch is produced by either
 /// finalizing the state (Single/Final modes) or emitting raw state columns
 /// (Partial mode).
-///
-/// # Performance
-///
-/// - O(G) memory where G is the number of groups, regardless of how many input
-///   batches.
 pub struct Stream {
     input: SendableRecordBatchStream,
     output_schema: SchemaRef,
@@ -68,6 +68,9 @@ pub struct Stream {
     aggregate_ops: Vec<Arc<dyn CuDFAggregationOp>>,
     column_mapping: ColumnMapping,
     state: StreamState,
+    /// Batches accumulated since the last flush, cleared on each flush.
+    pending_batches: Vec<RecordBatch>,
+    /// Aggregated running state (at most G rows), updated after each flush.
     running: Option<RunningState>,
 }
 
@@ -121,30 +124,39 @@ impl Stream {
             aggregate_ops,
             column_mapping,
             state: StreamState::ReadingInput,
+            pending_batches: Vec::new(),
             running: None,
         })
     }
 
-    /// Process a single input batch: aggregate it and merge into running state.
-    fn process_batch(&mut self, batch: &RecordBatch) -> Result<()> {
-        let group_by = self.evaluate_batch_groups(batch)?;
-        let evaluated_args = self.evaluate_batch_arguments(batch)?;
+    /// Aggregate all pending batches in one GPU kernel call and merge the result
+    /// into the running state.
+    ///
+    /// Clears `pending_batches` on return.
+    fn flush_pending(&mut self) -> Result<()> {
+        if self.pending_batches.is_empty() {
+            return Ok(());
+        }
 
-        // Build requests based on mode
+        let chunk = concat_cudf_batches(&self.pending_batches)?;
+        self.pending_batches.clear();
+
+        let group_by = self.evaluate_batch_groups(&chunk)?;
+        let evaluated_args = self.evaluate_batch_arguments(&chunk)?;
         let requests = self.build_batch_requests(evaluated_args)?;
 
-        let (batch_keys, batch_results) = group_by.aggregate(&requests).map_err(cudf_to_df)?;
-        let mut batch_state_columns = batch_results.into_iter().flatten().collect();
+        let (chunk_keys, chunk_results) = group_by.aggregate(&requests).map_err(cudf_to_df)?;
+        let mut chunk_state_columns = chunk_results.into_iter().flatten().collect();
 
-        // Normalize partial state column types so they match merge_requests output types.
+        // Normalize partial state column types so they are compatible with merge_requests.
         if !matches!(
             self.mode,
             AggregateMode::Final | AggregateMode::FinalPartitioned
         ) {
-            batch_state_columns = self.normalize_partial_state(batch_state_columns)?;
+            chunk_state_columns = self.normalize_partial_state(chunk_state_columns)?;
         }
 
-        self.merge_into_running(batch_keys, batch_state_columns)
+        self.merge_into_running(chunk_keys, chunk_state_columns)
     }
 
     /// Dispatch `normalize_partial_state` for each op over the flat state column vec.
@@ -159,7 +171,7 @@ impl Stream {
         Ok(result)
     }
 
-    /// Build aggregation requests for a single batch based on mode.
+    /// Build aggregation requests for a chunk based on mode.
     ///
     /// - Single/Partial/SinglePartitioned: use `partial_requests` (input is raw data)
     /// - Final/FinalPartitioned: use `merge_requests` (input is partial state)
@@ -186,7 +198,7 @@ impl Stream {
         Ok(requests)
     }
 
-    /// Merge new batch results into the running state.
+    /// Merge new chunk results into the running state.
     ///
     /// If no running state exists, stores the new results directly.
     /// Otherwise, concatenates running + new, then re-aggregates with merge_requests.
@@ -309,9 +321,13 @@ impl Stream {
         let group = &grouping_sets[0];
         let column_views = group
             .iter()
-            .map(|arr| arr.as_any().downcast_ref::<CuDFColumnView>().unwrap())
-            .cloned()
-            .collect::<Vec<_>>();
+            .map(|arr| {
+                let Some(view) = arr.as_any().downcast_ref::<CuDFColumnView>() else {
+                    return internal_err!("Expected Array to be of type CuDFColumnView");
+                };
+                Ok(view.clone())
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         let table_view = CuDFTableView::from_column_views(column_views).map_err(cudf_to_df)?;
 
@@ -339,6 +355,29 @@ impl Stream {
     }
 }
 
+/// Concatenate CuDF-backed record batches into a single batch by column.
+fn concat_cudf_batches(batches: &[RecordBatch]) -> Result<RecordBatch> {
+    let schema = batches[0].schema();
+    let cols = (0..schema.fields().len())
+        .map(|i| {
+            let views = batches
+                .iter()
+                .map(|b| {
+                    let Some(view) = b.column(i).as_any().downcast_ref::<CuDFColumnView>() else {
+                        return internal_err!(
+                            "Expected Array to be of type CuDFColumnView after CuDFLoadExec"
+                        );
+                    };
+                    Ok(view.clone())
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let col = CuDFColumn::concat(views).map_err(cudf_to_df)?;
+            Ok(Arc::new(col.into_view()) as Arc<dyn Array>)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(RecordBatch::try_new(schema, cols)?)
+}
+
 impl futures::Stream for Stream {
     type Item = Result<RecordBatch>;
 
@@ -351,10 +390,14 @@ impl futures::Stream for Stream {
                     }
                     Some(Err(e)) => return Poll::Ready(Some(Err(e))),
                     Some(Ok(batch)) => {
-                        self.process_batch(&batch)?;
+                        self.pending_batches.push(batch);
+                        if self.pending_batches.len() >= AGGREGATE_CHUNK_BATCHES {
+                            self.flush_pending()?;
+                        }
                     }
                 },
                 StreamState::ProducingOutput => {
+                    self.flush_pending()?;
                     let output = self.build_output()?;
                     self.state = StreamState::Done;
                     return match output {
