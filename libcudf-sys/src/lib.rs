@@ -30,6 +30,7 @@ pub mod ffi {
         include!("libcudf-sys/src/operations.h");
         include!("libcudf-sys/src/binaryop.h");
         include!("libcudf-sys/src/sorting.h");
+        include!("libcudf-sys/src/join.h");
 
         /// A set of cuDF columns of the same size
         ///
@@ -424,6 +425,44 @@ pub mod ffi {
             keys: &TableView,
             column_order: &[i32],
             null_precedence: &[i32],
+        ) -> Result<UniquePtr<Table>>;
+
+        // Join operations - direct cuDF mappings
+
+        /// Inner join: returns a 2-column table [left_gather_map, right_gather_map] (INT32)
+        fn inner_join(left_keys: &TableView, right_keys: &TableView) -> Result<UniquePtr<Table>>;
+
+        /// Left join: returns a 2-column table; right_gather_map contains INT32_MIN for unmatched rows
+        fn left_join(left_keys: &TableView, right_keys: &TableView) -> Result<UniquePtr<Table>>;
+
+        /// Full outer join: returns a 2-column table; either map may contain INT32_MIN for unmatched rows
+        fn full_join(left_keys: &TableView, right_keys: &TableView) -> Result<UniquePtr<Table>>;
+
+        /// Left semi join: returns a 1-column table of matching left row indices
+        fn left_semi_join(
+            left_keys: &TableView,
+            right_keys: &TableView,
+        ) -> Result<UniquePtr<Table>>;
+
+        /// Left anti join: returns a 1-column table of non-matching left row indices
+        fn left_anti_join(
+            left_keys: &TableView,
+            right_keys: &TableView,
+        ) -> Result<UniquePtr<Table>>;
+
+        /// Cross join: returns a full Cartesian product table
+        fn cross_join(left: &TableView, right: &TableView) -> Result<UniquePtr<Table>>;
+
+        /// Gather with NULLIFY policy: converts INT32_MIN sentinel indices to null output rows
+        fn gather_nullify(
+            source_table: &TableView,
+            gather_map: &ColumnView,
+        ) -> Result<UniquePtr<Table>>;
+
+        /// Horizontally concatenate two tables, consuming their columns
+        fn hconcat_tables(
+            left: Pin<&mut Table>,
+            right: Pin<&mut Table>,
         ) -> Result<UniquePtr<Table>>;
 
         // Aggregation factory functions - direct cuDF mappings (for reduce)
