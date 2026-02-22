@@ -8,7 +8,7 @@ use datafusion::error::Result;
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion_physical_plan::aggregates::{
-    evaluate_group_by, evaluate_many, AggregateMode, PhysicalGroupBy,
+    aggregate_expressions, evaluate_group_by, evaluate_many, AggregateMode, PhysicalGroupBy,
 };
 use datafusion_physical_plan::udaf::AggregateFunctionExpr;
 use futures::{ready, StreamExt};
@@ -78,11 +78,8 @@ impl Stream {
         mode: AggregateMode,
         group_by: PhysicalGroupBy,
         aggregate_expr: Vec<Arc<AggregateFunctionExpr>>,
-    ) -> Self {
-        let aggregate_args = aggregate_expr
-            .iter()
-            .map(|x| x.expressions())
-            .collect::<Vec<_>>();
+    ) -> Result<Self> {
+        let aggregate_args = aggregate_expressions(&aggregate_expr, &mode, group_by.expr().len())?;
 
         // Extract the GPU op from each CuDFAggregateUDF wrapper.
         // Safe to unwrap: the optimizer only creates CuDFAggregateExec when all
@@ -114,7 +111,7 @@ impl Stream {
             ColumnMapping { ranges }
         };
 
-        Self {
+        Ok(Self {
             input,
             output_schema,
             mode,
@@ -125,7 +122,7 @@ impl Stream {
             column_mapping,
             state: StreamState::ReadingInput,
             running: None,
-        }
+        })
     }
 
     /// Process a single input batch: aggregate it and merge into running state.
