@@ -73,7 +73,7 @@ pub fn full_join(
     gather_and_combine(left, right, maps, true)
 }
 
-/// Perform a left semi join — return only left rows that have at least one match.
+/// Perform a left semi join - return only left rows that have at least one match.
 ///
 /// Only left columns are included in the output.
 pub fn left_semi_join(

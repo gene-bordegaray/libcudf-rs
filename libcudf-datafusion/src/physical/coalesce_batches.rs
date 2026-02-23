@@ -124,6 +124,9 @@ impl Stream for CoalesceBatchesStream {
     type Item = Result<RecordBatch, DataFusionError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // TODO(#21): record_poll triggers Array::to_data() -> GPU->CPU for CuDFColumnView.
+        // Replace with record_output(batch.num_rows()) once #21 is addressed.
+        // see https://github.com/gene-bordegaray/libcudf-rs/issues/21
         let poll = self.poll_next_inner(cx);
         self.baseline_metrics.record_poll(poll)
     }
@@ -270,6 +273,7 @@ impl LimitedBatchCoalescer {
     }
 
     /// Return true if there is no data buffered
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
@@ -440,6 +444,7 @@ impl CuDFBatchCoalescer {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.buffered_rows == 0 && self.completed.is_empty()
     }

@@ -4,7 +4,6 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatchOptions;
 use datafusion::config::ConfigOptions;
 use datafusion::error::DataFusionError;
-use datafusion::execution::context::DataFilePaths;
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::equivalence::ProjectionMapping;
 use datafusion::physical_expr::projection::ProjectionExprs;
@@ -191,6 +190,9 @@ impl Stream for CuDFProjectionStream {
             other => other,
         });
 
+        // TODO(#21): record_poll triggers Array::to_data() -> GPU->CPU for CuDFColumnView.
+        // Replace with record_output(batch.num_rows()) once #21 is addressed.
+        // see https://github.com/gene-bordegaray/libcudf-rs/issues/21
         self.baseline_metrics.record_poll(poll)
     }
 

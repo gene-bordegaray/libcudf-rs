@@ -83,6 +83,8 @@ impl ExecutionPlan for CuDFLoadExec {
                 Err(err) => return Err(err),
             };
 
+            // TODO(#20): replace per-column upload with a single CuDFTable::from_arrow_host call
+            // see https://github.com/gene-bordegaray/libcudf-rs/issues/20
             let original_cols = batch.columns();
             let mut cudf_cols: Vec<Arc<dyn Array>> = Vec::with_capacity(original_cols.len());
             for original_col in original_cols {
@@ -104,7 +106,7 @@ impl ExecutionPlan for CuDFLoadExec {
     }
 }
 
-fn cudf_schema_compatibility_map(schema: SchemaRef) -> SchemaRef {
+pub(crate) fn cudf_schema_compatibility_map(schema: SchemaRef) -> SchemaRef {
     let mut new_fields = Vec::with_capacity(schema.fields.len());
 
     for field in schema.fields() {
