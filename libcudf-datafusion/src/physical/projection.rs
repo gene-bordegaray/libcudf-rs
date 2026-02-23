@@ -218,23 +218,22 @@ mod tests {
         let tf = TestFramework::new().await;
 
         let plan = tf
-            .plan(r#" SET cudf.enable=true; SELECT "MinTemp" + 1 FROM weather LIMIT 1"#)
+            .plan(r#" SET datafusion.execution.target_partitions=1; SET cudf.enable=true; SELECT "MinTemp" + 1 FROM weather LIMIT 1"#)
             .await?;
 
-        assert_snapshot!(plan.display(), @r"
+        assert_snapshot!(plan.display(), @"
         CuDFUnloadExec
           CuDFProjectionExec: expr=[MinTemp@0 + 1 as weather.MinTemp + Int64(1)]
             CuDFLoadExec
               CoalesceBatchesExec: target_batch_size=81920
-                RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1
-                  DataSourceExec: file_groups={1 group: [[/testdata/weather/result-000002.parquet]]}, projection=[MinTemp], limit=1, file_type=parquet
+                DataSourceExec: file_groups={1 group: [[/testdata/weather/result-000000.parquet]]}, projection=[MinTemp], limit=1, file_type=parquet
         ");
         let result = plan.execute().await?;
-        assert_snapshot!(result.pretty_print, @r"
+        assert_snapshot!(result.pretty_print, @"
         +----------------------------+
         | weather.MinTemp + Int64(1) |
         +----------------------------+
-        | 7.6                        |
+        | 9.0                        |
         +----------------------------+
         ");
         let host_result = tf

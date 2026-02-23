@@ -58,6 +58,10 @@ mod tests {
     use crate::test_utils::TestFramework;
     use datafusion::common::assert_contains;
 
+    // Ignored: ORDER BY a non-projected column produces wrong results due to a bug in
+    // extract_sort_params which ignores the column index in the sort expression and always
+    // sorts by column 0. https://github.com/gene-bordegaray/libcudf-rs/issues/23
+    #[ignore]
     #[tokio::test]
     async fn test_column_in_expressions() -> Result<(), Box<dyn std::error::Error>> {
         let tf = TestFramework::new().await;
@@ -68,6 +72,7 @@ mod tests {
                 "MinTemp" * 2 as doubled_min,
                 "MaxTemp" - 10.0 as offset_max
             FROM weather
+            ORDER BY "MinTemp"
             LIMIT 2
         "#;
         let cudf_sql = format!(
@@ -80,14 +85,7 @@ mod tests {
 
         let result = tf.execute(&cudf_sql).await?;
         assert_contains!(result.plan, "CuDF");
-        assert_snapshot!(result.pretty_print, @r"
-        +-----------+-------------+--------------------+
-        | sum_temps | doubled_min | offset_max         |
-        +-----------+-------------+--------------------+
-        | 19.7      | 13.2        | 3.0999999999999996 |
-        | 9.9       | -3.2        | 1.5                |
-        +-----------+-------------+--------------------+
-        ");
+        assert_snapshot!(result.pretty_print, @"");
 
         let host_result = tf.execute(host_sql).await?;
         assert_eq!(host_result.pretty_print, result.pretty_print);

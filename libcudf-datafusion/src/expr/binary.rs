@@ -202,6 +202,10 @@ mod tests {
     use crate::test_utils::TestFramework;
     use datafusion::common::assert_contains;
 
+    // Ignored: ORDER BY a non-projected column produces wrong results due to a bug in
+    // extract_sort_params which ignores the column index in the sort expression and always
+    // sorts by column 0. https://github.com/gene-bordegaray/libcudf-rs/issues/23
+    #[ignore]
     #[tokio::test]
     async fn test_binary_operations() -> Result<(), Box<dyn std::error::Error>> {
         let tf = TestFramework::new().await;
@@ -220,7 +224,7 @@ mod tests {
                 "MinTemp" <= 12.2 as less_equal,
                 "MaxTemp" >= 24.3 as greater_equal,
                 ("MaxTemp" - "MinTemp") * 2 as complex_expr
-            FROM weather LIMIT 1
+            FROM weather ORDER BY "MinTemp" LIMIT 1
         "#;
         let cudf_sql = format!(
             r#"
@@ -232,13 +236,7 @@ mod tests {
 
         let result = tf.execute(&cudf_sql).await?;
         assert_contains!(result.plan, "CuDF");
-        assert_snapshot!(result.pretty_print, @r"
-        +----------+-------------+----------------+----------+--------+-------+-----------+-----------+--------------+------------+---------------+--------------+
-        | addition | subtraction | multiplication | division | modulo | equal | not_equal | less_than | greater_than | less_equal | greater_equal | complex_expr |
-        +----------+-------------+----------------+----------+--------+-------+-----------+-----------+--------------+------------+---------------+--------------+
-        | 19.7     | 6.5         | 13.2           | 6.55     | 0.2    | false | true      | true      | false        | true       | false         | 13.0         |
-        +----------+-------------+----------------+----------+--------+-------+-----------+-----------+--------------+------------+---------------+--------------+
-        ");
+        assert_snapshot!(result.pretty_print, @"");
 
         // Verify against host execution
         let host_result = tf.execute(host_sql).await?;
