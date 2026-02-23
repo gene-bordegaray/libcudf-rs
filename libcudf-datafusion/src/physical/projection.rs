@@ -4,7 +4,6 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatchOptions;
 use datafusion::config::ConfigOptions;
 use datafusion::error::DataFusionError;
-use datafusion::execution::context::DataFilePaths;
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::equivalence::ProjectionMapping;
 use datafusion::physical_expr::projection::ProjectionExprs;
@@ -28,7 +27,7 @@ use std::task::{Context, Poll};
 pub struct CuDFProjectionExec {
     host_exec: ProjectionExec,
     cudf_exprs: ProjectionExprs,
-    properties: Arc<PlanProperties>,
+    properties: PlanProperties,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -57,7 +56,7 @@ impl CuDFProjectionExec {
         Ok(Self {
             host_exec,
             cudf_exprs: projection_exprs,
-            properties: Arc::new(properties),
+            properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
     }
@@ -127,7 +126,7 @@ impl ExecutionPlan for CuDFProjectionExec {
         }))
     }
 
-    fn properties(&self) -> &Arc<PlanProperties> {
+    fn properties(&self) -> &PlanProperties {
         &self.properties
     }
 
@@ -191,6 +190,9 @@ impl Stream for CuDFProjectionStream {
             other => other,
         });
 
+        // TODO(#21): record_poll triggers Array::to_data() -> GPU->CPU for CuDFColumnView.
+        // Replace with record_output(batch.num_rows()) once #21 is addressed.
+        // see https://github.com/gene-bordegaray/libcudf-rs/issues/21
         self.baseline_metrics.record_poll(poll)
     }
 
@@ -216,23 +218,22 @@ mod tests {
         let tf = TestFramework::new().await;
 
         let plan = tf
-            .plan(r#" SET cudf.enable=true; SELECT "MinTemp" + 1 FROM weather LIMIT 1"#)
+            .plan(r#" SET datafusion.execution.target_partitions=1; SET cudf.enable=true; SELECT "MinTemp" + 1 FROM weather LIMIT 1"#)
             .await?;
 
-        assert_snapshot!(plan.display(), @r"
+        assert_snapshot!(plan.display(), @"
         CuDFUnloadExec
           CuDFProjectionExec: expr=[MinTemp@0 + 1 as weather.MinTemp + Int64(1)]
             CuDFLoadExec
               CoalesceBatchesExec: target_batch_size=81920
-                RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1
-                  DataSourceExec: file_groups={1 group: [[/testdata/weather/result-000002.parquet]]}, projection=[MinTemp], limit=1, file_type=parquet
+                DataSourceExec: file_groups={1 group: [[/testdata/weather/result-000000.parquet]]}, projection=[MinTemp], limit=1, file_type=parquet
         ");
         let result = plan.execute().await?;
-        assert_snapshot!(result.pretty_print, @r"
+        assert_snapshot!(result.pretty_print, @"
         +----------------------------+
         | weather.MinTemp + Int64(1) |
         +----------------------------+
-        | 7.6                        |
+        | 9.0                        |
         +----------------------------+
         ");
         let host_result = tf

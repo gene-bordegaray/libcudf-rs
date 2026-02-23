@@ -73,30 +73,30 @@ mod tests {
     async fn test_literal_in_expressions() -> Result<(), Box<dyn std::error::Error>> {
         let tf = TestFramework::new().await;
 
-        tf.execute(
-            r#"CREATE TABLE temps (min_temp DOUBLE, max_temp DOUBLE, rainfall DOUBLE) AS VALUES
-                (6.6, 13.1, 0.6),
-                (-1.6, 11.5, 0.0)"#,
-        )
-        .await?;
-
         let host_sql = r#"
             SELECT
-                min_temp + 10.0 as temp_plus_ten,
-                max_temp * 2 as temp_doubled,
-                rainfall > 0.0 as has_rain
-            FROM temps
+                "MinTemp" + 10.0 as temp_plus_ten,
+                "MaxTemp" * 2 as temp_doubled,
+                "Rainfall" > 0.0 as has_rain
+            FROM weather
+            ORDER BY "MinTemp" LIMIT 2
         "#;
-        let cudf_sql = format!("SET cudf.enable=true; {host_sql}");
+        let cudf_sql = format!(
+            r#"
+            SET datafusion.execution.target_partitions=1;
+            SET cudf.enable=true;
+            {host_sql}
+        "#
+        );
 
         let result = tf.execute(&cudf_sql).await?;
         assert_contains!(result.plan, "CuDF");
-        assert_snapshot!(result.pretty_print, @r"
+        assert_snapshot!(result.pretty_print, @"
         +---------------+--------------+----------+
         | temp_plus_ten | temp_doubled | has_rain |
         +---------------+--------------+----------+
-        | 16.6          | 26.2         | true     |
-        | 8.4           | 23.0         | false    |
+        | 4.7           | 26.2         | false    |
+        | 6.3           | 28.8         | false    |
         +---------------+--------------+----------+
         ");
 
