@@ -79,7 +79,7 @@ mod tests {
                 "MaxTemp" * 2 as temp_doubled,
                 "Rainfall" > 0.0 as has_rain
             FROM weather
-            LIMIT 2
+            ORDER BY "MinTemp" LIMIT 2
         "#;
         let cudf_sql = format!(
             r#"
@@ -91,12 +91,12 @@ mod tests {
 
         let result = tf.execute(&cudf_sql).await?;
         assert_contains!(result.plan, "CuDF");
-        assert_snapshot!(result.pretty_print, @r"
+        assert_snapshot!(result.pretty_print, @"
         +---------------+--------------+----------+
         | temp_plus_ten | temp_doubled | has_rain |
         +---------------+--------------+----------+
-        | 16.6          | 26.2         | true     |
-        | 8.4           | 23.0         | false    |
+        | 4.7           | 26.2         | false    |
+        | 6.3           | 28.8         | false    |
         +---------------+--------------+----------+
         ");
 
