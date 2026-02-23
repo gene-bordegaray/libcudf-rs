@@ -65,6 +65,10 @@ pretty_assertions = { version = "1.4" }
 name = "aggregate"
 harness = false
 
+[[bench]]
+name = "tpch_pipeline"
+harness = false
+
 [[bin]]
 name = "cli"
 path = "bin/cli.rs"

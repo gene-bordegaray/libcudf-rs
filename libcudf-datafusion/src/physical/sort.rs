@@ -1,6 +1,6 @@
 use crate::errors::cudf_to_df;
-use arrow::array::{Array, RecordBatch};
-use datafusion::common::{internal_err, Statistics};
+use arrow::array::RecordBatch;
+use datafusion::common::Statistics;
 use datafusion::error::DataFusionError;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::LexOrdering;

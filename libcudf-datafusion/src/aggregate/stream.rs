@@ -339,6 +339,10 @@ impl Stream {
     fn evaluate_batch_arguments(&self, batch: &RecordBatch) -> Result<Vec<Vec<CuDFColumnView>>> {
         let evaluated_arguments = evaluate_many(&self.aggregate_args, batch)?;
 
+        // TODO(#18): COUNT(*) is rewritten by DataFusion as COUNT(lit(1)). lit(1) evaluates
+        // to a plain Arrow scalar, not a CuDFColumnView, causing the downcast below to fail.
+        // Fix: detect non-CuDF arrays here and upload them as GPU constant columns via
+        // CuDFTable::from_arrow_host before downcasting. This also covers SUM(1) and similar.
         evaluated_arguments
             .iter()
             .map(|args| {
