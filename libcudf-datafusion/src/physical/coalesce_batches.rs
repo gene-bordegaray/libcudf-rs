@@ -386,9 +386,11 @@ impl CuDFBatchCoalescer {
         // Concatenate all buffered batches
         let concat_table = CuDFTable::concat(table_views).map_err(cudf_to_df)?;
 
-        // Convert back to record batch
+        // Convert back to record batch, relabeling column types to match the expected schema
         let concat_view = concat_table.into_view();
-        let concat_batch = concat_view.to_record_batch().map_err(cudf_to_df)?;
+        let concat_batch = concat_view
+            .to_record_batch_with_schema(&self.schema)
+            .map_err(cudf_to_df)?;
 
         // Split at target_batch_size
         let output_batch = concat_batch.slice(0, self.target_batch_size);
@@ -435,7 +437,9 @@ impl CuDFBatchCoalescer {
 
         let concat_table = CuDFTable::concat(table_views).map_err(cudf_to_df)?;
         let concat_view = concat_table.into_view();
-        let concat_batch = concat_view.to_record_batch().map_err(cudf_to_df)?;
+        let concat_batch = concat_view
+            .to_record_batch_with_schema(&self.schema)
+            .map_err(cudf_to_df)?;
 
         self.completed.push(concat_batch);
         self.buffered_batches.clear();
