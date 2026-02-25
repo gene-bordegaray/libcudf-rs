@@ -1,3 +1,4 @@
+use crate::expr::expr_to_cudf_expr;
 use arrow_schema::Schema;
 use datafusion::error::Result;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -207,6 +208,12 @@ pub fn try_as_cudf_aggregate(node: &AggregateExec) -> Result<Option<Arc<dyn Exec
             .is_none()
         {
             return Ok(None);
+        }
+        // Validate that each input expression is cuDF-compatible.
+        for input_expr in expr.expressions() {
+            if expr_to_cudf_expr(input_expr.as_ref()).is_err() {
+                return Ok(None);
+            }
         }
     }
     Ok(Some(Arc::new(CuDFAggregateExec::try_new(
@@ -497,5 +504,23 @@ mod integration {
         "#,
         )
         .await
+    }
+
+    /// Aggregates with unsupported functions (non-CuDFAggregateUDF) must fall back to CPU.
+    #[tokio::test]
+    async fn test_unsupported_agg_falls_back_to_cpu() -> Result<(), Box<dyn Error>> {
+        let tf = TestFramework::new().await;
+        // BOOL_OR is not a CuDFAggregateUDF, so the aggregate must run on CPU.
+        let sql = r#"
+            SELECT "RainToday", BOOL_OR("RainTomorrow" = 'Yes') as any_rain
+            FROM weather
+            GROUP BY "RainToday"
+            ORDER BY "RainToday"
+        "#;
+        let cudf = tf.execute(&format!("SET cudf.enable=true; {sql}")).await?;
+        let cpu = tf.execute(sql).await?;
+        assert!(!cudf.plan.contains("CuDFAggregateExec"), "expected CPU fallback");
+        assert_eq!(cpu.pretty_print, cudf.pretty_print);
+        Ok(())
     }
 }

@@ -244,6 +244,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_unsupported_expression_falls_back_to_cpu() -> Result<(), DataFusionError> {
+        let tf = TestFramework::new().await;
+        tf.execute(
+            "CREATE TABLE dates (d DATE) AS VALUES (DATE '2023-01-15'), (DATE '2024-06-30')",
+        )
+        .await?;
+        let host_sql = r#"SELECT date_part('year', d) as yr FROM dates ORDER BY yr"#;
+        let cudf_sql = format!("SET cudf.enable=true; {host_sql}");
+        let cudf = tf.execute(&cudf_sql).await?;
+        let host = tf.execute(host_sql).await?;
+        assert_eq!(host.pretty_print, cudf.pretty_print);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_decimal_addition() -> Result<(), DataFusionError> {
         let tf = TestFramework::new().await;
 

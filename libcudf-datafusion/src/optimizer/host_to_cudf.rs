@@ -6,6 +6,7 @@ use crate::physical::{
 };
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::config::ConfigOptions;
+use datafusion::error::DataFusionError;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion_physical_plan::aggregates::AggregateExec;
 use datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec;
@@ -15,6 +16,16 @@ use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::sorts::sort::SortExec;
 use datafusion_physical_plan::ExecutionPlan;
 use std::sync::Arc;
+
+fn try_as_cudf<T: ExecutionPlan + 'static>(
+    r: datafusion::common::Result<T>,
+) -> datafusion::common::Result<Option<Arc<dyn ExecutionPlan>>> {
+    match r {
+        Ok(n) => Ok(Some(Arc::new(n))),
+        Err(DataFusionError::NotImplemented(_)) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
 
 #[derive(Debug)]
 pub struct HostToCuDFRule;
@@ -35,11 +46,11 @@ impl PhysicalOptimizerRule for HostToCuDFRule {
         let result = plan.transform_up(|mut plan| {
             let mut cudf_node: Option<Arc<dyn ExecutionPlan>> = None;
             if let Some(node) = plan.as_any().downcast_ref::<FilterExec>() {
-                cudf_node = Some(Arc::new(CuDFFilterExec::try_new(node.clone())?));
+                cudf_node = try_as_cudf(CuDFFilterExec::try_new(node.clone()))?;
             }
 
             if let Some(node) = plan.as_any().downcast_ref::<ProjectionExec>() {
-                cudf_node = Some(Arc::new(CuDFProjectionExec::try_new(node.clone())?));
+                cudf_node = try_as_cudf(CuDFProjectionExec::try_new(node.clone()))?;
             }
 
             if let Some(node) = plan.as_any().downcast_ref::<SortExec>() {

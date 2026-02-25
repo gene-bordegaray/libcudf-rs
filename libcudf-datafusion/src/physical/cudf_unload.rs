@@ -1,6 +1,6 @@
 use crate::errors::cudf_to_df;
 use arrow::array::RecordBatch;
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, Field, FieldRef, Schema, SchemaRef};
 use datafusion::common::{exec_err, internal_datafusion_err, plan_err, DataFusionError};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
@@ -20,10 +20,10 @@ pub struct CuDFUnloadExec {
 
 impl CuDFUnloadExec {
     pub fn new(input: Arc<dyn ExecutionPlan>) -> Self {
-        Self {
-            properties: input.properties().clone(),
-            input,
-        }
+        let mut properties = input.properties().clone();
+        properties.eq_properties =
+            EquivalenceProperties::new(cudf_unload_schema_map(input.schema()));
+        Self { properties, input }
     }
 
     pub fn with_target_schema(&self, target_schema: SchemaRef) -> Self {
@@ -113,8 +113,53 @@ impl ExecutionPlan for CuDFUnloadExec {
         // TODO(#20): download the entire batch in one table export instead of one call per
         // column - see https://github.com/gene-bordegaray/libcudf-rs/issues/20
         Ok(Box::pin(RecordBatchStreamAdapter::new(
-            self.input.schema(),
+            self.schema(),
             host_stream,
         )))
+    }
+}
+
+/// Partial reverse of [`cudf_schema_compatibility_map`]: restores `Utf8 -> Utf8View` so
+/// downstream CPU nodes see the types they expect from the original parquet schema.
+///
+/// Only Utf8View is reversed, decimal precision normalization is not because the original
+/// precision is not recoverable.
+fn cudf_unload_schema_map(schema: SchemaRef) -> SchemaRef {
+    let new_fields: Vec<FieldRef> = schema
+        .fields()
+        .iter()
+        .map(|field| match field.data_type() {
+            DataType::Utf8 => FieldRef::new(Field::new(
+                field.name(),
+                DataType::Utf8View,
+                field.is_nullable(),
+            )),
+            _ => Arc::clone(field),
+        })
+        .collect();
+    SchemaRef::new(Schema::new(new_fields))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CuDFUnloadExec;
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion_physical_plan::{test::TestMemoryExec, ExecutionPlan};
+    use std::sync::Arc;
+
+    #[test]
+    fn test_schema_restores_utf8view() {
+        // Input schema uses Utf8 (cuDF's normalised string type).
+        // CuDFUnloadExec must restore Utf8View so downstream CPU nodes see the
+        // type they expect from the original parquet schema.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("age", DataType::Int32, false),
+        ]));
+        let input = Arc::new(TestMemoryExec::try_new(&[], schema, None).unwrap());
+        let unload = CuDFUnloadExec::new(input);
+        let out = unload.schema();
+        assert_eq!(out.field(0).data_type(), &DataType::Utf8View);
+        assert_eq!(out.field(1).data_type(), &DataType::Int32);
     }
 }

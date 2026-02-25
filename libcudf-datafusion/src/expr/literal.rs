@@ -1,4 +1,5 @@
 use crate::errors::cudf_to_df;
+use crate::physical::normalize_scalar_for_cudf;
 use arrow::array::RecordBatch;
 use arrow_schema::{DataType, FieldRef, Schema};
 use datafusion::logical_expr::ColumnarValue;
@@ -34,7 +35,8 @@ impl PhysicalExpr for CuDFLiteral {
     }
 
     fn evaluate(&self, _: &RecordBatch) -> datafusion::common::Result<ColumnarValue> {
-        let host_scalar = self.inner.value().to_scalar()?;
+        let value = normalize_scalar_for_cudf(self.inner.value().clone());
+        let host_scalar = value.to_scalar()?;
         Ok(ColumnarValue::Array(Arc::new(
             CuDFScalar::from_arrow_host(host_scalar).map_err(cudf_to_df)?,
         )))
@@ -68,6 +70,20 @@ mod tests {
     use crate::assert_snapshot;
     use crate::test_utils::TestFramework;
     use datafusion::common::assert_contains;
+
+    #[tokio::test]
+    async fn test_string_equality_filter() -> Result<(), Box<dyn std::error::Error>> {
+        let tf = TestFramework::new().await;
+        tf.execute("CREATE TABLE items (id INT, category VARCHAR) AS VALUES (1, 'BUILDING'), (2, 'FURNITURE'), (3, 'BUILDING')").await?;
+        let host_sql = r#"SELECT id FROM items WHERE category = 'BUILDING' ORDER BY id"#;
+        let cudf_sql = format!(
+            "SET datafusion.execution.target_partitions=1; SET cudf.enable=true; {host_sql}"
+        );
+        let cudf = tf.execute(&cudf_sql).await?;
+        let host = tf.execute(host_sql).await?;
+        assert_eq!(host.pretty_print, cudf.pretty_print);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_literal_in_expressions() -> Result<(), Box<dyn std::error::Error>> {
