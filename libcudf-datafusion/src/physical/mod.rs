@@ -10,6 +10,7 @@ mod projection;
 mod sort;
 
 pub use coalesce_batches::CuDFCoalesceBatchesExec;
+pub(crate) use cudf_load::normalize_scalar_for_cudf;
 pub use cudf_load::CuDFLoadExec;
 pub use cudf_unload::CuDFUnloadExec;
 pub use filter::CuDFFilterExec;

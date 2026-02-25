@@ -72,12 +72,17 @@ impl ExecutionPlan for CuDFFilterExec {
 
     fn with_new_children(
         self: Arc<Self>,
-        mut children: Vec<Arc<dyn ExecutionPlan>>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
-        let f_exec = FilterExec::try_new(
-            Arc::clone(self.host_exec.predicate()),
-            children.swap_remove(0),
-        )?;
+        // Delegate to FilterExec::with_new_children to preserve the projection.
+        // FilterExec::try_new alone does not set the projection; only with_new_children
+        // calls .with_projection(self.projection().cloned()), so using it here is essential.
+        let updated = Arc::new(self.host_exec.clone()).with_new_children(children)?;
+        let f_exec = updated
+            .as_any()
+            .downcast_ref::<FilterExec>()
+            .expect("FilterExec::with_new_children should return a FilterExec")
+            .clone();
         Ok(Arc::new(Self::try_new(f_exec)?))
     }
 
@@ -207,7 +212,7 @@ fn filter_and_project(
             projected_columns,
         )?)
     } else {
-        Ok(RecordBatch::try_new(batch.schema(), cudf_columns)?)
+        Ok(RecordBatch::try_new(Arc::clone(output_schema), cudf_columns)?)
     }
 }
 
@@ -267,6 +272,38 @@ impl RecordBatchStream for CuDFFilterExecStream {
 mod tests {
     use crate::assert_snapshot;
     use crate::test_utils::TestFramework;
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::scalar::ScalarValue;
+    use datafusion_physical_plan::{
+        expressions::Literal,
+        filter::FilterExec,
+        test::TestMemoryExec,
+        ExecutionPlan, PhysicalExpr,
+    };
+    use std::{error::Error, sync::Arc};
+
+    fn bool_literal() -> Arc<dyn PhysicalExpr> {
+        Arc::new(Literal::new(ScalarValue::Boolean(Some(true))))
+    }
+
+    /// with_new_children must preserve the projection so the output schema stays consistent.
+    #[test]
+    fn test_with_new_children_preserves_projection() -> Result<(), Box<dyn Error>> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let input = Arc::new(TestMemoryExec::try_new(&[], schema.clone(), None)?) as Arc<dyn ExecutionPlan>;
+        let host = FilterExec::try_new(bool_literal(), input)?.with_projection(Some(vec![0usize]))?;
+        let exec = Arc::new(super::CuDFFilterExec::try_new(host)?);
+
+        let new_input = Arc::new(TestMemoryExec::try_new(&[], schema, None)?) as Arc<dyn ExecutionPlan>;
+        let updated = exec.with_new_children(vec![new_input])?;
+
+        assert_eq!(updated.schema().fields().len(), 1);
+        assert_eq!(updated.schema().field(0).name(), "a");
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_basic_filter() -> Result<(), Box<dyn std::error::Error>> {
