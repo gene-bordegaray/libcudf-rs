@@ -54,6 +54,23 @@ impl CuDFColumnView {
         self.inner
     }
 
+    /// Create a view with a different Arrow `DataType` label, sharing the same GPU memory.
+    ///
+    /// The caller must ensure the raw GPU values are already correct for the new type.
+    ///
+    /// **Warning:** the cuDF inner column type is unchanged. If this view is passed to a
+    /// subsequent cuDF arithmetic operation, the inner type (not `dt`) is used for scale
+    /// arithmetic. This is safe when the column is only unloaded to host, not chained into
+    /// further GPU arithmetic.
+    pub fn with_data_type(self, dt: DataType) -> Self {
+        Self {
+            _ref: self._ref,
+            inner: self.inner,
+            dt,
+            null_buf: OnceLock::new(),
+        }
+    }
+
     /// Convert the cuDF column view to an Arrow array, copying data from GPU to host
     ///
     /// This method copies the GPU data back to the CPU and creates an Arrow array.

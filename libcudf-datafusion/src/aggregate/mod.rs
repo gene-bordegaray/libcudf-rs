@@ -519,7 +519,10 @@ mod integration {
         "#;
         let cudf = tf.execute(&format!("SET cudf.enable=true; {sql}")).await?;
         let cpu = tf.execute(sql).await?;
-        assert!(!cudf.plan.contains("CuDFAggregateExec"), "expected CPU fallback");
+        assert!(
+            !cudf.plan.contains("CuDFAggregateExec"),
+            "expected CPU fallback"
+        );
         assert_eq!(cpu.pretty_print, cudf.pretty_print);
         Ok(())
     }
