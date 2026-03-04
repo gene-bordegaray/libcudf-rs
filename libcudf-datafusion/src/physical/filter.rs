@@ -212,7 +212,10 @@ fn filter_and_project(
             projected_columns,
         )?)
     } else {
-        Ok(RecordBatch::try_new(Arc::clone(output_schema), cudf_columns)?)
+        Ok(RecordBatch::try_new(
+            Arc::clone(output_schema),
+            cudf_columns,
+        )?)
     }
 }
 
@@ -275,10 +278,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::scalar::ScalarValue;
     use datafusion_physical_plan::{
-        expressions::Literal,
-        filter::FilterExec,
-        test::TestMemoryExec,
-        ExecutionPlan, PhysicalExpr,
+        expressions::Literal, filter::FilterExec, test::TestMemoryExec, ExecutionPlan, PhysicalExpr,
     };
     use std::{error::Error, sync::Arc};
 
@@ -293,11 +293,14 @@ mod tests {
             Field::new("a", DataType::Int32, false),
             Field::new("b", DataType::Int32, false),
         ]));
-        let input = Arc::new(TestMemoryExec::try_new(&[], schema.clone(), None)?) as Arc<dyn ExecutionPlan>;
-        let host = FilterExec::try_new(bool_literal(), input)?.with_projection(Some(vec![0usize]))?;
+        let input =
+            Arc::new(TestMemoryExec::try_new(&[], schema.clone(), None)?) as Arc<dyn ExecutionPlan>;
+        let host =
+            FilterExec::try_new(bool_literal(), input)?.with_projection(Some(vec![0usize]))?;
         let exec = Arc::new(super::CuDFFilterExec::try_new(host)?);
 
-        let new_input = Arc::new(TestMemoryExec::try_new(&[], schema, None)?) as Arc<dyn ExecutionPlan>;
+        let new_input =
+            Arc::new(TestMemoryExec::try_new(&[], schema, None)?) as Arc<dyn ExecutionPlan>;
         let updated = exec.with_new_children(vec![new_input])?;
 
         assert_eq!(updated.schema().fields().len(), 1);

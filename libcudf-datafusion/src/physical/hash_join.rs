@@ -61,10 +61,33 @@ fn normalized_properties(node: &HashJoinExec) -> PlanProperties {
 impl CuDFHashJoinExec {
     pub fn try_new(node: &HashJoinExec) -> Result<Self, DataFusionError> {
         let properties = normalized_properties(node);
-        // Guard before calling partition_statistics: DataFusion's estimate_join_statistics
-        // does an unchecked column_statistics[index] access and panics when an on-key column
-        // index is out of bounds. This happens during transform_up when children have been
-        // narrowed but on-key indices still reference the original wider schema.
+        // Guard before calling partition_statistics: DataFusion's estimate_join_cardinality
+        // (joins/utils.rs) does an unchecked `column_statistics[index]` access and panics
+        // when an on-key column index is out of bounds.
+        //
+        // How the stale index arises during transform_up:
+        //
+        // Before optimizer adds projection=[0,1] to inner join:
+        // ```
+        // HashJoinExec (outer)
+        //   on: [left.outer_key @ idx=3 = r.outer_key @ idx=0]
+        //   left  -> HashJoinExec (inner)   schema: [key(0), val(1), key(2), outer_key(3)]
+        //   right -> r                      schema: [outer_key(0), result(1)]
+        // ```
+        //
+        // After optimizer narrows inner join output to projection=[0,1]:
+        // ```
+        // HashJoinExec (outer)                       <- on-keys NOT re-validated
+        //   on: [left.outer_key @ idx=3 = ...]       <- idx=3 is now STALE
+        //   left  -> CuDFHashJoinExec (inner)  schema: [key(0), val(1)]  <- only 2 cols
+        //   right -> r
+        // ```
+        //
+        // Calling partition_statistics on the outer join then triggers:
+        //   column_statistics[3] on a Vec with 2 entries -> PANIC
+        //
+        // HashJoinExec::with_new_children does not re-validate on-key indices against the
+        // new child schemas, so this state is reachable. We skip statistics rather than panic.
         let on_indices_valid = node.on().iter().all(|(l, r)| {
             let l_ok = l
                 .as_any()
@@ -630,12 +653,21 @@ mod test {
         )];
         let filter = JoinFilter::new(
             Arc::new(Column::new("key", 0)) as Arc<dyn PhysicalExpr>,
-            vec![ColumnIndex { index: 0, side: JoinSide::Left }],
+            vec![ColumnIndex {
+                index: 0,
+                side: JoinSide::Left,
+            }],
             Arc::clone(&schema),
         );
         let join = HashJoinExec::try_new(
-            left, right, on, Some(filter), &JoinType::Inner, None,
-            PartitionMode::CollectLeft, NullEquality::NullEqualsNothing,
+            left,
+            right,
+            on,
+            Some(filter),
+            &JoinType::Inner,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
         )?;
         assert!(try_as_cudf_hash_join(&join)?.is_none());
         Ok(())
