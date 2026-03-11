@@ -2,7 +2,7 @@ use crate::errors::cudf_to_df;
 use crate::physical::cudf_load::{cast_to_target_schema, cudf_schema_compatibility_map};
 use arrow::array::{Array, RecordBatch};
 use arrow::compute::concat_batches;
-use arrow_schema::SchemaRef;
+use arrow_schema::{Schema, SchemaRef};
 use datafusion::common::{JoinType, NullEquality, Statistics};
 use datafusion::error::DataFusionError;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -205,50 +205,54 @@ impl ExecutionPlan for CuDFHashJoinExec {
             }
         };
 
-        let join_type = self.join_type;
-        let left_on: Vec<usize> = self
-            .on
-            .iter()
-            .map(|(l, _)| {
-                l.as_any()
-                    .downcast_ref::<Column>()
-                    .ok_or_else(|| {
-                        DataFusionError::Internal(
-                            "CuDFHashJoinExec: left join key is not a Column expression".into(),
-                        )
-                    })
-                    .map(|c| c.index())
-            })
-            .collect::<Result<_, _>>()?;
-        let right_on: Vec<usize> = self
-            .on
-            .iter()
-            .map(|(_, r)| {
-                r.as_any()
-                    .downcast_ref::<Column>()
-                    .ok_or_else(|| {
-                        DataFusionError::Internal(
-                            "CuDFHashJoinExec: right join key is not a Column expression".into(),
-                        )
-                    })
-                    .map(|c| c.index())
-            })
-            .collect::<Result<_, _>>()?;
-        let projection = self.projection.clone();
-        let output_schema = self.schema();
+        let params = JoinParams {
+            join_type: self.join_type,
+            left_on: self
+                .on
+                .iter()
+                .map(|(l, _)| {
+                    l.as_any()
+                        .downcast_ref::<Column>()
+                        .ok_or_else(|| {
+                            DataFusionError::Internal(
+                                "CuDFHashJoinExec: left join key is not a Column expression".into(),
+                            )
+                        })
+                        .map(|c| c.index())
+                })
+                .collect::<Result<_, _>>()?,
+            right_on: self
+                .on
+                .iter()
+                .map(|(_, r)| {
+                    r.as_any()
+                        .downcast_ref::<Column>()
+                        .ok_or_else(|| {
+                            DataFusionError::Internal(
+                                "CuDFHashJoinExec: right join key is not a Column expression"
+                                    .into(),
+                            )
+                        })
+                        .map(|c| c.index())
+                })
+                .collect::<Result<_, _>>()?,
+            projection: self.projection.clone(),
+            output_schema: self.schema(),
+            join_schema: cudf_schema_compatibility_map(Arc::new(Schema::new(
+                self.left
+                    .schema()
+                    .fields()
+                    .iter()
+                    .chain(self.right.schema().fields())
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            ))),
+        };
 
         let stream = futures::stream::once(async move {
             let left = left_fut.await?;
             let right_batches: Vec<RecordBatch> = right_stream.try_collect().await?;
-            let join_result = perform_join(
-                &left,
-                &right_batches,
-                join_type,
-                &left_on,
-                &right_on,
-                &projection,
-                &output_schema,
-            )?;
+            let join_result = perform_join(&left, &right_batches, &params)?;
             Ok(join_result)
         })
         .filter_map(|result| async move {
@@ -289,17 +293,37 @@ fn collect_shared(
     })
 }
 
+/// Everything `perform_join` needs, extracted from `self`.
+///
+/// Two schemas are required because cuDF joins work in two steps:
+/// 1. The raw join result has all left and right columns (`join_schema`).
+///   `to_record_batch_with_schema` uses this to restore correct types.
+/// 2. `apply_projection` then selects the final output columns and attaches `output_schema`,
+///    which is what downstream operators expect.
+struct JoinParams {
+    join_type: JoinType,
+    left_on: Vec<usize>,
+    right_on: Vec<usize>,
+    projection: Option<Vec<usize>>,
+    join_schema: SchemaRef,
+    output_schema: SchemaRef,
+}
+
 /// Run the cuDF join kernel and apply the output projection. Returns `None`
 /// for inner joins with no matching rows.
 fn perform_join(
     left: &Arc<CuDFTable>,
     right_batches: &[RecordBatch],
-    join_type: JoinType,
-    left_on: &[usize],
-    right_on: &[usize],
-    projection: &Option<Vec<usize>>,
-    output_schema: &SchemaRef,
+    params: &JoinParams,
 ) -> Result<Option<RecordBatch>, DataFusionError> {
+    let JoinParams {
+        join_type,
+        left_on,
+        right_on,
+        projection,
+        join_schema,
+        output_schema,
+    } = params;
     let right_empty = right_batches.is_empty() || right_batches.iter().all(|b| b.num_rows() == 0);
 
     // Inner join with no right rows: no matches possible, emit nothing.
@@ -334,7 +358,10 @@ fn perform_join(
     }
     .map_err(cudf_to_df)?;
 
-    let batch = result.into_view().to_record_batch().map_err(cudf_to_df)?;
+    let batch = result
+        .into_view()
+        .to_record_batch_with_schema(join_schema)
+        .map_err(cudf_to_df)?;
     apply_projection(batch, projection, Arc::clone(output_schema)).map(Some)
 }
 

@@ -1,6 +1,6 @@
 use crate::errors::cudf_to_df;
 use crate::expr::{columnar_value_to_cudf, cudf_to_columnar_value, expr_to_cudf_expr};
-use arrow::array::{AsArray, RecordBatch};
+use arrow::array::RecordBatch;
 use arrow_schema::{DataType, FieldRef, Schema};
 use datafusion::common::DataFusionError;
 use datafusion::logical_expr::ColumnarValue;
@@ -8,7 +8,7 @@ use datafusion::physical_expr::expressions::BinaryExpr;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion_expr::Operator;
 use delegate::delegate;
-use libcudf_rs::{cudf_binary_op, CuDFBinaryOp};
+use libcudf_rs::{cast, cudf_binary_op, CuDFBinaryOp, CuDFColumnViewOrScalar};
 use std::any::Any;
 use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
@@ -67,49 +67,52 @@ impl PhysicalExpr for CuDFBinaryExpr {
     }
 
     fn evaluate(&self, batch: &RecordBatch) -> datafusion::common::Result<ColumnarValue> {
-        // Get BOTH the expected output type (from host) AND the CuDF output type (normalized precision)
-        let expected_output_type = self.data_type(batch.schema_ref())?;
+        let expected = self.data_type(batch.schema_ref())?;
 
-        // For CuDF binary op, use normalized decimal precision (38)
-        let cudf_output_type = match &expected_output_type {
-            DataType::Decimal128(_, scale) => DataType::Decimal128(38, *scale),
-            DataType::Decimal32(_, scale) => DataType::Decimal32(9, *scale),
-            DataType::Decimal64(_, scale) => DataType::Decimal64(18, *scale),
-            _ => expected_output_type.clone(),
-        };
+        let mut lhs = columnar_value_to_cudf(self.left.evaluate(batch)?)?;
+        let rhs = columnar_value_to_cudf(self.right.evaluate(batch)?)?;
 
-        let lhs = self.left.evaluate(batch)?;
-        let lhs = columnar_value_to_cudf(lhs)?;
-        let rhs = self.right.evaluate(batch)?;
-        let rhs = columnar_value_to_cudf(rhs)?;
-
-        let result = cudf_binary_op(lhs, rhs, self.op, &cudf_output_type).map_err(cudf_to_df)?;
-        let mut result = cudf_to_columnar_value(result);
-
-        // CuDF returns decimals with maximum precision (38), but DataFusion may expect a different precision.
-        // Cast the result if needed to match the expected output type.
-        if let ColumnarValue::Array(arr) = &result {
-            if arr.data_type() != &expected_output_type {
-                if let (
-                    DataType::Decimal128(_, result_scale),
-                    DataType::Decimal128(_expected_prec, expected_scale),
-                ) = (arr.data_type(), &expected_output_type)
-                {
-                    if result_scale == expected_scale {
-                        // Same scale, just different precision. Arrow's cast doesn't handle this,
-                        // so we manually change the precision metadata while keeping the same i128 values.
-                        let decimal_array = arr.as_primitive::<arrow::datatypes::Decimal128Type>();
-                        let casted = decimal_array
-                            .clone()
-                            .with_precision_and_scale(*_expected_prec, *expected_scale)
-                            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-                        result = ColumnarValue::Array(Arc::new(casted));
-                    }
+        // cuDF Div computes floor(lhs_raw / rhs_raw) * 10^(s3-s1+s2). When s2+s3 > s1,
+        // the floor step truncates before scaling is applied, e.g. 1.00/4.00 (s1=s2=2, s3=6):
+        //   floor(100 / 400) * 10^6 = 0 -> wrong
+        // Cast lhs to scale s2+s3 first so the cuDF factor becomes 10^0=1:
+        //   cast lhs scale 2→8: raw 100 -> 100_000_000
+        //   floor(100_000_000 / 400) * 10^0 = 250_000 at scale 6 = 0.250000 -> correct
+        if self.op == CuDFBinaryOp::Div {
+            let lhs_type = self.left.data_type(batch.schema_ref())?;
+            let rhs_type = self.right.data_type(batch.schema_ref())?;
+            if let (
+                DataType::Decimal128(_, s1),
+                DataType::Decimal128(_, s2),
+                DataType::Decimal128(_, s3),
+            ) = (&lhs_type, &rhs_type, &expected)
+            {
+                let target_scale = (*s2 as i32) + (*s3 as i32);
+                let scale_shift = target_scale - (*s1 as i32);
+                if scale_shift > 38 || target_scale > 38 {
+                    return Err(DataFusionError::Internal(format!(
+                        "decimal division pre-scaling overflow: shift={scale_shift}, target_scale={target_scale}"
+                    )));
+                }
+                if scale_shift > 0 {
+                    let lhs_view = match lhs {
+                        CuDFColumnViewOrScalar::ColumnView(v) => v,
+                        _ => {
+                            return Err(DataFusionError::Internal(
+                                "decimal division: expected column for lhs".into(),
+                            ))
+                        }
+                    };
+                    let cast_col = cast(&lhs_view, &DataType::Decimal128(38, target_scale as i8))
+                        .map_err(cudf_to_df)?;
+                    lhs = CuDFColumnViewOrScalar::ColumnView(cast_col.into_view());
                 }
             }
         }
 
-        Ok(result)
+        let cudf_output_type = max_precision(&expected);
+        let result = cudf_binary_op(lhs, rhs, self.op, &cudf_output_type).map_err(cudf_to_df)?;
+        Ok(cudf_to_columnar_value(result))
     }
 
     fn with_new_children(
@@ -131,6 +134,16 @@ impl PhysicalExpr for CuDFBinaryExpr {
             fn data_type(&self, input_schema: &Schema) -> datafusion::common::Result<DataType>;
             fn return_field(&self, input_schema: &Schema) -> datafusion::common::Result<FieldRef>;
         }
+    }
+}
+
+/// Normalise decimal precision to cuDF's fixed storage width; other types pass through unchanged.
+fn max_precision(dt: &DataType) -> DataType {
+    match dt {
+        DataType::Decimal128(_, s) => DataType::Decimal128(38, *s),
+        DataType::Decimal32(_, s) => DataType::Decimal32(9, *s),
+        DataType::Decimal64(_, s) => DataType::Decimal64(18, *s),
+        _ => dt.clone(),
     }
 }
 
@@ -201,6 +214,7 @@ mod tests {
     use crate::assert_snapshot;
     use crate::test_utils::TestFramework;
     use datafusion::common::assert_contains;
+    use std::error::Error;
 
     #[tokio::test]
     async fn test_binary_operations() -> Result<(), Box<dyn std::error::Error>> {
@@ -244,6 +258,30 @@ mod tests {
         let host_result = tf.execute(host_sql).await?;
         assert_eq!(host_result.pretty_print, result.pretty_print);
 
+        Ok(())
+    }
+
+    /// Decimal division where numerator < denominator would return 0 with raw cuDF Div.
+    /// The pre-scaling fix in evaluate() must produce the same result as CPU execution.
+    #[tokio::test]
+    async fn test_decimal_division() -> Result<(), Box<dyn Error>> {
+        let tf = TestFramework::new().await;
+        let host_sql = r#"
+            SELECT a / b as ratio
+            FROM (VALUES
+                (CAST(1.00 AS DECIMAL(10,2)), CAST(4.00 AS DECIMAL(10,2))),
+                (CAST(3.00 AS DECIMAL(10,2)), CAST(4.00 AS DECIMAL(10,2))),
+                (CAST(22.50 AS DECIMAL(10,2)), CAST(4.50 AS DECIMAL(10,2)))
+            ) AS t(a, b)
+            ORDER BY a
+        "#;
+        let cudf_sql = format!(
+            "SET datafusion.execution.target_partitions=1; SET cudf.enable=true; {host_sql}"
+        );
+        let cudf = tf.execute(&cudf_sql).await?;
+        let host = tf.execute(host_sql).await?;
+        assert_contains!(cudf.plan, "CuDF");
+        assert_eq!(host.pretty_print, cudf.pretty_print);
         Ok(())
     }
 }
