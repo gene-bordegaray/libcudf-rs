@@ -1,9 +1,9 @@
 use crate::cudf_reference::CuDFRef;
 use crate::{CuDFColumnView, CuDFError};
-use arrow::array::{ArrayRef, RecordBatch, StructArray};
+use arrow::array::{Array, ArrayRef, RecordBatch, StructArray};
 use arrow::ffi::{from_ffi, FFI_ArrowArray};
 use arrow_schema::ffi::FFI_ArrowSchema;
-use arrow_schema::{ArrowError, Schema};
+use arrow_schema::{ArrowError, Schema, SchemaRef};
 use cxx::UniquePtr;
 use libcudf_sys::ffi;
 use std::sync::Arc;
@@ -199,6 +199,35 @@ impl CuDFTableView {
             .collect();
 
         Ok(RecordBatch::try_new(Arc::new(self.schema()?), columns)?)
+    }
+
+    /// Like `to_record_batch`, but attaches `schema` to relabel column names and
+    /// reconcile any type precision differences.
+    pub fn to_record_batch_with_schema(
+        &self,
+        schema: &SchemaRef,
+    ) -> Result<RecordBatch, CuDFError> {
+        if self.num_columns() != schema.fields().len() {
+            return Err(CuDFError::ArrowError(ArrowError::InvalidArgumentError(
+                format!(
+                    "to_record_batch_with_schema: table has {} columns but schema has {} fields",
+                    self.num_columns(),
+                    schema.fields().len()
+                ),
+            )));
+        }
+        let columns: Vec<ArrayRef> = (0..self.num_columns())
+            .zip(schema.fields())
+            .map(|(i, field)| {
+                let col = self.column(i as i32);
+                if col.data_type() != field.data_type() {
+                    Arc::new(col.with_data_type(field.data_type().clone())) as _
+                } else {
+                    Arc::new(col) as _
+                }
+            })
+            .collect();
+        Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
     }
 
     /// Create a table view from a RecordBatch containing CuDF arrays (GPU)

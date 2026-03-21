@@ -1,8 +1,7 @@
 use crate::errors::cudf_to_df;
-use crate::physical::cudf_load::{cast_to_target_schema, cudf_schema_compatibility_map};
-use arrow::array::{Array, RecordBatch};
-use arrow::compute::concat_batches;
-use arrow_schema::SchemaRef;
+use crate::physical::cudf_load::cudf_schema_compatibility_map;
+use arrow::array::RecordBatch;
+use arrow_schema::{Field, Schema, SchemaRef};
 use datafusion::common::{JoinType, NullEquality, Statistics};
 use datafusion::error::DataFusionError;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -11,10 +10,10 @@ use datafusion_physical_plan::expressions::Column;
 use datafusion_physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::{
-    execute_stream, DisplayAs, DisplayFormatType, ExecutionPlan, PhysicalExpr, PlanProperties,
+    execute_stream, project_schema, DisplayAs, DisplayFormatType, ExecutionPlan,
+    ExecutionPlanProperties, PhysicalExpr, PlanProperties,
 };
-use futures::StreamExt;
-use futures_util::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use libcudf_rs::{full_join, inner_join, left_join, CuDFTable, CuDFTableView};
 use std::any::Any;
 use std::fmt::Formatter;
@@ -25,8 +24,7 @@ use tokio::sync::OnceCell;
 ///
 /// Replaces DataFusion's `HashJoinExec` for equi-joins where all keys are
 /// simple column references. Supports `Inner`, `Left`, and `Full` join types.
-/// The right side is uploaded from host memory, the left side is expected to
-/// already be on GPU (via `CuDFLoadExec`).
+/// Both children are expected to be GPU-resident (via `CuDFLoadExec`).
 pub struct CuDFHashJoinExec {
     left: Arc<dyn ExecutionPlan>,
     right: Arc<dyn ExecutionPlan>,
@@ -34,8 +32,9 @@ pub struct CuDFHashJoinExec {
     join_type: JoinType,
     projection: Option<Vec<usize>>,
     partition_mode: PartitionMode,
+    left_on: Vec<usize>,
+    right_on: Vec<usize>,
     properties: PlanProperties,
-    statistics: Statistics,
     shared_table: Arc<OnceCell<Arc<CuDFTable>>>,
 }
 
@@ -48,76 +47,116 @@ impl std::fmt::Debug for CuDFHashJoinExec {
     }
 }
 
-/// Derive plan properties from `node` with the schema normalized for cuDF types.
-fn normalized_properties(node: &HashJoinExec) -> PlanProperties {
-    PlanProperties::new(
-        EquivalenceProperties::new(cudf_schema_compatibility_map(node.schema())),
-        node.properties().partitioning.clone(),
-        node.properties().emission_type,
-        node.properties().boundedness,
-    )
+/// Merge left and right schemas into raw join output schema (pre-projection),
+/// adjusting field nullability to match the join type, then normalize types for cuDF.
+fn build_join_schema(left: &SchemaRef, right: &SchemaRef, join_type: JoinType) -> SchemaRef {
+    let left_nullable = matches!(join_type, JoinType::Full);
+    let right_nullable = matches!(join_type, JoinType::Left | JoinType::Full);
+
+    let fields: Vec<_> = left
+        .fields()
+        .iter()
+        .map(|f| {
+            if left_nullable && !f.is_nullable() {
+                Arc::new(Field::new(f.name(), f.data_type().clone(), true))
+            } else {
+                Arc::clone(f)
+            }
+        })
+        .chain(right.fields().iter().map(|f| {
+            if right_nullable && !f.is_nullable() {
+                Arc::new(Field::new(f.name(), f.data_type().clone(), true))
+            } else {
+                Arc::clone(f)
+            }
+        }))
+        .collect();
+
+    cudf_schema_compatibility_map(Arc::new(Schema::new(fields)))
+}
+
+fn extract_column_indices(
+    on: &[(Arc<dyn PhysicalExpr>, Arc<dyn PhysicalExpr>)],
+    left_side: bool,
+) -> Result<Vec<usize>, DataFusionError> {
+    on.iter()
+        .map(|(l, r)| {
+            let expr = if left_side { l } else { r };
+            expr.as_any()
+                .downcast_ref::<Column>()
+                .ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "CuDFHashJoinExec: join key is not a Column expression".into(),
+                    )
+                })
+                .map(|c| c.index())
+        })
+        .collect()
 }
 
 impl CuDFHashJoinExec {
-    pub fn try_new(node: &HashJoinExec) -> Result<Self, DataFusionError> {
-        let properties = normalized_properties(node);
-        // Guard before calling partition_statistics: DataFusion's estimate_join_cardinality
-        // (joins/utils.rs) does an unchecked `column_statistics[index]` access and panics
-        // when an on-key column index is out of bounds.
-        //
-        // How the stale index arises during transform_up:
-        //
-        // Before optimizer adds projection=[0,1] to inner join:
-        // ```
-        // HashJoinExec (outer)
-        //   on: [left.outer_key @ idx=3 = r.outer_key @ idx=0]
-        //   left  -> HashJoinExec (inner)   schema: [key(0), val(1), key(2), outer_key(3)]
-        //   right -> r                      schema: [outer_key(0), result(1)]
-        // ```
-        //
-        // After optimizer narrows inner join output to projection=[0,1]:
-        // ```
-        // HashJoinExec (outer)                       <- on-keys NOT re-validated
-        //   on: [left.outer_key @ idx=3 = ...]       <- idx=3 is now STALE
-        //   left  -> CuDFHashJoinExec (inner)  schema: [key(0), val(1)]  <- only 2 cols
-        //   right -> r
-        // ```
-        //
-        // Calling partition_statistics on the outer join then triggers:
-        //   column_statistics[3] on a Vec with 2 entries -> PANIC
-        //
-        // HashJoinExec::with_new_children does not re-validate on-key indices against the
-        // new child schemas, so this state is reachable. We skip statistics rather than panic.
-        let on_indices_valid = node.on().iter().all(|(l, r)| {
-            let l_ok = l
-                .as_any()
-                .downcast_ref::<Column>()
-                .map(|c| c.index() < node.left().schema().fields().len())
-                .unwrap_or(true);
-            let r_ok = r
-                .as_any()
-                .downcast_ref::<Column>()
-                .map(|c| c.index() < node.right().schema().fields().len())
-                .unwrap_or(true);
-            l_ok && r_ok
-        });
-        let statistics = if on_indices_valid {
-            node.partition_statistics(None)
-                .unwrap_or_else(|_| Statistics::new_unknown(&node.schema()))
-        } else {
-            Statistics::new_unknown(&node.schema())
+    pub fn try_new(
+        left: Arc<dyn ExecutionPlan>,
+        right: Arc<dyn ExecutionPlan>,
+        on: Vec<(Arc<dyn PhysicalExpr>, Arc<dyn PhysicalExpr>)>,
+        join_type: JoinType,
+        projection: Option<Vec<usize>>,
+        partition_mode: PartitionMode,
+    ) -> Result<Self, DataFusionError> {
+        let left_schema = left.schema();
+        let right_schema = right.schema();
+        let join_schema = build_join_schema(&left_schema, &right_schema, join_type);
+        let output_schema = project_schema(&join_schema, projection.as_ref())?;
+        let left_on = extract_column_indices(&on, true)?;
+        let right_on = extract_column_indices(&on, false)?;
+
+        let left_len = left_schema.fields().len();
+        let right_len = right_schema.fields().len();
+        for (l, r) in left_on.iter().zip(&right_on) {
+            if *l >= left_len || *r >= right_len {
+                return datafusion::common::plan_err!(
+                    "CuDFHashJoinExec: on-key index out of bounds (left={l}/{left_len}, right={r}/{right_len})"
+                );
+            }
+        }
+
+        // Output partitioning follows the probe side for CollectLeft, and the build side
+        // otherwise.
+        let output_partitioning = match partition_mode {
+            PartitionMode::CollectLeft => right.output_partitioning().clone(),
+            _ => left.output_partitioning().clone(),
         };
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(output_schema),
+            output_partitioning,
+            left.pipeline_behavior(),
+            left.boundedness(),
+        );
+
         Ok(Self {
-            left: node.left().clone(),
-            right: node.right().clone(),
-            on: node.on().to_vec(),
-            join_type: *node.join_type(),
-            projection: node.projection.clone(),
-            partition_mode: *node.partition_mode(),
+            left,
+            right,
+            on,
+            join_type,
+            projection,
+            partition_mode,
+            left_on,
+            right_on,
             properties,
-            statistics,
             shared_table: Arc::new(OnceCell::new()),
         })
+    }
+
+    /// Extract fields from a DataFusion `HashJoinExec` and call `try_new`.
+    pub fn from_hash_join_exec(node: &HashJoinExec) -> Result<Self, DataFusionError> {
+        Self::try_new(
+            node.left().clone(),
+            node.right().clone(),
+            node.on().to_vec(),
+            *node.join_type(),
+            node.projection.clone(),
+            *node.partition_mode(),
+        )
     }
 }
 
@@ -149,12 +188,9 @@ impl ExecutionPlan for CuDFHashJoinExec {
 
     fn partition_statistics(
         &self,
-        partition: Option<usize>,
+        _partition: Option<usize>,
     ) -> Result<Statistics, DataFusionError> {
-        if partition.is_some() {
-            return Ok(Statistics::new_unknown(&self.schema()));
-        }
-        Ok(self.statistics.clone())
+        Ok(Statistics::new_unknown(&self.schema()))
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -167,17 +203,14 @@ impl ExecutionPlan for CuDFHashJoinExec {
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
         let right = children.swap_remove(1);
         let left = children.swap_remove(0);
-        Ok(Arc::new(Self {
+        Ok(Arc::new(Self::try_new(
             left,
             right,
-            on: self.on.clone(),
-            join_type: self.join_type,
-            projection: self.projection.clone(),
-            partition_mode: self.partition_mode,
-            properties: self.properties.clone(),
-            statistics: Statistics::new_unknown(&self.schema()),
-            shared_table: Arc::new(OnceCell::new()),
-        }))
+            self.on.clone(),
+            self.join_type,
+            self.projection.clone(),
+            self.partition_mode,
+        )?))
     }
 
     fn execute(
@@ -185,10 +218,10 @@ impl ExecutionPlan for CuDFHashJoinExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> datafusion::common::Result<SendableRecordBatchStream> {
-        let right_stream = Arc::clone(&self.right).execute(partition, Arc::clone(&context))?;
+        let right_stream = self.right.execute(partition, Arc::clone(&context))?;
 
-        // CollectLeft: all right-side partition streams share one left table via OnceCell,
-        // so the left child is executed at most once regardless of output partition count.
+        // CollectLeft: all partition streams share one left table via OnceCell,
+        // so the left child is executed at most once regardless of partition count.
         // Partitioned/Auto: each partition builds its own left table independently.
         let left_fut = match &self.partition_mode {
             PartitionMode::CollectLeft => collect_shared(
@@ -206,50 +239,43 @@ impl ExecutionPlan for CuDFHashJoinExec {
         };
 
         let join_type = self.join_type;
-        let left_on: Vec<usize> = self
-            .on
-            .iter()
-            .map(|(l, _)| {
-                l.as_any()
-                    .downcast_ref::<Column>()
-                    .ok_or_else(|| {
-                        DataFusionError::Internal(
-                            "CuDFHashJoinExec: left join key is not a Column expression".into(),
-                        )
-                    })
-                    .map(|c| c.index())
-            })
-            .collect::<Result<_, _>>()?;
-        let right_on: Vec<usize> = self
-            .on
-            .iter()
-            .map(|(_, r)| {
-                r.as_any()
-                    .downcast_ref::<Column>()
-                    .ok_or_else(|| {
-                        DataFusionError::Internal(
-                            "CuDFHashJoinExec: right join key is not a Column expression".into(),
-                        )
-                    })
-                    .map(|c| c.index())
-            })
-            .collect::<Result<_, _>>()?;
+        let left_on = self.left_on.clone();
+        let right_on = self.right_on.clone();
         let projection = self.projection.clone();
         let output_schema = self.schema();
+        let right_schema = self.right.schema();
 
         let stream = futures::stream::once(async move {
             let left = left_fut.await?;
             let right_batches: Vec<RecordBatch> = right_stream.try_collect().await?;
-            let join_result = perform_join(
-                &left,
-                &right_batches,
+
+            let right_empty =
+                right_batches.is_empty() || right_batches.iter().all(|b| b.num_rows() == 0);
+
+            // Inner join with no right rows: no matches possible, emit nothing.
+            if matches!(join_type, JoinType::Inner) && right_empty {
+                return Ok(None);
+            }
+
+            // For Left/Full joins with no right batches, synthesize an empty right table
+            // from the child schema so the join kernel returns all left rows with null
+            // right columns.
+            let right = if right_batches.is_empty() {
+                let empty = RecordBatch::new_empty(right_schema);
+                Arc::new(CuDFTable::from_arrow_host(empty).map_err(cudf_to_df)?)
+            } else {
+                Arc::new(batches_to_table(&right_batches).map_err(cudf_to_df)?)
+            };
+
+            perform_join(
+                left,
+                right,
                 join_type,
                 &left_on,
                 &right_on,
-                &projection,
                 &output_schema,
-            )?;
-            Ok(join_result)
+                &projection,
+            )
         })
         .filter_map(|result| async move {
             match result {
@@ -266,7 +292,7 @@ impl ExecutionPlan for CuDFHashJoinExec {
     }
 }
 
-/// Materialize the left (build) side once and share across partitions via `OnceCell`.
+/// Materialize the left side once and share across partitions via `OnceCell`.
 fn collect_shared(
     shared: Arc<OnceCell<Arc<CuDFTable>>>,
     left_child: Arc<dyn ExecutionPlan>,
@@ -292,40 +318,67 @@ fn collect_shared(
 /// Run the cuDF join kernel and apply the output projection. Returns `None`
 /// for inner joins with no matching rows.
 fn perform_join(
-    left: &Arc<CuDFTable>,
-    right_batches: &[RecordBatch],
+    left: Arc<CuDFTable>,
+    right: Arc<CuDFTable>,
     join_type: JoinType,
     left_on: &[usize],
     right_on: &[usize],
-    projection: &Option<Vec<usize>>,
     output_schema: &SchemaRef,
+    projection: &Option<Vec<usize>>,
 ) -> Result<Option<RecordBatch>, DataFusionError> {
-    let right_empty = right_batches.is_empty() || right_batches.iter().all(|b| b.num_rows() == 0);
+    let left_view = left.view();
+    let right_view = right.view();
 
-    // Inner join with no right rows: no matches possible, emit nothing.
-    if matches!(join_type, JoinType::Inner) && right_empty {
-        return Ok(None);
-    }
-
-    // TODO: Left/Full join with a completely empty right partition (no batches, not even a
-    // zero-row batch) should return all left rows with nulls in the right columns.
-    // host_batches_to_table panics on batches[0] when the slice is empty.
-    // Fix: carry the right child schema here and synthesise an empty CuDFTable from it.
-    if right_batches.is_empty() {
-        return Err(DataFusionError::NotImplemented(
-            "CuDFHashJoinExec: Left/Full join with zero right-side batches is not yet supported"
-                .to_string(),
-        ));
-    }
-
-    let left_view = Arc::clone(left).view();
-    let right_table = host_batches_to_table(right_batches)?;
-    let right_view = right_table.into_view();
+    // Decompose projection into per-side column lists.
+    //
+    // Projection must be strictly ascending with all left-side indices (< left_width)
+    // appearing before right-side indices. DataFusion always emits join projections in
+    // this order.
+    debug_assert!(
+        projection
+            .as_ref()
+            .is_none_or(|p| p.windows(2).all(|w| w[0] < w[1])),
+        "join projection indices must be strictly ascending"
+    );
+    let left_width = left_view.num_columns();
+    let (left_out, right_out) = match projection {
+        None => (None, None),
+        Some(proj) => {
+            let lc: Vec<usize> = proj.iter().filter(|&&i| i < left_width).copied().collect();
+            let rc: Vec<usize> = proj
+                .iter()
+                .filter(|&&i| i >= left_width)
+                .map(|&i| i - left_width)
+                .collect();
+            (Some(lc), Some(rc))
+        }
+    };
 
     let result = match join_type {
-        JoinType::Inner => inner_join(&left_view, &right_view, left_on, right_on),
-        JoinType::Left => left_join(&left_view, &right_view, left_on, right_on),
-        JoinType::Full => full_join(&left_view, &right_view, left_on, right_on),
+        JoinType::Inner => inner_join(
+            &left_view,
+            &right_view,
+            left_on,
+            right_on,
+            left_out.as_deref(),
+            right_out.as_deref(),
+        ),
+        JoinType::Left => left_join(
+            &left_view,
+            &right_view,
+            left_on,
+            right_on,
+            left_out.as_deref(),
+            right_out.as_deref(),
+        ),
+        JoinType::Full => full_join(
+            &left_view,
+            &right_view,
+            left_on,
+            right_on,
+            left_out.as_deref(),
+            right_out.as_deref(),
+        ),
         other => {
             return Err(DataFusionError::NotImplemented(format!(
                 "CuDFHashJoinExec: unsupported join type {other:?}"
@@ -334,44 +387,25 @@ fn perform_join(
     }
     .map_err(cudf_to_df)?;
 
-    let batch = result.into_view().to_record_batch().map_err(cudf_to_df)?;
-    apply_projection(batch, projection, Arc::clone(output_schema)).map(Some)
+    let batch = result
+        .into_view()
+        .to_record_batch_with_schema(output_schema)
+        .map_err(cudf_to_df)?;
+
+    Ok(Some(batch))
 }
 
-/// Concat GPU-resident record batches (already `CuDFColumnView` arrays) into one table.
+/// Concat GPU-resident record batches into one table.
+///
+/// # Panics
+///
+/// Panics if any column in any batch is not a GPU-resident `CuDFColumnView`.
 fn batches_to_table(batches: &[RecordBatch]) -> Result<CuDFTable, libcudf_rs::CuDFError> {
     let views: Vec<CuDFTableView> = batches
         .iter()
         .map(CuDFTableView::from_record_batch)
         .collect::<Result<_, _>>()?;
     CuDFTable::concat(views)
-}
-
-/// Concat host batches on CPU, then upload to GPU in one transfer.
-fn host_batches_to_table(batches: &[RecordBatch]) -> Result<CuDFTable, DataFusionError> {
-    let schema = cudf_schema_compatibility_map(batches[0].schema());
-    let cast: Vec<RecordBatch> = batches
-        .iter()
-        .map(|b| cast_to_target_schema(b.clone(), Arc::clone(&schema)))
-        .collect::<Result<_, _>>()?;
-    let batch = concat_batches(&schema, &cast)?;
-    CuDFTable::from_arrow_host(batch).map_err(cudf_to_df)
-}
-
-/// Select output columns per the join's projection and attach the output schema.
-fn apply_projection(
-    batch: RecordBatch,
-    projection: &Option<Vec<usize>>,
-    schema: SchemaRef,
-) -> Result<RecordBatch, DataFusionError> {
-    match projection {
-        Some(proj) => {
-            let cols: Vec<Arc<dyn Array>> =
-                proj.iter().map(|&i| Arc::clone(batch.column(i))).collect();
-            Ok(RecordBatch::try_new(schema, cols)?)
-        }
-        None => Ok(RecordBatch::try_new(schema, batch.columns().to_vec())?),
-    }
 }
 
 /// Try to convert a `HashJoinExec` to GPU. Returns `None` for unsupported
@@ -400,7 +434,7 @@ pub fn try_as_cudf_hash_join(
         return Ok(None);
     }
 
-    Ok(Some(Arc::new(CuDFHashJoinExec::try_new(node)?)))
+    Ok(Some(Arc::new(CuDFHashJoinExec::from_hash_join_exec(node)?)))
 }
 
 #[cfg(test)]
@@ -456,29 +490,24 @@ mod test {
     ) -> Result<Vec<RecordBatch>, Box<dyn Error>> {
         let ls = left.schema();
         let rs = right.schema();
-        // Left (build) side: optimizer inserts CuDFLoadExec, so simulate that here.
+        // Both sides go through CuDFLoadExec — symmetric GPU upload.
         let left_in = Arc::new(CuDFLoadExec::try_new(Arc::new(TestMemoryExec::try_new(
             &[vec![left]],
             ls.clone(),
             None,
         )?))?);
-        // Right (probe) side: CuDFHashJoinExec owns the upload, no CuDFLoadExec.
-        let right_in = Arc::new(TestMemoryExec::try_new(&[vec![right]], rs.clone(), None)?);
+        let right_in = Arc::new(CuDFLoadExec::try_new(Arc::new(TestMemoryExec::try_new(
+            &[vec![right]],
+            rs.clone(),
+            None,
+        )?))?);
         let on = vec![(
             Arc::new(Column::new("key", 0)) as Arc<dyn PhysicalExpr>,
             Arc::new(Column::new("key", 0)) as Arc<dyn PhysicalExpr>,
         )];
-        let inner = HashJoinExec::try_new(
-            left_in,
-            right_in,
-            on,
-            None,
-            &join_type,
-            None,
-            partition_mode,
-            NullEquality::NullEqualsNothing,
-        )?;
-        let unload = CuDFUnloadExec::new(Arc::new(CuDFHashJoinExec::try_new(&inner)?));
+        let exec =
+            CuDFHashJoinExec::try_new(left_in, right_in, on, join_type, None, partition_mode)?;
+        let unload = CuDFUnloadExec::new(Arc::new(exec));
         let stream = unload.execute(0, Arc::new(TaskContext::default()))?;
         Ok(stream.try_collect::<Vec<_>>().await?)
     }
@@ -511,6 +540,43 @@ mod test {
         )
         .await?;
         assert_eq!(total_rows(&out), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_left_join_no_right_batches() -> Result<(), Box<dyn Error>> {
+        // Right partition produces zero batches.
+        // Left/Full joins must still return all left rows with nulls in right columns.
+        let ls = left_batch().schema();
+        let rs = right_batch().schema();
+        let left_in = Arc::new(CuDFLoadExec::try_new(Arc::new(TestMemoryExec::try_new(
+            &[vec![left_batch()]],
+            ls,
+            None,
+        )?))?);
+        let right_in = Arc::new(CuDFLoadExec::try_new(Arc::new(TestMemoryExec::try_new(
+            &[vec![]],
+            rs,
+            None,
+        )?))?);
+        let on = vec![(
+            Arc::new(Column::new("key", 0)) as Arc<dyn PhysicalExpr>,
+            Arc::new(Column::new("key", 0)) as Arc<dyn PhysicalExpr>,
+        )];
+        let exec = CuDFHashJoinExec::try_new(
+            left_in,
+            right_in,
+            on,
+            JoinType::Left,
+            None,
+            PartitionMode::CollectLeft,
+        )?;
+        let unload = CuDFUnloadExec::new(Arc::new(exec));
+        let stream = unload.execute(0, Arc::new(TaskContext::default()))?;
+        let out: Vec<RecordBatch> = stream.try_collect().await?;
+        // All 4 left rows preserved; right columns are null.
+        assert_eq!(total_rows(&out), 4);
+        assert_eq!(out[0].num_columns(), 4);
         Ok(())
     }
 
@@ -623,7 +689,7 @@ mod test {
             PartitionMode::Partitioned,
             NullEquality::NullEqualsNothing,
         )?;
-        let cudf_inner = Arc::new(CuDFHashJoinExec::try_new(&inner_projected)?);
+        let cudf_inner = Arc::new(CuDFHashJoinExec::from_hash_join_exec(&inner_projected)?);
 
         // transform_up calls with_new_children to inject the narrowed GPU child into the
         // outer join. HashJoinExec::with_new_children does not re-validate on-key columns,
@@ -635,10 +701,7 @@ mod test {
             .downcast_ref::<HashJoinExec>()
             .unwrap();
 
-        // Must convert this without calling HashJoinExec::try_new (which would
-        // re-validate the stale index-3 reference against the 2-column left child).
-        let converted = try_as_cudf_hash_join(outer_hj)?;
-        assert!(converted.is_some());
+        assert!(try_as_cudf_hash_join(outer_hj).is_err());
         Ok(())
     }
 

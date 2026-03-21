@@ -1,8 +1,8 @@
 use crate::aggregate::try_as_cudf_aggregate;
 use crate::optimizer::CuDFConfig;
 use crate::physical::{
-    is_cudf_plan, try_as_cudf_hash_join, CuDFCoalesceBatchesExec, CuDFFilterExec, CuDFHashJoinExec,
-    CuDFLoadExec, CuDFProjectionExec, CuDFSortExec, CuDFUnloadExec,
+    is_cudf_plan, try_as_cudf_hash_join, CuDFCoalesceBatchesExec, CuDFFilterExec, CuDFLoadExec,
+    CuDFProjectionExec, CuDFSortExec, CuDFUnloadExec,
 };
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::config::ConfigOptions;
@@ -90,18 +90,10 @@ impl PhysicalOptimizerRule for HostToCuDFRule {
             let plan_is_cudf = is_cudf_plan(plan.as_ref());
             let children = plan.children();
             let mut new_children: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(children.len());
-            for (child_idx, child) in children.iter().enumerate() {
+            for child in children.iter() {
                 let child_is_cudf = is_cudf_plan(child.as_ref());
 
-                // The probe (right, index 1) child of CuDFHashJoinExec is uploaded in bulk
-                // by the exec itself - do not insert CuDFLoadExec here.
-                let is_probe_child = plan.as_any().is::<CuDFHashJoinExec>() && child_idx == 1;
-
-                if plan_is_cudf
-                    && !child_is_cudf
-                    && !plan.as_any().is::<CuDFLoadExec>()
-                    && !is_probe_child
-                {
+                if plan_is_cudf && !child_is_cudf && !plan.as_any().is::<CuDFLoadExec>() {
                     if !child.as_any().is::<CoalesceBatchesExec>() {
                         let child = Arc::new(CoalesceBatchesExec::new(
                             Arc::clone(child),
