@@ -427,43 +427,48 @@ pub mod ffi {
             null_precedence: &[i32],
         ) -> Result<UniquePtr<Table>>;
 
-        // Join operations - direct cuDF mappings
+        // Join operations — fused join+gather cuDF mappings.
 
-        /// Inner join: returns a 2-column table [left_gather_map, right_gather_map] (INT32)
-        fn inner_join(left_keys: &TableView, right_keys: &TableView) -> Result<UniquePtr<Table>>;
-
-        /// Left join: returns a 2-column table; right_gather_map contains INT32_MIN for unmatched rows
-        fn left_join(left_keys: &TableView, right_keys: &TableView) -> Result<UniquePtr<Table>>;
-
-        /// Full outer join: returns a 2-column table; either map may contain INT32_MIN for unmatched rows
-        fn full_join(left_keys: &TableView, right_keys: &TableView) -> Result<UniquePtr<Table>>;
-
-        /// Left semi join: returns a 1-column table of matching left row indices
-        fn left_semi_join(
+        /// Inner join: gather matching rows from both payloads into one output table.
+        fn inner_join_gather(
             left_keys: &TableView,
             right_keys: &TableView,
+            left_payload: &TableView,
+            right_payload: &TableView,
         ) -> Result<UniquePtr<Table>>;
 
-        /// Left anti join: returns a 1-column table of non-matching left row indices
-        fn left_anti_join(
+        /// Left outer join: all left rows appear; unmatched right columns are null.
+        fn left_join_gather(
             left_keys: &TableView,
             right_keys: &TableView,
+            left_payload: &TableView,
+            right_payload: &TableView,
+        ) -> Result<UniquePtr<Table>>;
+
+        /// Full outer join: all rows from both sides; unmatched columns on either side are null.
+        fn full_join_gather(
+            left_keys: &TableView,
+            right_keys: &TableView,
+            left_payload: &TableView,
+            right_payload: &TableView,
+        ) -> Result<UniquePtr<Table>>;
+
+        /// Left semi join: gather only matching left rows (no right columns in output).
+        fn left_semi_join_gather(
+            left_keys: &TableView,
+            right_keys: &TableView,
+            left_payload: &TableView,
+        ) -> Result<UniquePtr<Table>>;
+
+        /// Left anti join: gather only non-matching left rows (no right columns in output).
+        fn left_anti_join_gather(
+            left_keys: &TableView,
+            right_keys: &TableView,
+            left_payload: &TableView,
         ) -> Result<UniquePtr<Table>>;
 
         /// Cross join: returns a full Cartesian product table
         fn cross_join(left: &TableView, right: &TableView) -> Result<UniquePtr<Table>>;
-
-        /// Gather with NULLIFY policy: converts INT32_MIN sentinel indices to null output rows
-        fn gather_nullify(
-            source_table: &TableView,
-            gather_map: &ColumnView,
-        ) -> Result<UniquePtr<Table>>;
-
-        /// Horizontally concatenate two tables, consuming their columns
-        fn hconcat_tables(
-            left: Pin<&mut Table>,
-            right: Pin<&mut Table>,
-        ) -> Result<UniquePtr<Table>>;
 
         // Aggregation factory functions - direct cuDF mappings (for reduce)
 

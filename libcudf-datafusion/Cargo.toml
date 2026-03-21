@@ -66,6 +66,10 @@ name = "aggregate"
 harness = false
 
 [[bench]]
+name = "join"
+harness = false
+
+[[bench]]
 name = "tpch_pipeline"
 harness = false
 
