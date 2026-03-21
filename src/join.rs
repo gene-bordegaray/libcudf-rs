@@ -1,42 +1,9 @@
 use crate::{CuDFError, CuDFTable, CuDFTableView};
 use libcudf_sys::ffi;
 
-fn select_keys(view: &CuDFTableView, cols: &[usize]) -> cxx::UniquePtr<ffi::TableView> {
+fn select_cols(view: &CuDFTableView, cols: &[usize]) -> cxx::UniquePtr<ffi::TableView> {
     let indices: Vec<i32> = cols.iter().map(|&i| i as i32).collect();
     view.inner().select(&indices)
-}
-
-fn gather_and_combine(
-    left: &CuDFTableView,
-    right: &CuDFTableView,
-    maps: cxx::UniquePtr<ffi::Table>,
-    outer: bool,
-    left_out_cols: Option<&[usize]>,
-    right_out_cols: Option<&[usize]>,
-) -> Result<CuDFTable, CuDFError> {
-    let maps_view = maps.view();
-    let left_map = maps_view.column(0);
-    let right_map = maps_view.column(1);
-
-    // Pre-select output columns if requested; otherwise pass the full view directly.
-    let left_sel = left_out_cols.map(|cols| select_keys(left, cols));
-    let right_sel = right_out_cols.map(|cols| select_keys(right, cols));
-    let left_src = left_sel.as_ref().unwrap_or_else(|| left.inner());
-    let right_src = right_sel.as_ref().unwrap_or_else(|| right.inner());
-
-    let mut left_result = if outer {
-        ffi::gather_nullify(left_src, &left_map)?
-    } else {
-        ffi::gather(left_src, &left_map)?
-    };
-    let mut right_result = if outer {
-        ffi::gather_nullify(right_src, &right_map)?
-    } else {
-        ffi::gather(right_src, &right_map)?
-    };
-
-    let combined = ffi::hconcat_tables(left_result.pin_mut(), right_result.pin_mut())?;
-    Ok(CuDFTable::from_inner(combined))
 }
 
 /// Perform an inner join on two tables using the specified key columns.
@@ -52,8 +19,17 @@ pub fn inner_join(
     left_out_cols: Option<&[usize]>,
     right_out_cols: Option<&[usize]>,
 ) -> Result<CuDFTable, CuDFError> {
-    let maps = ffi::inner_join(&select_keys(left, left_on), &select_keys(right, right_on))?;
-    gather_and_combine(left, right, maps, false, left_out_cols, right_out_cols)
+    let left_keys = select_cols(left, left_on);
+    let right_keys = select_cols(right, right_on);
+    let left_payload = left_out_cols.map(|c| select_cols(left, c));
+    let right_payload = right_out_cols.map(|c| select_cols(right, c));
+    let result = ffi::inner_join_gather(
+        &left_keys,
+        &right_keys,
+        left_payload.as_ref().unwrap_or_else(|| left.inner()),
+        right_payload.as_ref().unwrap_or_else(|| right.inner()),
+    )?;
+    Ok(CuDFTable::from_inner(result))
 }
 
 /// Perform a left outer join on two tables.
@@ -69,8 +45,17 @@ pub fn left_join(
     left_out_cols: Option<&[usize]>,
     right_out_cols: Option<&[usize]>,
 ) -> Result<CuDFTable, CuDFError> {
-    let maps = ffi::left_join(&select_keys(left, left_on), &select_keys(right, right_on))?;
-    gather_and_combine(left, right, maps, true, left_out_cols, right_out_cols)
+    let left_keys = select_cols(left, left_on);
+    let right_keys = select_cols(right, right_on);
+    let left_payload = left_out_cols.map(|c| select_cols(left, c));
+    let right_payload = right_out_cols.map(|c| select_cols(right, c));
+    let result = ffi::left_join_gather(
+        &left_keys,
+        &right_keys,
+        left_payload.as_ref().unwrap_or_else(|| left.inner()),
+        right_payload.as_ref().unwrap_or_else(|| right.inner()),
+    )?;
+    Ok(CuDFTable::from_inner(result))
 }
 
 /// Perform a full outer join on two tables.
@@ -86,8 +71,17 @@ pub fn full_join(
     left_out_cols: Option<&[usize]>,
     right_out_cols: Option<&[usize]>,
 ) -> Result<CuDFTable, CuDFError> {
-    let maps = ffi::full_join(&select_keys(left, left_on), &select_keys(right, right_on))?;
-    gather_and_combine(left, right, maps, true, left_out_cols, right_out_cols)
+    let left_keys = select_cols(left, left_on);
+    let right_keys = select_cols(right, right_on);
+    let left_payload = left_out_cols.map(|c| select_cols(left, c));
+    let right_payload = right_out_cols.map(|c| select_cols(right, c));
+    let result = ffi::full_join_gather(
+        &left_keys,
+        &right_keys,
+        left_payload.as_ref().unwrap_or_else(|| left.inner()),
+        right_payload.as_ref().unwrap_or_else(|| right.inner()),
+    )?;
+    Ok(CuDFTable::from_inner(result))
 }
 
 /// Perform a left semi join - return only left rows that have at least one match.
@@ -99,11 +93,10 @@ pub fn left_semi_join(
     left_on: &[usize],
     right_on: &[usize],
 ) -> Result<CuDFTable, CuDFError> {
-    let maps = ffi::left_semi_join(&select_keys(left, left_on), &select_keys(right, right_on))?;
-    let gather_map = maps.view().column(0);
-    Ok(CuDFTable::from_inner(ffi::gather(
+    Ok(CuDFTable::from_inner(ffi::left_semi_join_gather(
+        &select_cols(left, left_on),
+        &select_cols(right, right_on),
         left.inner(),
-        &gather_map,
     )?))
 }
 
@@ -116,11 +109,10 @@ pub fn left_anti_join(
     left_on: &[usize],
     right_on: &[usize],
 ) -> Result<CuDFTable, CuDFError> {
-    let maps = ffi::left_anti_join(&select_keys(left, left_on), &select_keys(right, right_on))?;
-    let gather_map = maps.view().column(0);
-    Ok(CuDFTable::from_inner(ffi::gather(
+    Ok(CuDFTable::from_inner(ffi::left_anti_join_gather(
+        &select_cols(left, left_on),
+        &select_cols(right, right_on),
         left.inner(),
-        &gather_map,
     )?))
 }
 
