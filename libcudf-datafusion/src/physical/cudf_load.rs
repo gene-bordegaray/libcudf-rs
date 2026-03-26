@@ -8,7 +8,7 @@ use datafusion::physical_expr::EquivalenceProperties;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures_util::stream::StreamExt;
-use libcudf_rs::{is_cudf_array, CuDFColumn};
+use libcudf_rs::{is_cudf_array, CuDFTable};
 use std::any::Any;
 use std::fmt::Formatter;
 use std::sync::Arc;
@@ -87,21 +87,19 @@ impl ExecutionPlan for CuDFLoadExec {
                 Err(err) => return Err(err),
             };
 
-            // TODO(#20): replace per-column upload with a single CuDFTable::from_arrow_host call
-            // see https://github.com/gene-bordegaray/libcudf-rs/issues/20
-            let original_cols = batch.columns();
-            let mut cudf_cols: Vec<Arc<dyn Array>> = Vec::with_capacity(original_cols.len());
-            for original_col in original_cols {
-                if is_cudf_array(original_col) {
-                    return exec_err!(
-                        "Cannot move RecordBatch from host to CuDF: a column is already a CuDF array"
-                    );
-                }
-                let col = CuDFColumn::from_arrow_host(original_col).map_err(cudf_to_df)?;
-                cudf_cols.push(Arc::new(col.into_view()));
+            if batch.columns().iter().any(|c| is_cudf_array(c)) {
+                return exec_err!(
+                    "Cannot move RecordBatch from host to CuDF: a column is already a CuDF array"
+                );
             }
-
-            Ok(RecordBatch::try_new(batch.schema(), cudf_cols)?)
+            let schema = batch.schema();
+            let table = CuDFTable::from_arrow_host(batch).map_err(cudf_to_df)?;
+            let cudf_cols: Vec<Arc<dyn Array>> = table
+                .into_columns()
+                .into_iter()
+                .map(|c| Arc::new(c.into_view()) as Arc<dyn Array>)
+                .collect();
+            Ok(RecordBatch::try_new(schema, cudf_cols)?)
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
