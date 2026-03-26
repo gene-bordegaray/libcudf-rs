@@ -101,8 +101,6 @@ impl ExecutionPlan for CuDFUnloadExec {
                 )
             })
         });
-        // TODO(#20): download the entire batch in one table export instead of one call per
-        // column - see https://github.com/gene-bordegaray/libcudf-rs/issues/20
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
             host_stream,
