@@ -577,6 +577,28 @@ pub mod ffi {
 
         /// Get the version of the cuDF library
         fn get_cudf_version() -> String;
+
+        /// Configure the global RMM device-memory pool.
+        ///
+        /// Reserves `initial_bytes` of GPU VRAM via `cudaMalloc` once at startup so that
+        /// `rmm::device_buffer` allocations (every cuDF column buffer) are served from the
+        /// pool instead of calling `cudaMalloc` per allocation. Returns `true` if the pool
+        /// was configured, `false` if already set by a previous call.
+        fn config_device_memory_pool(initial_bytes: usize, max_bytes: usize) -> bool;
+
+        /// Configure the global cuDF pinned-memory pool.
+        ///
+        /// Reserves `pool_size_bytes` of page-locked host RAM via `cudaMallocHost`
+        /// once so that subsequent host↔GPU copies bypass CUDA's internal pageable
+        /// staging copy. Returns `true` if the pool was configured, `false` if it
+        /// was already set up by a previous call.
+        fn config_pinned_memory_resource(pool_size_bytes: usize) -> bool;
+
+        /// Set the minimum allocation size that will be served from the pinned pool.
+        ///
+        /// Allocations smaller than `threshold_bytes` remain as ordinary pageable
+        /// memory. Only allocations at or above the threshold use the pinned pool.
+        fn set_host_pinned_threshold(threshold_bytes: usize);
     }
 }
 

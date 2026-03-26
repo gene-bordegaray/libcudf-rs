@@ -2,10 +2,7 @@
 name = "libcudf-datafusion"
 version = "0.1.0"
 edition = "2021"
-authors = [
-    "notfilippo",
-    "gabotechs",
-]
+authors = ["notfilippo", "gabotechs"]
 
 [dependencies]
 libcudf-rs = { path = ".." }
@@ -35,18 +32,13 @@ dirs = { version = "6", optional = true }
 
 [features]
 integration = [
-    "insta",
-    "tpchgen",
-    "tpchgen-arrow",
-    "parquet",
-    "pretty_assertions",
+  "insta",
+  "tpchgen",
+  "tpchgen-arrow",
+  "parquet",
+  "pretty_assertions",
 ]
-cli = [
-    "clap",
-    "datafusion-cli",
-    "env_logger",
-    "dirs",
-]
+cli = ["clap", "datafusion-cli", "env_logger", "dirs"]
 tpch = ["integration"]
 
 [dev-dependencies]
@@ -70,6 +62,10 @@ name = "join"
 harness = false
 
 [[bench]]
+name = "load_unload"
+harness = false
+
+[[bench]]
 name = "tpch_pipeline"
 harness = false
 
@@ -77,4 +73,3 @@ harness = false
 name = "cli"
 path = "bin/cli.rs"
 required-features = ["cli"]
-
