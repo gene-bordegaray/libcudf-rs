@@ -405,22 +405,18 @@ mod test {
 
 /// Integration tests: full SQL pipeline through TestFramework against real weather data.
 ///
-/// Each test runs the same query on CPU and GPU, asserts the plan uses `CuDFAggregateExec`,
-/// and verifies GPU results match CPU results exactly (ORDER BY ensures stable row ordering).
+/// Tests using `check_query_results` omit ORDER BY — the helper sorts rows before
+/// comparing, keeping plans free of sort operators. Float tests (AVG, mixed aggregates)
+/// keep ORDER BY and use `assert_batches_approx_eq` to absorb last-ULP differences.
 #[cfg(test)]
 mod integration {
-    use crate::test_utils::TestFramework;
+    use crate::assert_snapshot;
+    use crate::test_utils::{check_query_results, sort_batches, TestFramework};
     use arrow::array::{Array, Float64Array, RecordBatch};
-    use datafusion::common::assert_contains;
     use std::error::Error;
 
-    /// Compare two sets of record batches, rounding Float64 values to `decimals`
-    /// decimal places before comparing.
-    ///
-    /// This absorbs last-ULP differences between cuDF's GPU arithmetic and
-    /// DataFusion's CPU arithmetic (e.g. `19.243023255813952` vs `...956`).
-    /// Non-float columns are compared for exact equality.
-    /// Rows are expected to already be in the same order.
+    /// Absorbs last-ULP differences between cuDF and DataFusion float arithmetic.
+    /// Used only for tests that produce Float64 results (AVG, mixed aggregates).
     fn assert_batches_approx_eq(gpu: &[RecordBatch], cpu: &[RecordBatch], decimals: u32) {
         let factor = 10f64.powi(decimals as i32);
         assert_eq!(gpu.len(), cpu.len(), "batch count mismatch");
@@ -446,132 +442,240 @@ mod integration {
         }
     }
 
-    async fn check(sql: &str) -> Result<(), Box<dyn Error>> {
-        let tf = TestFramework::new().await;
-        let cudf_sql = format!("SET cudf.enable=true; {sql}");
-
-        let cudf = tf.execute(&cudf_sql).await?;
-        let cpu = tf.execute(sql).await?;
-
-        assert_contains!(&cudf.plan, "CuDFAggregateExec");
-        assert_batches_approx_eq(&cudf.batches, &cpu.batches, 10);
+    #[tokio::test]
+    async fn test_sum() -> Result<(), Box<dyn Error>> {
+        let sql = r#"SELECT "RainToday", SUM("Rainfall") as total_rain FROM weather GROUP BY "RainToday""#;
+        let result = check_query_results(sql, 1).await?;
+        assert_snapshot!(result.plan, @"
+        CuDFUnloadExec
+          CuDFProjectionExec: expr=[RainToday@0 as RainToday, sum(weather.Rainfall)@1 as total_rain]
+            CuDFAggregateExec: mode=Final, group_by=[RainToday@RainToday@0], aggr_expr=[sum(weather.Rainfall)]
+              CuDFLoadExec
+                CoalesceBatchesExec: target_batch_size=81920
+                  CoalescePartitionsExec
+                    CuDFUnloadExec
+                      CuDFCoalesceBatchesExec: target_batch_size=81920
+                        CuDFAggregateExec: mode=Partial, group_by=[RainToday@RainToday@1], aggr_expr=[sum(weather.Rainfall)]
+                          CuDFLoadExec
+                            CoalesceBatchesExec: target_batch_size=81920
+                              DataSourceExec: file_groups={3 groups: [[/testdata/weather/result-000000.parquet], [/testdata/weather/result-000001.parquet], [/testdata/weather/result-000002.parquet]]}, projection=[Rainfall, RainToday], file_type=parquet
+        ");
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_sum() -> Result<(), Box<dyn Error>> {
-        check(
-            r#"
-            SELECT "RainToday", SUM("Rainfall") as total_rain
-            FROM weather
-            GROUP BY "RainToday"
-            ORDER BY "RainToday"
-        "#,
-        )
-        .await
-    }
-
-    #[tokio::test]
     async fn test_count() -> Result<(), Box<dyn Error>> {
-        check(
-            r#"
-            SELECT "RainToday", COUNT("Rainfall") as n
-            FROM weather
-            GROUP BY "RainToday"
-            ORDER BY "RainToday"
-        "#,
-        )
-        .await
+        let sql = r#"SELECT "RainToday", COUNT("Rainfall") as n FROM weather GROUP BY "RainToday""#;
+        let result = check_query_results(sql, 1).await?;
+        assert_snapshot!(result.plan, @"
+        CuDFUnloadExec
+          CuDFProjectionExec: expr=[RainToday@0 as RainToday, count(weather.Rainfall)@1 as n]
+            CuDFAggregateExec: mode=Final, group_by=[RainToday@RainToday@0], aggr_expr=[count(weather.Rainfall)]
+              CuDFLoadExec
+                CoalesceBatchesExec: target_batch_size=81920
+                  CoalescePartitionsExec
+                    CuDFUnloadExec
+                      CuDFCoalesceBatchesExec: target_batch_size=81920
+                        CuDFAggregateExec: mode=Partial, group_by=[RainToday@RainToday@1], aggr_expr=[count(weather.Rainfall)]
+                          CuDFLoadExec
+                            CoalesceBatchesExec: target_batch_size=81920
+                              DataSourceExec: file_groups={3 groups: [[/testdata/weather/result-000000.parquet], [/testdata/weather/result-000001.parquet], [/testdata/weather/result-000002.parquet]]}, projection=[Rainfall, RainToday], file_type=parquet
+        ");
+        Ok(())
     }
 
+    /// AVG produces Float64 — uses assert_batches_approx_eq to handle last-ULP differences.
     #[tokio::test]
     async fn test_avg() -> Result<(), Box<dyn Error>> {
-        check(
-            r#"
-            SELECT "RainToday", AVG("MinTemp") as avg_min
-            FROM weather
-            GROUP BY "RainToday"
-            ORDER BY "RainToday"
-        "#,
-        )
-        .await
+        let sql = r#"SELECT "RainToday", AVG("MinTemp") as avg_min FROM weather GROUP BY "RainToday""#;
+        let tf = TestFramework::new().await;
+        let gpu = tf.execute(&format!("SET cudf.enable=true; SET datafusion.execution.target_partitions=1; {sql}")).await?;
+        let cpu = tf.execute(&format!("SET datafusion.execution.target_partitions=1; {sql}")).await?;
+        assert_batches_approx_eq(&sort_batches(&gpu.batches), &sort_batches(&cpu.batches), 10);
+        assert_snapshot!(gpu.plan, @"
+        CuDFUnloadExec
+          CuDFProjectionExec: expr=[RainToday@0 as RainToday, avg(weather.MinTemp)@1 as avg_min]
+            CuDFAggregateExec: mode=Final, group_by=[RainToday@RainToday@0], aggr_expr=[avg(weather.MinTemp)]
+              CuDFLoadExec
+                CoalesceBatchesExec: target_batch_size=81920
+                  CoalescePartitionsExec
+                    CuDFUnloadExec
+                      CuDFCoalesceBatchesExec: target_batch_size=81920
+                        CuDFAggregateExec: mode=Partial, group_by=[RainToday@RainToday@1], aggr_expr=[avg(weather.MinTemp)]
+                          CuDFLoadExec
+                            CoalesceBatchesExec: target_batch_size=81920
+                              DataSourceExec: file_groups={3 groups: [[/testdata/weather/result-000000.parquet], [/testdata/weather/result-000001.parquet], [/testdata/weather/result-000002.parquet]]}, projection=[MinTemp, RainToday], file_type=parquet
+        ");
+        Ok(())
     }
 
     #[tokio::test]
     async fn test_min_max() -> Result<(), Box<dyn Error>> {
-        check(
-            r#"
-            SELECT "RainToday", MIN("MinTemp") as lo, MAX("MaxTemp") as hi
-            FROM weather
-            GROUP BY "RainToday"
-            ORDER BY "RainToday"
-        "#,
-        )
-        .await
+        let sql = r#"SELECT "RainToday", MIN("MinTemp") as lo, MAX("MaxTemp") as hi FROM weather GROUP BY "RainToday""#;
+        let result = check_query_results(sql, 1).await?;
+        assert_snapshot!(result.plan, @"
+        CuDFUnloadExec
+          CuDFProjectionExec: expr=[RainToday@0 as RainToday, min(weather.MinTemp)@1 as lo, max(weather.MaxTemp)@2 as hi]
+            CuDFAggregateExec: mode=Final, group_by=[RainToday@RainToday@0], aggr_expr=[min(weather.MinTemp), max(weather.MaxTemp)]
+              CuDFLoadExec
+                CoalesceBatchesExec: target_batch_size=81920
+                  CoalescePartitionsExec
+                    CuDFUnloadExec
+                      CuDFCoalesceBatchesExec: target_batch_size=81920
+                        CuDFAggregateExec: mode=Partial, group_by=[RainToday@RainToday@2], aggr_expr=[min(weather.MinTemp), max(weather.MaxTemp)]
+                          CuDFLoadExec
+                            CoalesceBatchesExec: target_batch_size=81920
+                              DataSourceExec: file_groups={3 groups: [[/testdata/weather/result-000000.parquet], [/testdata/weather/result-000001.parquet], [/testdata/weather/result-000002.parquet]]}, projection=[MinTemp, MaxTemp, RainToday], file_type=parquet
+        ");
+        Ok(())
     }
 
+    /// Contains AVG — uses assert_batches_approx_eq to handle last-ULP differences.
     #[tokio::test]
     async fn test_multiple_aggregates() -> Result<(), Box<dyn Error>> {
-        check(
-            r#"
-            SELECT "RainToday",
-                   COUNT("Rainfall") as n,
-                   SUM("Rainfall") as total,
-                   AVG("MaxTemp") as avg_max,
-                   MIN("MinTemp") as lo,
-                   MAX("MaxTemp") as hi
-            FROM weather
-            GROUP BY "RainToday"
-            ORDER BY "RainToday"
-        "#,
-        )
-        .await
+        let sql = r#"SELECT "RainToday", COUNT("Rainfall") as n, SUM("Rainfall") as total, AVG("MaxTemp") as avg_max, MIN("MinTemp") as lo, MAX("MaxTemp") as hi FROM weather GROUP BY "RainToday""#;
+        let tf = TestFramework::new().await;
+        let gpu = tf.execute(&format!("SET cudf.enable=true; SET datafusion.execution.target_partitions=1; {sql}")).await?;
+        let cpu = tf.execute(&format!("SET datafusion.execution.target_partitions=1; {sql}")).await?;
+        assert_batches_approx_eq(&sort_batches(&gpu.batches), &sort_batches(&cpu.batches), 10);
+        assert_snapshot!(gpu.plan, @"
+        CuDFUnloadExec
+          CuDFProjectionExec: expr=[RainToday@0 as RainToday, count(weather.Rainfall)@1 as n, sum(weather.Rainfall)@2 as total, avg(weather.MaxTemp)@3 as avg_max, min(weather.MinTemp)@4 as lo, max(weather.MaxTemp)@5 as hi]
+            CuDFAggregateExec: mode=Final, group_by=[RainToday@RainToday@0], aggr_expr=[count(weather.Rainfall), sum(weather.Rainfall), avg(weather.MaxTemp), min(weather.MinTemp), max(weather.MaxTemp)]
+              CuDFLoadExec
+                CoalesceBatchesExec: target_batch_size=81920
+                  CoalescePartitionsExec
+                    CuDFUnloadExec
+                      CuDFCoalesceBatchesExec: target_batch_size=81920
+                        CuDFAggregateExec: mode=Partial, group_by=[RainToday@RainToday@3], aggr_expr=[count(weather.Rainfall), sum(weather.Rainfall), avg(weather.MaxTemp), min(weather.MinTemp), max(weather.MaxTemp)]
+                          CuDFLoadExec
+                            CoalesceBatchesExec: target_batch_size=81920
+                              DataSourceExec: file_groups={3 groups: [[/testdata/weather/result-000000.parquet], [/testdata/weather/result-000001.parquet], [/testdata/weather/result-000002.parquet]]}, projection=[MinTemp, MaxTemp, Rainfall, RainToday], file_type=parquet
+        ");
+        Ok(())
     }
 
     #[tokio::test]
     async fn test_count_star() -> Result<(), Box<dyn Error>> {
-        check(
-            r#"
-            SELECT "RainToday", COUNT(*) as n
-            FROM weather
-            GROUP BY "RainToday"
-            ORDER BY "RainToday"
-        "#,
-        )
-        .await
+        let sql = r#"SELECT "RainToday", COUNT(*) as n FROM weather GROUP BY "RainToday""#;
+        let result = check_query_results(sql, 1).await?;
+        assert_snapshot!(result.plan, @"
+        CuDFUnloadExec
+          CuDFProjectionExec: expr=[RainToday@0 as RainToday, count(Int64(1))@1 as n]
+            CuDFAggregateExec: mode=Final, group_by=[RainToday@RainToday@0], aggr_expr=[count(Int64(1))]
+              CuDFLoadExec
+                CoalesceBatchesExec: target_batch_size=81920
+                  CoalescePartitionsExec
+                    CuDFUnloadExec
+                      CuDFCoalesceBatchesExec: target_batch_size=81920
+                        CuDFAggregateExec: mode=Partial, group_by=[RainToday@RainToday@0], aggr_expr=[count(Int64(1))]
+                          CuDFLoadExec
+                            CoalesceBatchesExec: target_batch_size=81920
+                              DataSourceExec: file_groups={3 groups: [[/testdata/weather/result-000000.parquet], [/testdata/weather/result-000001.parquet], [/testdata/weather/result-000002.parquet]]}, projection=[RainToday], file_type=parquet
+        ");
+        Ok(())
     }
 
     #[tokio::test]
     async fn test_count_star_mixed() -> Result<(), Box<dyn Error>> {
-        check(
-            r#"
-            SELECT "RainToday", COUNT(*) as n, SUM("Rainfall") as total
-            FROM weather
-            GROUP BY "RainToday"
-            ORDER BY "RainToday"
-        "#,
-        )
-        .await
+        let sql = r#"SELECT "RainToday", COUNT(*) as n, SUM("Rainfall") as total FROM weather GROUP BY "RainToday""#;
+        let result = check_query_results(sql, 1).await?;
+        assert_snapshot!(result.plan, @"
+        CuDFUnloadExec
+          CuDFProjectionExec: expr=[RainToday@0 as RainToday, count(Int64(1))@1 as n, sum(weather.Rainfall)@2 as total]
+            CuDFAggregateExec: mode=Final, group_by=[RainToday@RainToday@0], aggr_expr=[count(Int64(1)), sum(weather.Rainfall)]
+              CuDFLoadExec
+                CoalesceBatchesExec: target_batch_size=81920
+                  CoalescePartitionsExec
+                    CuDFUnloadExec
+                      CuDFCoalesceBatchesExec: target_batch_size=81920
+                        CuDFAggregateExec: mode=Partial, group_by=[RainToday@RainToday@1], aggr_expr=[count(Int64(1)), sum(weather.Rainfall)]
+                          CuDFLoadExec
+                            CoalesceBatchesExec: target_batch_size=81920
+                              DataSourceExec: file_groups={3 groups: [[/testdata/weather/result-000000.parquet], [/testdata/weather/result-000001.parquet], [/testdata/weather/result-000002.parquet]]}, projection=[Rainfall, RainToday], file_type=parquet
+        ");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_multi_partition_sum() -> Result<(), Box<dyn Error>> {
+        let sql = r#"SELECT "RainToday", SUM("Rainfall") as total FROM weather GROUP BY "RainToday""#;
+        let result = check_query_results(sql, 4).await?;
+        assert_snapshot!(result.plan, @"
+        CuDFUnloadExec
+          CuDFProjectionExec: expr=[RainToday@0 as RainToday, sum(weather.Rainfall)@1 as total]
+            CuDFAggregateExec: mode=FinalPartitioned, group_by=[RainToday@RainToday@0], aggr_expr=[sum(weather.Rainfall)]
+              CuDFLoadExec
+                CoalesceBatchesExec: target_batch_size=8192
+                  RepartitionExec: partitioning=Hash([RainToday@0], 4), input_partitions=4
+                    RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=3
+                      CuDFUnloadExec
+                        CuDFCoalesceBatchesExec: target_batch_size=81920
+                          CuDFAggregateExec: mode=Partial, group_by=[RainToday@RainToday@1], aggr_expr=[sum(weather.Rainfall)]
+                            CuDFLoadExec
+                              CoalesceBatchesExec: target_batch_size=81920
+                                DataSourceExec: file_groups={3 groups: [[/testdata/weather/result-000000.parquet], [/testdata/weather/result-000001.parquet], [/testdata/weather/result-000002.parquet]]}, projection=[Rainfall, RainToday], file_type=parquet
+        ");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_multi_partition_count_star() -> Result<(), Box<dyn Error>> {
+        let sql = r#"SELECT "RainToday", COUNT(*) as n FROM weather GROUP BY "RainToday""#;
+        let result = check_query_results(sql, 4).await?;
+        assert_snapshot!(result.plan, @"
+        CuDFUnloadExec
+          CuDFProjectionExec: expr=[RainToday@0 as RainToday, count(Int64(1))@1 as n]
+            CuDFAggregateExec: mode=FinalPartitioned, group_by=[RainToday@RainToday@0], aggr_expr=[count(Int64(1))]
+              CuDFLoadExec
+                CoalesceBatchesExec: target_batch_size=8192
+                  RepartitionExec: partitioning=Hash([RainToday@0], 4), input_partitions=4
+                    RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=3
+                      CuDFUnloadExec
+                        CuDFCoalesceBatchesExec: target_batch_size=81920
+                          CuDFAggregateExec: mode=Partial, group_by=[RainToday@RainToday@0], aggr_expr=[count(Int64(1))]
+                            CuDFLoadExec
+                              CoalesceBatchesExec: target_batch_size=81920
+                                DataSourceExec: file_groups={3 groups: [[/testdata/weather/result-000000.parquet], [/testdata/weather/result-000001.parquet], [/testdata/weather/result-000002.parquet]]}, projection=[RainToday], file_type=parquet
+        ");
+        Ok(())
+    }
+
+    /// Contains AVG — uses assert_batches_approx_eq to handle last-ULP differences.
+    #[tokio::test]
+    async fn test_multi_partition_multiple_aggs() -> Result<(), Box<dyn Error>> {
+        let sql = r#"SELECT "RainToday", COUNT(*) as n, SUM("Rainfall") as total, AVG("MaxTemp") as avg_max, MIN("MinTemp") as lo, MAX("MaxTemp") as hi FROM weather GROUP BY "RainToday""#;
+        let tf = TestFramework::new().await;
+        let gpu = tf.execute(&format!("SET cudf.enable=true; SET datafusion.execution.target_partitions=4; {sql}")).await?;
+        let cpu = tf.execute(&format!("SET datafusion.execution.target_partitions=4; {sql}")).await?;
+        assert_batches_approx_eq(&sort_batches(&gpu.batches), &sort_batches(&cpu.batches), 10);
+        assert_snapshot!(gpu.plan, @"
+        CuDFUnloadExec
+          CuDFProjectionExec: expr=[RainToday@0 as RainToday, count(Int64(1))@1 as n, sum(weather.Rainfall)@2 as total, avg(weather.MaxTemp)@3 as avg_max, min(weather.MinTemp)@4 as lo, max(weather.MaxTemp)@5 as hi]
+            CuDFAggregateExec: mode=FinalPartitioned, group_by=[RainToday@RainToday@0], aggr_expr=[count(Int64(1)), sum(weather.Rainfall), avg(weather.MaxTemp), min(weather.MinTemp), max(weather.MaxTemp)]
+              CuDFLoadExec
+                CoalesceBatchesExec: target_batch_size=8192
+                  RepartitionExec: partitioning=Hash([RainToday@0], 4), input_partitions=4
+                    RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=3
+                      CuDFUnloadExec
+                        CuDFCoalesceBatchesExec: target_batch_size=81920
+                          CuDFAggregateExec: mode=Partial, group_by=[RainToday@RainToday@3], aggr_expr=[count(Int64(1)), sum(weather.Rainfall), avg(weather.MaxTemp), min(weather.MinTemp), max(weather.MaxTemp)]
+                            CuDFLoadExec
+                              CoalesceBatchesExec: target_batch_size=81920
+                                DataSourceExec: file_groups={3 groups: [[/testdata/weather/result-000000.parquet], [/testdata/weather/result-000001.parquet], [/testdata/weather/result-000002.parquet]]}, projection=[MinTemp, MaxTemp, Rainfall, RainToday], file_type=parquet
+        ");
+        Ok(())
     }
 
     /// Aggregates with unsupported functions (non-CuDFAggregateUDF) must fall back to CPU.
     #[tokio::test]
     async fn test_unsupported_agg_falls_back_to_cpu() -> Result<(), Box<dyn Error>> {
         let tf = TestFramework::new().await;
-        // BOOL_OR is not a CuDFAggregateUDF, so the aggregate must run on CPU.
-        let sql = r#"
-            SELECT "RainToday", BOOL_OR("RainTomorrow" = 'Yes') as any_rain
-            FROM weather
-            GROUP BY "RainToday"
-            ORDER BY "RainToday"
-        "#;
-        let cudf = tf.execute(&format!("SET cudf.enable=true; {sql}")).await?;
+        let sql = r#"SELECT "RainToday", BOOL_OR("RainTomorrow" = 'Yes') as any_rain FROM weather GROUP BY "RainToday""#;
+        let gpu = tf.execute(&format!("SET cudf.enable=true; {sql}")).await?;
         let cpu = tf.execute(sql).await?;
-        assert!(
-            !cudf.plan.contains("CuDFAggregateExec"),
-            "expected CPU fallback"
-        );
-        assert_eq!(cpu.pretty_print, cudf.pretty_print);
+        assert!(!gpu.plan.contains("CuDFAggregateExec"), "expected CPU fallback");
+        assert_eq!(cpu.pretty_print, gpu.pretty_print);
         Ok(())
     }
 }
