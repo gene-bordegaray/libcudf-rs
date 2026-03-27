@@ -70,13 +70,6 @@ impl PhysicalOptimizerRule for HostToCuDFRule {
                 cudf_node = try_as_cudf_hash_join(node)?;
             }
 
-            // TODO(#19): Multi-phase aggregate (Partial -> RepartitionExec -> Final) is not
-            // supported. RepartitionExec is a CPU node; it strips CuDFColumnView wrappers from
-            // partial-state batches, causing the downstream Final CuDFAggregateExec to fail.
-            // Workaround: use with_target_partitions(1) to force AggregateMode::Single.
-            // Fix: recognise the Partial->RepartitionExec->Final pattern in HostToCuDFRule and
-            // either fuse into a single CuDFAggregateExec or bracket RepartitionExec with
-            // CuDFUnloadExec / CuDFLoadExec to preserve column identity across the CPU boundary.
             if let Some(node) = plan.as_any().downcast_ref::<AggregateExec>() {
                 cudf_node = try_as_cudf_aggregate(node)?;
             }

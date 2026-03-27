@@ -93,3 +93,42 @@ pub struct SqlResult {
     pub plan: String,
     pub batches: Vec<RecordBatch>,
 }
+
+/// Run `sql` on both GPU and CPU with `partitions` target partitions, assert results match,
+/// and return the GPU [`SqlResult`].
+pub(crate) async fn check_query_results(
+    sql: &str,
+    partitions: usize,
+) -> Result<SqlResult, DataFusionError> {
+    let tf = TestFramework::new().await;
+    let cudf_sql = format!(
+        "SET cudf.enable=true; SET datafusion.execution.target_partitions={partitions}; {sql}"
+    );
+    let cpu_sql = format!("SET datafusion.execution.target_partitions={partitions}; {sql}");
+    let gpu = tf.execute(&cudf_sql).await?;
+    let cpu = tf.execute(&cpu_sql).await?;
+    let gpu_pp = pretty_format_batches(&sort_batches(&gpu.batches))?.to_string();
+    let cpu_pp = pretty_format_batches(&sort_batches(&cpu.batches))?.to_string();
+    assert_eq!(gpu_pp, cpu_pp);
+    Ok(gpu)
+}
+
+/// Concatenate `batches` into one and sort rows by the first column.
+pub(crate) fn sort_batches(batches: &[RecordBatch]) -> Vec<RecordBatch> {
+    if batches.is_empty() {
+        return vec![];
+    }
+    let schema = batches[0].schema();
+    let combined = arrow::compute::concat_batches(&schema, batches).expect("concat_batches failed");
+    if combined.num_rows() == 0 {
+        return vec![combined];
+    }
+    let indices =
+        arrow::compute::sort_to_indices(combined.column(0), None, None).expect("sort failed");
+    let columns: Vec<_> = combined
+        .columns()
+        .iter()
+        .map(|c| arrow::compute::take(c.as_ref(), &indices, None).expect("take failed"))
+        .collect();
+    vec![RecordBatch::try_new(schema, columns).expect("RecordBatch::try_new failed")]
+}
