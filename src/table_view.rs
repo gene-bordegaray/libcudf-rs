@@ -201,8 +201,10 @@ impl CuDFTableView {
         Ok(RecordBatch::try_new(Arc::new(self.schema()?), columns)?)
     }
 
-    /// Like `to_record_batch`, but attaches `schema` to relabel column names and
-    /// reconcile any type precision differences.
+    /// Wrap GPU columns in a `RecordBatch` whose types match `schema`.
+    ///
+    /// Delegates to [`record_batch_with_schema`]. Use this when the columns
+    /// are still in a `CuDFTableView`.
     pub fn to_record_batch_with_schema(
         &self,
         schema: &SchemaRef,
@@ -217,17 +219,9 @@ impl CuDFTableView {
             )));
         }
         let columns: Vec<ArrayRef> = (0..self.num_columns())
-            .zip(schema.fields())
-            .map(|(i, field)| {
-                let col = self.column(i as i32);
-                if col.data_type() != field.data_type() {
-                    Arc::new(col.with_data_type(field.data_type().clone())) as _
-                } else {
-                    Arc::new(col) as _
-                }
-            })
+            .map(|i| Arc::new(self.column(i as i32)) as _)
             .collect();
-        Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
+        record_batch_with_schema(columns, schema).map_err(CuDFError::ArrowError)
     }
 
     /// Create a table view from a RecordBatch containing CuDF arrays (GPU)
@@ -251,6 +245,32 @@ impl CuDFTableView {
 
         Self::from_column_views(column_views)
     }
+}
+
+/// Build a `RecordBatch`, relabeling any `CuDFColumnView` whose type differs from
+/// the corresponding `schema` field.
+///
+/// cuDF normalises decimal precision to the storage maximum (e.g. 38 for Decimal128).
+/// This function restores the declared precision so `RecordBatch::try_new` accepts it.
+/// All GPU `RecordBatch` creation should go through this function instead of calling
+/// `RecordBatch::try_new` directly.
+pub fn record_batch_with_schema(
+    columns: Vec<ArrayRef>,
+    schema: &SchemaRef,
+) -> Result<RecordBatch, ArrowError> {
+    let relabeled: Vec<ArrayRef> = columns
+        .into_iter()
+        .zip(schema.fields())
+        .map(|(col, field)| {
+            if col.data_type() != field.data_type() {
+                if let Some(v) = col.as_any().downcast_ref::<CuDFColumnView>() {
+                    return Arc::new(v.clone().with_data_type(field.data_type().clone())) as _;
+                }
+            }
+            col
+        })
+        .collect();
+    RecordBatch::try_new(Arc::clone(schema), relabeled)
 }
 
 impl Clone for CuDFTableView {

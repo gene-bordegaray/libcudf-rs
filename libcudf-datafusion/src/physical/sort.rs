@@ -1,5 +1,6 @@
 use crate::errors::cudf_to_df;
 use arrow::array::RecordBatch;
+use arrow_schema::SchemaRef;
 use datafusion::common::Statistics;
 use datafusion::error::DataFusionError;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -71,9 +72,11 @@ impl ExecutionPlan for CuDFSortExec {
             execute_stream(Arc::clone(self.inner.input()), context)?
         };
 
+        let schema = self.schema();
         let ordered_stream = if let Some(limit) = self.fetch() {
             CuDFTopKStream {
                 input,
+                schema,
                 limit,
                 ordering: self.inner.expr().clone(),
                 result: None,
@@ -83,6 +86,7 @@ impl ExecutionPlan for CuDFSortExec {
         } else {
             CuDFSortStream {
                 input,
+                schema,
                 ordering: self.inner.expr().clone(),
                 views: vec![],
                 finished: false,
@@ -109,6 +113,7 @@ impl ExecutionPlan for CuDFSortExec {
 
 struct CuDFSortStream {
     input: SendableRecordBatchStream,
+    schema: SchemaRef,
     ordering: LexOrdering,
     views: Vec<CuDFTableView>,
     finished: bool,
@@ -143,9 +148,12 @@ impl Stream for CuDFSortStream {
                 let (key_columns, sort_orders) = extract_sort_params(&self.ordering);
                 let sorted = sort(&table_view, &key_columns, &sort_orders).map_err(cudf_to_df)?;
 
-                let result = sorted.into_view().to_record_batch().map_err(cudf_to_df);
+                let result = sorted
+                    .into_view()
+                    .to_record_batch_with_schema(&self.schema)
+                    .map_err(cudf_to_df)?;
 
-                Poll::Ready(Some(result))
+                Poll::Ready(Some(Ok(result)))
             }
         }
     }
@@ -162,6 +170,7 @@ impl Stream for CuDFSortStream {
 /// This reduces memory usage and improves performance for large inputs.
 struct CuDFTopKStream {
     input: SendableRecordBatchStream,
+    schema: SchemaRef,
     ordering: LexOrdering,
     limit: usize,
     result: Option<CuDFTableView>,
@@ -232,7 +241,7 @@ impl Stream for CuDFTopKStream {
 
                 let batch = sorted_result
                     .into_view()
-                    .to_record_batch()
+                    .to_record_batch_with_schema(&self.schema)
                     .map_err(cudf_to_df)?;
                 Poll::Ready(Some(Ok(batch)))
             }

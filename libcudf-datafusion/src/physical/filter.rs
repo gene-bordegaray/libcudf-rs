@@ -203,21 +203,18 @@ fn filter_and_project(
     }
 
     // Apply projection if needed
-    if let Some(projection) = projection {
-        let projected_columns: Vec<Arc<dyn Array>> = projection
+    let columns = if let Some(projection) = projection {
+        projection
             .iter()
             .map(|i| Arc::clone(&cudf_columns[*i]))
-            .collect();
-        Ok(RecordBatch::try_new(
-            Arc::clone(output_schema),
-            projected_columns,
-        )?)
+            .collect()
     } else {
-        Ok(RecordBatch::try_new(
-            Arc::clone(output_schema),
-            cudf_columns,
-        )?)
-    }
+        cudf_columns
+    };
+    Ok(libcudf_rs::record_batch_with_schema(
+        columns,
+        output_schema,
+    )?)
 }
 
 // Implementation pretty much copied from `datafusion/core/src/physical_plan/filter.rs`

@@ -23,55 +23,47 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
     async fn test_tpch_2() -> Result<(), Box<dyn Error>> {
         test_tpch_query(get_test_tpch_query(2)).await
     }
 
     #[tokio::test]
-    #[ignore]
     async fn test_tpch_3() -> Result<(), Box<dyn Error>> {
         test_tpch_query(get_test_tpch_query(3)).await
     }
 
     #[tokio::test]
-    #[ignore]
     async fn test_tpch_4() -> Result<(), Box<dyn Error>> {
         test_tpch_query(get_test_tpch_query(4)).await
     }
 
     #[tokio::test]
-    #[ignore]
     async fn test_tpch_5() -> Result<(), Box<dyn Error>> {
         test_tpch_query(get_test_tpch_query(5)).await
     }
 
     #[tokio::test]
-    #[ignore]
     async fn test_tpch_6() -> Result<(), Box<dyn Error>> {
         test_tpch_query(get_test_tpch_query(6)).await
     }
 
     #[tokio::test]
-    #[ignore]
     async fn test_tpch_7() -> Result<(), Box<dyn Error>> {
         test_tpch_query(get_test_tpch_query(7)).await
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "wrong results: mkt_share returns 0 on GPU instead of correct values; likely a CASE expression bug"]
     async fn test_tpch_8() -> Result<(), Box<dyn Error>> {
         test_tpch_query(get_test_tpch_query(8)).await
     }
 
     #[tokio::test]
-    #[ignore]
     async fn test_tpch_9() -> Result<(), Box<dyn Error>> {
         test_tpch_query(get_test_tpch_query(9)).await
     }
 
     #[tokio::test]
-    #[ignore]
     async fn test_tpch_10() -> Result<(), Box<dyn Error>> {
         let sql = get_test_tpch_query(10);
         // There is a chance that this query returns non-deterministic results if two entries
