@@ -487,10 +487,19 @@ mod integration {
     /// AVG produces Float64 — uses assert_batches_approx_eq to handle last-ULP differences.
     #[tokio::test]
     async fn test_avg() -> Result<(), Box<dyn Error>> {
-        let sql = r#"SELECT "RainToday", AVG("MinTemp") as avg_min FROM weather GROUP BY "RainToday""#;
+        let sql =
+            r#"SELECT "RainToday", AVG("MinTemp") as avg_min FROM weather GROUP BY "RainToday""#;
         let tf = TestFramework::new().await;
-        let gpu = tf.execute(&format!("SET cudf.enable=true; SET datafusion.execution.target_partitions=1; {sql}")).await?;
-        let cpu = tf.execute(&format!("SET datafusion.execution.target_partitions=1; {sql}")).await?;
+        let gpu = tf
+            .execute(&format!(
+                "SET cudf.enable=true; SET datafusion.execution.target_partitions=1; {sql}"
+            ))
+            .await?;
+        let cpu = tf
+            .execute(&format!(
+                "SET datafusion.execution.target_partitions=1; {sql}"
+            ))
+            .await?;
         assert_batches_approx_eq(&sort_batches(&gpu.batches), &sort_batches(&cpu.batches), 10);
         assert_snapshot!(gpu.plan, @"
         CuDFUnloadExec
@@ -535,8 +544,16 @@ mod integration {
     async fn test_multiple_aggregates() -> Result<(), Box<dyn Error>> {
         let sql = r#"SELECT "RainToday", COUNT("Rainfall") as n, SUM("Rainfall") as total, AVG("MaxTemp") as avg_max, MIN("MinTemp") as lo, MAX("MaxTemp") as hi FROM weather GROUP BY "RainToday""#;
         let tf = TestFramework::new().await;
-        let gpu = tf.execute(&format!("SET cudf.enable=true; SET datafusion.execution.target_partitions=1; {sql}")).await?;
-        let cpu = tf.execute(&format!("SET datafusion.execution.target_partitions=1; {sql}")).await?;
+        let gpu = tf
+            .execute(&format!(
+                "SET cudf.enable=true; SET datafusion.execution.target_partitions=1; {sql}"
+            ))
+            .await?;
+        let cpu = tf
+            .execute(&format!(
+                "SET datafusion.execution.target_partitions=1; {sql}"
+            ))
+            .await?;
         assert_batches_approx_eq(&sort_batches(&gpu.batches), &sort_batches(&cpu.batches), 10);
         assert_snapshot!(gpu.plan, @"
         CuDFUnloadExec
@@ -599,7 +616,8 @@ mod integration {
 
     #[tokio::test]
     async fn test_multi_partition_sum() -> Result<(), Box<dyn Error>> {
-        let sql = r#"SELECT "RainToday", SUM("Rainfall") as total FROM weather GROUP BY "RainToday""#;
+        let sql =
+            r#"SELECT "RainToday", SUM("Rainfall") as total FROM weather GROUP BY "RainToday""#;
         let result = check_query_results(sql, 4).await?;
         assert_snapshot!(result.plan, @"
         CuDFUnloadExec
@@ -646,8 +664,16 @@ mod integration {
     async fn test_multi_partition_multiple_aggs() -> Result<(), Box<dyn Error>> {
         let sql = r#"SELECT "RainToday", COUNT(*) as n, SUM("Rainfall") as total, AVG("MaxTemp") as avg_max, MIN("MinTemp") as lo, MAX("MaxTemp") as hi FROM weather GROUP BY "RainToday""#;
         let tf = TestFramework::new().await;
-        let gpu = tf.execute(&format!("SET cudf.enable=true; SET datafusion.execution.target_partitions=4; {sql}")).await?;
-        let cpu = tf.execute(&format!("SET datafusion.execution.target_partitions=4; {sql}")).await?;
+        let gpu = tf
+            .execute(&format!(
+                "SET cudf.enable=true; SET datafusion.execution.target_partitions=4; {sql}"
+            ))
+            .await?;
+        let cpu = tf
+            .execute(&format!(
+                "SET datafusion.execution.target_partitions=4; {sql}"
+            ))
+            .await?;
         assert_batches_approx_eq(&sort_batches(&gpu.batches), &sort_batches(&cpu.batches), 10);
         assert_snapshot!(gpu.plan, @"
         CuDFUnloadExec
@@ -674,7 +700,10 @@ mod integration {
         let sql = r#"SELECT "RainToday", BOOL_OR("RainTomorrow" = 'Yes') as any_rain FROM weather GROUP BY "RainToday""#;
         let gpu = tf.execute(&format!("SET cudf.enable=true; {sql}")).await?;
         let cpu = tf.execute(sql).await?;
-        assert!(!gpu.plan.contains("CuDFAggregateExec"), "expected CPU fallback");
+        assert!(
+            !gpu.plan.contains("CuDFAggregateExec"),
+            "expected CPU fallback"
+        );
         assert_eq!(cpu.pretty_print, gpu.pretty_print);
         Ok(())
     }

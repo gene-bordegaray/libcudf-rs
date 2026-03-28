@@ -99,7 +99,7 @@ impl ExecutionPlan for CuDFLoadExec {
                 .into_iter()
                 .map(|c| Arc::new(c.into_view()) as Arc<dyn Array>)
                 .collect();
-            Ok(RecordBatch::try_new(schema, cudf_cols)?)
+            Ok(libcudf_rs::record_batch_with_schema(cudf_cols, &schema)?)
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
@@ -117,11 +117,7 @@ pub(crate) fn normalize_scalar_for_cudf(value: ScalarValue) -> ScalarValue {
     }
 }
 
-/// Maps an Arrow schema to the types cuDF will actually produce.
-///
-/// - `Utf8View -> Utf8`: cuDF's `TYPE_STRING` has no view variant.
-/// - `Decimal{32,64,128}(p, s) -> Decimal{32,64,128}(max_p, s)`: cuDF uses fixed precision
-///   based on storage width (9/18/38). Scale is preserved.
+/// Maps an Arrow schema to cuDF-compatible types (`Utf8View -> Utf8`).
 pub(crate) fn cudf_schema_compatibility_map(schema: SchemaRef) -> SchemaRef {
     let mut new_fields = Vec::with_capacity(schema.fields.len());
 
@@ -130,21 +126,6 @@ pub(crate) fn cudf_schema_compatibility_map(schema: SchemaRef) -> SchemaRef {
             DataType::Utf8View => FieldRef::new(Field::new(
                 field.name(),
                 DataType::Utf8,
-                field.is_nullable(),
-            )),
-            DataType::Decimal32(_, s) => FieldRef::new(Field::new(
-                field.name(),
-                DataType::Decimal32(9, *s), // max precision for 32-bit
-                field.is_nullable(),
-            )),
-            DataType::Decimal64(_, s) => FieldRef::new(Field::new(
-                field.name(),
-                DataType::Decimal64(18, *s), // max precision for 64-bit
-                field.is_nullable(),
-            )),
-            DataType::Decimal128(_, s) => FieldRef::new(Field::new(
-                field.name(),
-                DataType::Decimal128(38, *s), // max precision for 128-bit
                 field.is_nullable(),
             )),
             _ => Arc::clone(field),

@@ -170,15 +170,11 @@ impl CuDFProjectionStream {
         if arrays.is_empty() {
             let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
             RecordBatch::try_new_with_options(Arc::clone(&self.schema), arrays, &options)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
         } else {
-            RecordBatch::try_new(Arc::clone(&self.schema), arrays)
+            libcudf_rs::record_batch_with_schema(arrays, &self.schema)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
         }
-        .map_err(|err| {
-            DataFusionError::ArrowError(
-                Box::new(err),
-                Some("Error projecting CuDF RecordBatch".to_string()),
-            )
-        })
     }
 }
 
