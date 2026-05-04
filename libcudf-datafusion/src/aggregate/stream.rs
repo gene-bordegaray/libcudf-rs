@@ -12,7 +12,9 @@ use datafusion_physical_plan::aggregates::{
 };
 use datafusion_physical_plan::udaf::AggregateFunctionExpr;
 use futures::{ready, StreamExt};
-use libcudf_rs::{CuDFColumn, CuDFColumnView, CuDFGroupBy, CuDFTable, CuDFTableView};
+use libcudf_rs::{
+    record_batch_with_schema, CuDFColumn, CuDFColumnView, CuDFGroupBy, CuDFTable, CuDFTableView,
+};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -303,10 +305,7 @@ impl Stream {
             }
         }
 
-        Ok(Some(RecordBatch::try_new(
-            self.output_schema.clone(),
-            arrays,
-        )?))
+        Ok(Some(record_batch_with_schema(arrays, &self.output_schema)?))
     }
 
     /// Evaluate GROUP BY expressions on a batch and wrap the resulting key
@@ -336,6 +335,9 @@ impl Stream {
 
     /// Evaluate each aggregate function's argument expressions on a batch,
     /// returning GPU column views suitable for `partial_requests` / `merge_requests`.
+    ///
+    /// Literal aggregate args, such as `COUNT(*)`, can evaluate to host Arrow arrays.
+    /// Upload them here so aggregate requests always receive cuDF column views.
     fn evaluate_batch_arguments(&self, batch: &RecordBatch) -> Result<Vec<Vec<CuDFColumnView>>> {
         let evaluated_arguments = evaluate_many(&self.aggregate_args, batch)?;
 
@@ -344,10 +346,12 @@ impl Stream {
             .map(|args| {
                 args.iter()
                     .map(|arg| {
-                        let Some(view) = arg.as_any().downcast_ref::<CuDFColumnView>() else {
-                            return internal_err!("Expected Array to be of type CuDFColumnView");
-                        };
-                        Ok(view.clone())
+                        if let Some(view) = arg.as_any().downcast_ref::<CuDFColumnView>() {
+                            return Ok(view.clone());
+                        }
+                        CuDFColumn::from_arrow_host(arg.as_ref())
+                            .map(|col| col.into_view())
+                            .map_err(cudf_to_df)
                     })
                     .collect()
             })
@@ -375,7 +379,7 @@ fn concat_cudf_batches(batches: &[RecordBatch]) -> Result<RecordBatch> {
             Ok(Arc::new(col.into_view()) as Arc<dyn Array>)
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok(RecordBatch::try_new(schema, cols)?)
+    Ok(record_batch_with_schema(cols, &schema)?)
 }
 
 impl futures::Stream for Stream {
