@@ -1,4 +1,3 @@
-use crate::aggregate::{avg, count, max, min, sum};
 use crate::optimizer::{CuDFConfig, HostToCuDFRule};
 use arrow::array::RecordBatch;
 use arrow::util::pretty::pretty_format_batches;
@@ -27,12 +26,7 @@ impl TestFramework {
             .build();
         let ctx = SessionContext::from(state);
 
-        // Register GPU-backed aggregate UDFs so SQL queries route to the cuDF path.
-        ctx.register_udaf((*avg()).clone());
-        ctx.register_udaf((*count()).clone());
-        ctx.register_udaf((*max()).clone());
-        ctx.register_udaf((*min()).clone());
-        ctx.register_udaf((*sum()).clone());
+        crate::test_utils::tpch::register_cudf_aggregate_udfs(&ctx);
 
         let mut base = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         base.pop();

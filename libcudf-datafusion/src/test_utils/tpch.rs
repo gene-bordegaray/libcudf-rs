@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
+use crate::aggregate::{avg, count, max, min, sum};
 use datafusion::{
     arrow::datatypes::{DataType, Field, Schema},
     catalog::{MemTable, TableProvider},
+    prelude::SessionContext,
 };
 
 use std::fs;
@@ -26,6 +28,15 @@ pub fn tpch_query_from_dir(queries_dir: &std::path::Path, num: u8) -> String {
         .to_string()
 }
 pub const NUM_QUERIES: u8 = 22; // number of queries in the TPCH benchmark numbered from 1 to 22
+
+/// Registers cuDF-backed aggregate UDFs used by TPC-H SQL.
+pub fn register_cudf_aggregate_udfs(ctx: &SessionContext) {
+    ctx.register_udaf((*avg()).clone());
+    ctx.register_udaf((*count()).clone());
+    ctx.register_udaf((*max()).clone());
+    ctx.register_udaf((*min()).clone());
+    ctx.register_udaf((*sum()).clone());
+}
 
 pub fn tpch_table(name: &str) -> Arc<dyn TableProvider> {
     let schema = Arc::new(get_tpch_table_schema(name));
