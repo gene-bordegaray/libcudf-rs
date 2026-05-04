@@ -104,21 +104,21 @@ impl ExecutionPlan for CuDFLoadExec {
     }
 }
 
-fn cudf_schema_compatibility_map(schema: SchemaRef) -> SchemaRef {
+/// Maps an Arrow schema to the types cuDF will actually produce.
+///
+/// - `Utf8View -> Utf8`: cuDF's `TYPE_STRING` has no view variant.
+/// - `Decimal{32,64,128}(p, s) -> Decimal{32,64,128}(max_p, s)`: cuDF uses fixed precision
+///   based on storage width (9/18/38). Scale is preserved.
+pub(crate) fn cudf_schema_compatibility_map(schema: SchemaRef) -> SchemaRef {
     let mut new_fields = Vec::with_capacity(schema.fields.len());
 
     for field in schema.fields() {
         let field = match field.data_type() {
-            // CuDF doesn't support Utf8View, convert to regular Utf8
             DataType::Utf8View => FieldRef::new(Field::new(
                 field.name(),
                 DataType::Utf8,
                 field.is_nullable(),
             )),
-            // Normalize decimal precision to max for the representation type.
-            // CuDF uses fixed precision based on storage type (int32/int64/int128),
-            // so we normalize schema to match what CuDF will produce.
-            // Scale is preserved as-is since it's user-specified metadata.
             DataType::Decimal32(_, s) => FieldRef::new(Field::new(
                 field.name(),
                 DataType::Decimal32(9, *s), // max precision for 32-bit

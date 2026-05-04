@@ -30,6 +30,7 @@ pub mod ffi {
         include!("libcudf-sys/src/operations.h");
         include!("libcudf-sys/src/binaryop.h");
         include!("libcudf-sys/src/sorting.h");
+        include!("libcudf-sys/src/join.h");
 
         /// A set of cuDF columns of the same size
         ///
@@ -425,6 +426,49 @@ pub mod ffi {
             column_order: &[i32],
             null_precedence: &[i32],
         ) -> Result<UniquePtr<Table>>;
+
+        // Join operations.
+
+        /// Inner join: gather matching rows from both payloads into one output table.
+        fn inner_join_gather(
+            left_keys: &TableView,
+            right_keys: &TableView,
+            left_payload: &TableView,
+            right_payload: &TableView,
+        ) -> Result<UniquePtr<Table>>;
+
+        /// Left outer join: all left rows appear; unmatched right columns are null.
+        fn left_join_gather(
+            left_keys: &TableView,
+            right_keys: &TableView,
+            left_payload: &TableView,
+            right_payload: &TableView,
+        ) -> Result<UniquePtr<Table>>;
+
+        /// Full outer join: all rows from both sides; unmatched columns on either side are null.
+        fn full_join_gather(
+            left_keys: &TableView,
+            right_keys: &TableView,
+            left_payload: &TableView,
+            right_payload: &TableView,
+        ) -> Result<UniquePtr<Table>>;
+
+        /// Left semi join: gather only matching left rows (no right columns in output).
+        fn left_semi_join_gather(
+            left_keys: &TableView,
+            right_keys: &TableView,
+            left_payload: &TableView,
+        ) -> Result<UniquePtr<Table>>;
+
+        /// Left anti join: gather only non-matching left rows (no right columns in output).
+        fn left_anti_join_gather(
+            left_keys: &TableView,
+            right_keys: &TableView,
+            left_payload: &TableView,
+        ) -> Result<UniquePtr<Table>>;
+
+        /// Cross join: returns a full Cartesian product table
+        fn cross_join(left: &TableView, right: &TableView) -> Result<UniquePtr<Table>>;
 
         // Aggregation factory functions - direct cuDF mappings (for reduce)
 
