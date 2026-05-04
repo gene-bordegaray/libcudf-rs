@@ -14,7 +14,9 @@ pub struct TestFramework {
 
 impl TestFramework {
     pub async fn new() -> Self {
-        let config = SessionConfig::new().with_option_extension(CuDFConfig::default());
+        let config = SessionConfig::new()
+            .with_target_partitions(4)
+            .with_option_extension(CuDFConfig::default());
 
         let state = SessionStateBuilder::new()
             .with_default_features()
