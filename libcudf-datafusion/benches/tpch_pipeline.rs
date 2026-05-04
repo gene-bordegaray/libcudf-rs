@@ -27,7 +27,15 @@
 //!
 //! ## Data
 //!
-//! TPC-H SF=1 Parquet files from `testdata/tpch/correctness_sf1/`.
+//! TPC-H Parquet files from `testdata/tpch/correctness_sf{scale}/`.
+//! The benchmark defaults to SF=1. Set `LIBCUDF_TPCH_SCALE_FACTOR` to run
+//! another generated scale factor:
+//!
+//! ```sh
+//! LIBCUDF_TPCH_SCALE_FACTOR=10 cargo bench -p libcudf-datafusion --bench tpch_pipeline
+//! ```
+//!
+//! Row counts below are for SF=1.
 //!
 //! | Table    | Rows    | Role               |
 //! |----------|---------|--------------------|
@@ -42,13 +50,41 @@ use datafusion_physical_plan::{execute_stream, ExecutionPlan};
 use futures_util::TryStreamExt;
 use libcudf_datafusion::aggregate::count;
 use libcudf_datafusion::{configure_default_pools, CuDFConfig, HostToCuDFRule};
+use std::env;
 use std::hint::black_box;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
-fn tpch_sf1_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/tpch/correctness_sf1")
+const TPCH_SCALE_FACTOR_ENV: &str = "LIBCUDF_TPCH_SCALE_FACTOR";
+
+fn tpch_scale_factor() -> String {
+    let raw = env::var(TPCH_SCALE_FACTOR_ENV).unwrap_or_else(|_| "1".to_string());
+    let scale_factor = raw.trim().parse::<f64>().unwrap_or_else(|err| {
+        panic!("invalid {TPCH_SCALE_FACTOR_ENV} value {raw:?}: {err}");
+    });
+
+    if !scale_factor.is_finite() || scale_factor <= 0.0 {
+        panic!("{TPCH_SCALE_FACTOR_ENV} must be a positive finite number");
+    }
+
+    if scale_factor.fract() == 0.0 {
+        format!("{scale_factor:.0}")
+    } else {
+        scale_factor.to_string()
+    }
+}
+
+fn tpch_data_dir(scale_factor: &str) -> PathBuf {
+    let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(format!("testdata/tpch/correctness_sf{scale_factor}"));
+    if !data_dir.exists() {
+        panic!(
+            "TPC-H SF={scale_factor} data not found at {}",
+            data_dir.display()
+        );
+    }
+    data_dir
 }
 
 const PIPELINE_SQL: &str = "
@@ -58,9 +94,8 @@ const PIPELINE_SQL: &str = "
     GROUP BY c.c_nationkey
 ";
 
-async fn cpu_ctx() -> SessionContext {
+async fn cpu_ctx(base: PathBuf) -> SessionContext {
     let ctx = SessionContext::new();
-    let base = tpch_sf1_dir();
     ctx.register_parquet(
         "orders",
         base.join("orders").to_str().unwrap(),
@@ -78,7 +113,7 @@ async fn cpu_ctx() -> SessionContext {
     ctx
 }
 
-async fn gpu_ctx() -> SessionContext {
+async fn gpu_ctx(base: PathBuf) -> SessionContext {
     let mut cudf_config = CuDFConfig::default();
     cudf_config.enable = true;
     // Single partition: DataFusion then plans AggregateMode::Single instead of
@@ -97,7 +132,6 @@ async fn gpu_ctx() -> SessionContext {
         .build();
     let ctx = SessionContext::from(state);
     ctx.register_udaf((*count()).clone());
-    let base = tpch_sf1_dir();
     ctx.register_parquet(
         "orders",
         base.join("orders").to_str().unwrap(),
@@ -127,10 +161,12 @@ async fn build_plan(ctx: &SessionContext, sql: &str) -> Arc<dyn ExecutionPlan> {
 fn bench_tpch_pipeline(c: &mut Criterion) {
     configure_default_pools();
     let rt = Runtime::new().unwrap();
-    let mut group = c.benchmark_group("tpch_pipeline/orders_x_customer");
+    let scale_factor = tpch_scale_factor();
+    let data_dir = tpch_data_dir(&scale_factor);
+    let mut group = c.benchmark_group(format!("tpch_pipeline/orders_x_customer/sf{scale_factor}"));
 
-    let cpu = rt.block_on(cpu_ctx());
-    let gpu = rt.block_on(gpu_ctx());
+    let cpu = rt.block_on(cpu_ctx(data_dir.clone()));
+    let gpu = rt.block_on(gpu_ctx(data_dir));
     let cpu_task_ctx = cpu.task_ctx();
     let gpu_task_ctx = gpu.task_ctx();
 
