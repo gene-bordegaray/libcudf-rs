@@ -169,15 +169,11 @@ impl CuDFProjectionStream {
         if arrays.is_empty() {
             let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
             RecordBatch::try_new_with_options(Arc::clone(&self.schema), arrays, &options)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
         } else {
-            RecordBatch::try_new(Arc::clone(&self.schema), arrays)
+            libcudf_rs::record_batch_with_schema(arrays, &self.schema)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
         }
-        .map_err(|err| {
-            DataFusionError::ArrowError(
-                Box::new(err),
-                Some("Error projecting CuDF RecordBatch".to_string()),
-            )
-        })
     }
 }
 
@@ -252,6 +248,21 @@ mod tests {
             )
             .await?;
         assert_eq!(host_result.pretty_print, result.pretty_print);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_unsupported_expression_falls_back_to_cpu() -> Result<(), DataFusionError> {
+        let tf = TestFramework::new().await;
+        tf.execute(
+            "CREATE TABLE dates (d DATE) AS VALUES (DATE '2023-01-15'), (DATE '2024-06-30')",
+        )
+        .await?;
+        let host_sql = r#"SELECT date_part('year', d) as yr FROM dates ORDER BY yr"#;
+        let cudf_sql = format!("SET cudf.enable=true; {host_sql}");
+        let cudf = tf.execute(&cudf_sql).await?;
+        let host = tf.execute(host_sql).await?;
+        assert_eq!(host.pretty_print, cudf.pretty_print);
         Ok(())
     }
 
