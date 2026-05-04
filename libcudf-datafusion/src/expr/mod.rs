@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 mod binary;
 mod column;
+mod decimal;
 mod literal;
 
 pub(crate) fn columnar_value_to_cudf(

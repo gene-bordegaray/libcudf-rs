@@ -53,7 +53,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "wrong results: mkt_share returns 0 on GPU instead of correct values; likely a CASE expression bug"]
     async fn test_tpch_8() -> Result<(), Box<dyn Error>> {
         test_tpch_query(get_test_tpch_query(8)).await
     }
@@ -75,73 +74,61 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
     async fn test_tpch_11() -> Result<(), Box<dyn Error>> {
         test_tpch_query(get_test_tpch_query(11)).await
     }
 
     #[tokio::test]
-    #[ignore]
     async fn test_tpch_12() -> Result<(), Box<dyn Error>> {
         test_tpch_query(get_test_tpch_query(12)).await
     }
 
     #[tokio::test]
-    #[ignore]
     async fn test_tpch_13() -> Result<(), Box<dyn Error>> {
         test_tpch_query(get_test_tpch_query(13)).await
     }
 
     #[tokio::test]
-    #[ignore]
     async fn test_tpch_14() -> Result<(), Box<dyn Error>> {
         test_tpch_query(get_test_tpch_query(14)).await
     }
 
     #[tokio::test]
-    #[ignore]
     async fn test_tpch_15() -> Result<(), Box<dyn Error>> {
         test_tpch_query(get_test_tpch_query(15)).await
     }
 
     #[tokio::test]
-    #[ignore]
     async fn test_tpch_16() -> Result<(), Box<dyn Error>> {
         test_tpch_query(get_test_tpch_query(16)).await
     }
 
     #[tokio::test]
-    #[ignore]
     async fn test_tpch_17() -> Result<(), Box<dyn Error>> {
         test_tpch_query(get_test_tpch_query(17)).await
     }
 
     #[tokio::test]
-    #[ignore]
     async fn test_tpch_18() -> Result<(), Box<dyn Error>> {
         test_tpch_query(get_test_tpch_query(18)).await
     }
 
     #[tokio::test]
-    #[ignore]
     async fn test_tpch_19() -> Result<(), Box<dyn Error>> {
         test_tpch_query(get_test_tpch_query(19)).await
     }
 
     #[tokio::test]
-    #[ignore]
     async fn test_tpch_20() -> Result<(), Box<dyn Error>> {
         test_tpch_query(get_test_tpch_query(20)).await
     }
 
     #[tokio::test]
-    #[ignore]
     async fn test_tpch_21() -> Result<(), Box<dyn Error>> {
         test_tpch_query(get_test_tpch_query(21)).await
     }
 
     #[tokio::test]
-    #[ignore]
     async fn test_tpch_22() -> Result<(), Box<dyn Error>> {
         test_tpch_query(get_test_tpch_query(22)).await
     }

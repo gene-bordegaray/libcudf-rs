@@ -1,4 +1,5 @@
 use crate::errors::cudf_to_df;
+use crate::expr::decimal::{decimal_div, is_decimal_division};
 use crate::expr::{columnar_value_to_cudf, cudf_to_columnar_value, expr_to_cudf_expr};
 use arrow::array::RecordBatch;
 use arrow_schema::{DataType, FieldRef, Schema};
@@ -77,10 +78,20 @@ impl PhysicalExpr for CuDFBinaryExpr {
             _ => expected.clone(),
         };
 
-        let lhs = columnar_value_to_cudf(self.left.evaluate(batch)?)?;
-        let rhs = columnar_value_to_cudf(self.right.evaluate(batch)?)?;
+        let lhs_value = self.left.evaluate(batch)?;
+        let rhs_value = self.right.evaluate(batch)?;
+        let lhs_type = lhs_value.data_type();
+        let rhs_type = rhs_value.data_type();
+        let lhs = columnar_value_to_cudf(lhs_value)?;
+        let rhs = columnar_value_to_cudf(rhs_value)?;
 
-        let result = cudf_binary_op(lhs, rhs, self.op, &cudf_output_type).map_err(cudf_to_df)?;
+        let result = if self.op == CuDFBinaryOp::Div
+            && is_decimal_division(&expected, &lhs_type, &rhs_type)
+        {
+            decimal_div(lhs, rhs, &lhs_type, &rhs_type, &cudf_output_type)?
+        } else {
+            cudf_binary_op(lhs, rhs, self.op, &cudf_output_type).map_err(cudf_to_df)?
+        };
         Ok(cudf_to_columnar_value(result))
     }
 
@@ -213,6 +224,38 @@ mod tests {
         ");
 
         // Verify against host execution
+        let host_result = tf.execute(host_sql).await?;
+        assert_eq!(host_result.pretty_print, result.pretty_print);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_decimal_division_fractional_result() -> Result<(), Box<dyn std::error::Error>> {
+        let tf = TestFramework::new().await;
+
+        tf.execute(
+            r#"CREATE TABLE ratios (num DECIMAL(10, 2), den DECIMAL(10, 2)) AS VALUES
+                (3.00, 100.00),
+                (42.00, 10.00)"#,
+        )
+        .await?;
+
+        let host_sql = "SELECT num / den as ratio FROM ratios ORDER BY ratio";
+        let result = tf
+            .execute(&format!("SET cudf.enable=true; {host_sql}"))
+            .await?;
+
+        assert_contains!(result.plan, "CuDFProjectionExec");
+        assert_snapshot!(result.pretty_print, @r"
+        +----------+
+        | ratio    |
+        +----------+
+        | 0.030000 |
+        | 4.200000 |
+        +----------+
+        ");
+
         let host_result = tf.execute(host_sql).await?;
         assert_eq!(host_result.pretty_print, result.pretty_print);
 
