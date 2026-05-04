@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 mod binary;
 mod column;
+mod decimal;
 mod literal;
 
 pub(crate) fn columnar_value_to_cudf(
@@ -28,7 +29,7 @@ pub(crate) fn columnar_value_to_cudf(
             }
             exec_err!("ColumnarValue::Array is not CuDFColumnView or CuDFScalar")
         }
-        ColumnarValue::Scalar(s) => {
+        ColumnarValue::Scalar(_) => {
             exec_err!("ColumnarValue::Scalar is not allowed when executing in CuDF nodes")
         }
     }

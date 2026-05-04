@@ -642,7 +642,7 @@ mod integration {
     #[tokio::test]
     async fn test_unsupported_agg_falls_back_to_cpu() -> Result<(), Box<dyn Error>> {
         let tf = TestFramework::new().await;
-        let sql = r#"SELECT "RainToday", BOOL_OR("RainTomorrow" = 'Yes') as any_rain FROM weather GROUP BY "RainToday""#;
+        let sql = r#"SELECT "RainToday", BOOL_OR("RainTomorrow" = 'Yes') as any_rain FROM weather GROUP BY "RainToday" ORDER BY "RainToday""#;
         let gpu = tf.execute(&format!("SET cudf.enable=true; {sql}")).await?;
         let cpu = tf.execute(sql).await?;
         assert!(
