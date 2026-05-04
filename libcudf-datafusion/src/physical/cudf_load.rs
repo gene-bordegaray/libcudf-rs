@@ -1,7 +1,7 @@
 use crate::errors::cudf_to_df;
 use arrow::array::{Array, RecordBatch};
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Schema, SchemaRef};
-use datafusion::common::{exec_err, plan_err};
+use datafusion::common::{exec_err, plan_err, ScalarValue};
 use datafusion::error::DataFusionError;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
@@ -101,6 +101,14 @@ impl ExecutionPlan for CuDFLoadExec {
             self.schema(),
             cudf_stream,
         )))
+    }
+}
+
+/// Converts Arrow scalar types that cuDF does not support into cuDF-compatible equivalents.
+pub(crate) fn normalize_scalar_for_cudf(value: ScalarValue) -> ScalarValue {
+    match value {
+        ScalarValue::Utf8View(s) => ScalarValue::Utf8(s),
+        other => other,
     }
 }
 
