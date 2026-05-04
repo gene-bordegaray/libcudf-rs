@@ -91,7 +91,7 @@ mod tests {
 
         let result = tf.execute(&cudf_sql).await?;
         assert_contains!(result.plan, "CuDF");
-        assert_snapshot!(result.pretty_print, @"
+        assert_snapshot!(result.pretty_print, @r"
         +---------------+--------------+----------+
         | temp_plus_ten | temp_doubled | has_rain |
         +---------------+--------------+----------+
