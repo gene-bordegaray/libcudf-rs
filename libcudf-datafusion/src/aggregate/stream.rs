@@ -12,7 +12,9 @@ use datafusion_physical_plan::aggregates::{
 };
 use datafusion_physical_plan::udaf::AggregateFunctionExpr;
 use futures::{ready, StreamExt};
-use libcudf_rs::{CuDFColumn, CuDFColumnView, CuDFGroupBy, CuDFTable, CuDFTableView};
+use libcudf_rs::{
+    record_batch_with_schema, CuDFColumn, CuDFColumnView, CuDFGroupBy, CuDFTable, CuDFTableView,
+};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -303,10 +305,7 @@ impl Stream {
             }
         }
 
-        Ok(Some(RecordBatch::try_new(
-            self.output_schema.clone(),
-            arrays,
-        )?))
+        Ok(Some(record_batch_with_schema(arrays, &self.output_schema)?))
     }
 
     /// Evaluate GROUP BY expressions on a batch and wrap the resulting key
@@ -386,7 +385,7 @@ fn concat_cudf_batches(batches: &[RecordBatch]) -> Result<RecordBatch> {
             Ok(Arc::new(col.into_view()) as Arc<dyn Array>)
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok(RecordBatch::try_new(schema, cols)?)
+    Ok(record_batch_with_schema(cols, &schema)?)
 }
 
 impl futures::Stream for Stream {

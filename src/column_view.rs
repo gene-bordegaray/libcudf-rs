@@ -54,10 +54,9 @@ impl CuDFColumnView {
         self.inner
     }
 
-    /// Create a view with a different Arrow `DataType` label, sharing the same GPU memory.
-    ///
-    /// The caller must ensure the raw GPU values are correct for the new type.
-    /// Safe to use when the view is only unloaded to host, not chained into further GPU arithmetic.
+    /// Relabel this view's Arrow `DataType` without touching GPU memory.
+    /// Used by [`record_batch_with_schema`](crate::record_batch_with_schema) to
+    /// reconcile cuDF's max-precision decimals with declared schema types.
     pub fn with_data_type(self, dt: DataType) -> Self {
         Self {
             _ref: self._ref,
