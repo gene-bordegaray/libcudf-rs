@@ -755,22 +755,6 @@ mod tests {
     }
 
     #[test]
-    fn gpu_execution_batch_size_overrides_shared_batch_size() {
-        let opt = harness_opt(Some(8192), Some(131072));
-
-        assert_eq!(opt.cpu_execution_batch_size(), Some(8192));
-        assert_eq!(opt.gpu_execution_batch_size(), Some(131072));
-    }
-
-    #[test]
-    fn gpu_execution_batch_size_defaults_to_shared_batch_size() {
-        let opt = harness_opt(Some(8192), None);
-
-        assert_eq!(opt.cpu_execution_batch_size(), Some(8192));
-        assert_eq!(opt.gpu_execution_batch_size(), Some(8192));
-    }
-
-    #[test]
     fn run_args_use_gpu_execution_batch_size_override() {
         let opt = harness_opt(Some(8192), Some(131072));
 
@@ -795,6 +779,18 @@ mod tests {
 
         assert!(contains_arg_pair(&cpu_args, "--batch-size", "8192"));
         assert!(contains_arg_pair(&gpu_args, "--batch-size", "131072"));
+
+        let default_opt = harness_opt(Some(8192), None);
+        let default_gpu_args = default_opt.dfbench_run_args(
+            true,
+            default_opt.gpu_execution_batch_size(),
+            false,
+            None,
+            3,
+            Some(Path::new("/tmp/gpu")),
+            true,
+        );
+        assert!(contains_arg_pair(&default_gpu_args, "--batch-size", "8192"));
     }
 
     fn harness_opt(
