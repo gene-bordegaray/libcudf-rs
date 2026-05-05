@@ -1,4 +1,6 @@
+use arrow_schema::DataType;
 use datafusion::error::Result;
+use datafusion_physical_plan::aggregates::AggregateMode;
 use libcudf_rs::{AggregationRequest, CuDFColumn, CuDFColumnView};
 use std::fmt::Debug;
 
@@ -25,6 +27,17 @@ pub trait CuDFAggregationOp: Debug + Send + Sync {
     /// Must match the DataFusion UDF's `state_fields().len()`.
     fn num_state_columns(&self) -> usize;
 
+    /// Return whether this op supports the argument columns that DataFusion will
+    /// pass for the given aggregate mode.
+    fn supports_input_types(
+        &self,
+        _mode: AggregateMode,
+        _input_types: &[DataType],
+        _output_type: &DataType,
+    ) -> bool {
+        true
+    }
+
     /// Build cuDF aggregation requests for raw input data.
     fn partial_requests(&self, args: &[CuDFColumnView]) -> Result<Vec<AggregationRequest>>;
 
@@ -43,5 +56,5 @@ pub trait CuDFAggregationOp: Debug + Send + Sync {
     fn merge_requests(&self, args: &[CuDFColumnView]) -> Result<Vec<AggregationRequest>>;
 
     /// Convert merged state columns into the final output column.
-    fn finalize(&self, args: &[CuDFColumnView]) -> Result<CuDFColumnView>;
+    fn finalize(&self, args: &[CuDFColumnView], output_type: &DataType) -> Result<CuDFColumnView>;
 }

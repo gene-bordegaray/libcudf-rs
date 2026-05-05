@@ -1,12 +1,15 @@
 use crate::expr::expr_to_cudf_expr;
-use arrow_schema::Schema;
-use datafusion::error::Result;
+use arrow_schema::{DataType, Schema, SchemaRef};
+use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::projection::ProjectionMapping;
-use datafusion_physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
+use datafusion_physical_plan::aggregates::{
+    aggregate_expressions, AggregateExec, AggregateMode, PhysicalGroupBy,
+};
+use datafusion_physical_plan::expressions::{Column, Literal};
 use datafusion_physical_plan::udaf::AggregateFunctionExpr;
 use datafusion_physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, InputOrderMode, PlanProperties,
+    DisplayAs, DisplayFormatType, ExecutionPlan, InputOrderMode, PhysicalExpr, PlanProperties,
 };
 use std::any::{type_name, Any};
 use std::fmt::{Debug, Formatter};
@@ -23,6 +26,29 @@ pub use op::sum::sum;
 pub(crate) use op::udf::CuDFAggregateUDF;
 pub(crate) use op::CuDFAggregationOp;
 
+/// A fully validated cuDF aggregate plan for one DataFusion `AggregateExec`.
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedCuDFAggregate {
+    mode: AggregateMode,
+    group_by: PhysicalGroupBy,
+    aggs: Vec<PreparedAggregate>,
+}
+
+/// One aggregate expression with all cuDF execution details resolved.
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedAggregate {
+    expr: Arc<AggregateFunctionExpr>,
+    op: Arc<dyn CuDFAggregationOp>,
+    args: Vec<Arc<dyn PhysicalExpr>>,
+    output_type: DataType,
+}
+
+impl PreparedCuDFAggregate {
+    fn aggr_expr(&self) -> Vec<Arc<AggregateFunctionExpr>> {
+        self.aggs.iter().map(|agg| agg.expr.clone()).collect()
+    }
+}
+
 /// GPU-accelerated GROUP BY aggregate execution node.
 ///
 /// Replaces DataFusion's `AggregateExec` for queries where all aggregate
@@ -30,10 +56,7 @@ pub(crate) use op::CuDFAggregationOp;
 #[derive(Debug)]
 pub struct CuDFAggregateExec {
     input: Arc<dyn ExecutionPlan>,
-    mode: AggregateMode,
-    group_by: PhysicalGroupBy,
-    aggr_expr: Vec<Arc<AggregateFunctionExpr>>,
-
+    prepared: PreparedCuDFAggregate,
     plan_properties: Arc<PlanProperties>,
 }
 
@@ -45,18 +68,28 @@ impl CuDFAggregateExec {
         aggr_expr: Vec<Arc<AggregateFunctionExpr>>,
     ) -> Result<Self> {
         let input_schema = input.schema();
-
-        // Non-single grouping sets (CUBE, ROLLUP) add an extra column for the grouping ID.
-        let group_by_fields = {
-            let num_exprs = group_by.expr().len();
-            if !group_by.is_single() {
-                num_exprs + 1
-            } else {
-                num_exprs
-            }
+        let Some(prepared) =
+            prepare_cudf_aggregate_parts(mode, group_by, aggr_expr, &input_schema)?
+        else {
+            return Err(datafusion::error::DataFusionError::NotImplemented(
+                "Aggregate is not supported by cuDF".to_string(),
+            ));
         };
 
-        let group_by_schema = group_by.group_schema(&input_schema)?;
+        Self::try_new_prepared(input, prepared)
+    }
+
+    fn try_new_prepared(
+        input: Arc<dyn ExecutionPlan>,
+        prepared: PreparedCuDFAggregate,
+    ) -> Result<Self> {
+        let input_schema = input.schema();
+        let mode = prepared.mode;
+        let aggr_expr = prepared.aggr_expr();
+
+        let group_by_fields = prepared.group_by.expr().len();
+
+        let group_by_schema = prepared.group_by.group_schema(&input_schema)?;
         let group_by_exprs = group_by_schema.fields.iter().take(group_by_fields).cloned();
 
         let mut fields = Vec::with_capacity(group_by_fields + aggr_expr.len());
@@ -83,7 +116,7 @@ impl CuDFAggregateExec {
         ));
 
         let group_by_expr_mapping =
-            ProjectionMapping::try_new(group_by.expr().iter().cloned(), &input.schema())?;
+            ProjectionMapping::try_new(prepared.group_by.expr().iter().cloned(), &input.schema())?;
 
         let plan_properties = Arc::new(AggregateExec::compute_properties(
             &input,
@@ -96,9 +129,7 @@ impl CuDFAggregateExec {
 
         Ok(Self {
             input,
-            mode,
-            group_by,
-            aggr_expr,
+            prepared,
             plan_properties,
         })
     }
@@ -107,20 +138,20 @@ impl CuDFAggregateExec {
 impl DisplayAs for CuDFAggregateExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
         write!(f, "CuDFAggregateExec: ")?;
-        write!(f, "mode={:?}, ", self.mode)?;
+        write!(f, "mode={:?}, ", self.prepared.mode)?;
         write!(f, "group_by=[")?;
-        for (i, (expr, alias)) in self.group_by.expr().iter().enumerate() {
+        for (i, (expr, alias)) in self.prepared.group_by.expr().iter().enumerate() {
             if i > 0 {
                 write!(f, ", ")?;
             }
             write!(f, "{}@{}", alias, expr)?;
         }
         write!(f, "], aggr_expr=[")?;
-        for (i, expr) in self.aggr_expr.iter().enumerate() {
+        for (i, agg) in self.prepared.aggs.iter().enumerate() {
             if i > 0 {
                 write!(f, ", ")?;
             }
-            write!(f, "{}", expr.name())?;
+            write!(f, "{}", agg.expr.name())?;
         }
         write!(f, "]")
     }
@@ -149,9 +180,9 @@ impl ExecutionPlan for CuDFAggregateExec {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let new = Self::try_new(
             children[0].clone(),
-            self.mode,
-            self.group_by.clone(),
-            self.aggr_expr.clone(),
+            self.prepared.mode,
+            self.prepared.group_by.clone(),
+            self.prepared.aggr_expr(),
         )?;
 
         Ok(Arc::new(new))
@@ -163,14 +194,116 @@ impl ExecutionPlan for CuDFAggregateExec {
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let input = self.input.execute(partition, context)?;
-        let stream = stream::Stream::new(
-            input,
-            self.schema(),
-            self.mode,
-            self.group_by.clone(),
-            self.aggr_expr.clone(),
-        )?;
+        let stream = stream::Stream::new(input, self.schema(), self.prepared.clone())?;
         Ok(Box::pin(stream))
+    }
+}
+
+fn prepare_cudf_aggregate(node: &AggregateExec) -> Result<Option<PreparedCuDFAggregate>> {
+    prepare_cudf_aggregate_parts(
+        *node.mode(),
+        node.group_expr().clone(),
+        node.aggr_expr().to_vec(),
+        &node.input().schema(),
+    )
+}
+
+fn prepare_cudf_aggregate_parts(
+    mode: AggregateMode,
+    group_by: PhysicalGroupBy,
+    aggr_expr: Vec<Arc<AggregateFunctionExpr>>,
+    input_schema: &SchemaRef,
+) -> Result<Option<PreparedCuDFAggregate>> {
+    if group_by.expr().is_empty() {
+        return Ok(None);
+    }
+    if !group_by.is_single() {
+        return Ok(None);
+    }
+    for (expr, _) in group_by.expr() {
+        if expr.as_any().downcast_ref::<Column>().is_none() {
+            return Ok(None);
+        }
+    }
+    for expr in &aggr_expr {
+        if expr.is_distinct() || !expr.order_bys().is_empty() {
+            return Ok(None);
+        }
+    }
+
+    let aggregate_args = aggregate_expressions(&aggr_expr, &mode, group_by.expr().len())?;
+
+    let mut aggs = Vec::with_capacity(aggregate_args.len());
+    for (expr, args) in aggr_expr.into_iter().zip(aggregate_args) {
+        let Some(udf) = expr
+            .fun()
+            .inner()
+            .as_any()
+            .downcast_ref::<CuDFAggregateUDF>()
+        else {
+            return Ok(None);
+        };
+        let op = udf.gpu().clone();
+
+        if !original_aggregate_args_supported(&expr)? {
+            return Ok(None);
+        }
+
+        let output_type = expr.field().data_type().clone();
+        let arg_types = args
+            .iter()
+            .map(|arg| arg.data_type(input_schema))
+            .collect::<Result<Vec<DataType>>>()?;
+        if !op.supports_input_types(mode, &arg_types, &output_type) {
+            return Ok(None);
+        }
+
+        let mut converted = Vec::with_capacity(args.len());
+        for arg in args {
+            let Some(arg) = expr_to_cudf_aggregate_arg(arg)? else {
+                return Ok(None);
+            };
+            converted.push(arg);
+        }
+        aggs.push(PreparedAggregate {
+            expr,
+            op,
+            args: converted,
+            output_type,
+        });
+    }
+
+    Ok(Some(PreparedCuDFAggregate {
+        mode,
+        group_by,
+        aggs,
+    }))
+}
+
+fn original_aggregate_args_supported(expr: &AggregateFunctionExpr) -> Result<bool> {
+    // Final aggregates see only state columns, so they may look GPU-compatible
+    // even when the matching partial aggregate had unsupported raw arguments.
+    // Keep the whole aggregate chain on one side of the CPU/GPU boundary.
+    for arg in expr.expressions() {
+        if expr_to_cudf_aggregate_arg(arg)?.is_none() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn expr_to_cudf_aggregate_arg(arg: Arc<dyn PhysicalExpr>) -> Result<Option<Arc<dyn PhysicalExpr>>> {
+    // A bare literal aggregate argument, e.g. COUNT(*), must keep DataFusion's
+    // normal batch-length expansion. CuDFLiteral evaluates to a scalar, which is
+    // correct inside binary GPU expressions but not as a direct aggregate input.
+    if arg.as_any().downcast_ref::<Literal>().is_some() {
+        return Ok(Some(arg));
+    }
+
+    match expr_to_cudf_expr(arg.as_ref()) {
+        Ok(expr) => Ok(Some(expr)),
+        Err(DataFusionError::NotImplemented(_)) => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
@@ -181,36 +314,12 @@ impl ExecutionPlan for CuDFAggregateExec {
 pub(crate) fn try_as_cudf_aggregate(
     node: &AggregateExec,
 ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-    if node.group_expr().expr().is_empty() {
+    let Some(prepared) = prepare_cudf_aggregate(node)? else {
         return Ok(None);
-    }
-    if !node.group_expr().is_single() {
-        return Ok(None);
-    }
-    for expr in node.aggr_expr() {
-        if expr.is_distinct() || !expr.order_bys().is_empty() {
-            return Ok(None);
-        }
-        if expr
-            .fun()
-            .inner()
-            .as_any()
-            .downcast_ref::<CuDFAggregateUDF>()
-            .is_none()
-        {
-            return Ok(None);
-        }
-        for input_expr in expr.expressions() {
-            if expr_to_cudf_expr(input_expr.as_ref()).is_err() {
-                return Ok(None);
-            }
-        }
-    }
-    Ok(Some(Arc::new(CuDFAggregateExec::try_new(
+    };
+    Ok(Some(Arc::new(CuDFAggregateExec::try_new_prepared(
         node.input().clone(),
-        *node.mode(),
-        node.group_expr().clone(),
-        node.aggr_expr().to_vec(),
+        prepared,
     )?)))
 }
 
@@ -647,6 +756,59 @@ mod integration {
         assert!(
             !gpu.plan.contains("CuDFAggregateExec"),
             "unsupported aggregate argument should keep AggregateExec:\n{}",
+            gpu.plan
+        );
+        assert_eq!(cpu.pretty_print, gpu.pretty_print);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_decimal_sum_expression_uses_cudf_args() -> Result<(), Box<dyn Error>> {
+        let tf = TestFramework::new().await;
+        tf.execute(
+            r#"CREATE TABLE decimal_sales (
+                k VARCHAR,
+                price DECIMAL(10, 2),
+                discount DECIMAL(10, 2)
+            ) AS VALUES
+                ('a', 10.00, 1.25),
+                ('a', 20.00, 2.50),
+                ('b', 30.00, 3.75)"#,
+        )
+        .await?;
+
+        let sql = "SELECT k, SUM(price - discount) AS net FROM decimal_sales GROUP BY k ORDER BY k";
+        let gpu = tf.execute(&format!("SET cudf.enable=true; {sql}")).await?;
+        let cpu = tf.execute(sql).await?;
+        assert!(
+            gpu.plan.contains("CuDFAggregateExec"),
+            "expected decimal aggregate expression to use cuDF:\n{}",
+            gpu.plan
+        );
+        assert_eq!(cpu.pretty_print, gpu.pretty_print);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_decimal_avg_uses_cudf() -> Result<(), Box<dyn Error>> {
+        let tf = TestFramework::new().await;
+        tf.execute(
+            r#"CREATE TABLE decimal_sales (
+                k VARCHAR,
+                price DECIMAL(10, 2)
+            ) AS VALUES
+                ('a', 10.00),
+                ('a', 20.00),
+                ('b', 30.00)"#,
+        )
+        .await?;
+
+        let sql = "SELECT k, AVG(price) AS avg_price FROM decimal_sales GROUP BY k ORDER BY k";
+        let gpu = tf.execute(&format!("SET cudf.enable=true; {sql}")).await?;
+        let cpu = tf.execute(sql).await?;
+        assert!(
+            gpu.plan.contains("CuDFAggregateExec"),
+            "expected AVG(decimal) to use cuDF:\n{}",
             gpu.plan
         );
         assert_eq!(cpu.pretty_print, gpu.pretty_print);

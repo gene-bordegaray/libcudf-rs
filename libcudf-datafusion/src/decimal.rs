@@ -7,7 +7,7 @@ use arrow_schema::{
 use datafusion::common::{exec_err, DataFusionError};
 use libcudf_rs::{cudf_binary_op, CuDFBinaryOp, CuDFColumnViewOrScalar, CuDFScalar};
 
-pub(super) fn is_decimal_division(
+pub(crate) fn is_decimal_division(
     output_type: &DataType,
     lhs_type: &DataType,
     rhs_type: &DataType,
@@ -17,16 +17,16 @@ pub(super) fn is_decimal_division(
         && decimal_parts(rhs_type).is_some()
 }
 
-pub(super) fn decimal_div(
+pub(crate) fn decimal_div(
     lhs: CuDFColumnViewOrScalar,
     rhs: CuDFColumnViewOrScalar,
     lhs_type: &DataType,
     rhs_type: &DataType,
     output_type: &DataType,
 ) -> Result<CuDFColumnViewOrScalar, DataFusionError> {
-    let (_, lhs_scale) = decimal_parts(lhs_type).expect("checked by caller");
-    let (_, rhs_scale) = decimal_parts(rhs_type).expect("checked by caller");
-    let (_, output_scale) = decimal_parts(output_type).expect("checked by caller");
+    let (_, lhs_scale) = decimal_parts_or_err(lhs_type, "left operand")?;
+    let (_, rhs_scale) = decimal_parts_or_err(rhs_type, "right operand")?;
+    let (_, output_scale) = decimal_parts_or_err(output_type, "output")?;
 
     // DataFusion scales the stored numerator before decimal division. cuDF's
     // fixed-point Div divides the stored integers directly, so rescale first.
@@ -50,7 +50,7 @@ fn rescale_decimal(
     data_type: &DataType,
     target_scale: i8,
 ) -> Result<CuDFColumnViewOrScalar, DataFusionError> {
-    let (_, current_scale) = decimal_parts(data_type).expect("checked by caller");
+    let (_, current_scale) = decimal_parts_or_err(data_type, "operand")?;
     if target_scale == current_scale {
         return Ok(value);
     }
@@ -79,6 +79,12 @@ fn decimal_parts(data_type: &DataType) -> Option<(u8, i8)> {
         | DataType::Decimal128(precision, scale) => Some((*precision, *scale)),
         _ => None,
     }
+}
+
+fn decimal_parts_or_err(data_type: &DataType, role: &str) -> Result<(u8, i8), DataFusionError> {
+    decimal_parts(data_type).ok_or_else(|| {
+        DataFusionError::Execution(format!("Expected decimal {role}, got {data_type}"))
+    })
 }
 
 fn decimal_type_with_scale(data_type: &DataType, scale: i8) -> Result<DataType, DataFusionError> {

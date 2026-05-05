@@ -40,7 +40,11 @@ impl CuDFAggregationOp for CuDFMax {
         Ok(vec![request])
     }
 
-    fn finalize(&self, state_cols: &[CuDFColumnView]) -> Result<CuDFColumnView> {
+    fn finalize(
+        &self,
+        state_cols: &[CuDFColumnView],
+        _output_type: &arrow_schema::DataType,
+    ) -> Result<CuDFColumnView> {
         if state_cols.len() != 1 {
             return exec_err!(
                 "MAX finalize expects 1 state column, got {}",

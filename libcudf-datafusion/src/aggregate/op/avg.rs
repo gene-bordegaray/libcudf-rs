@@ -1,11 +1,16 @@
 use crate::aggregate::op::udf::CuDFAggregateUDF;
 use crate::aggregate::CuDFAggregationOp;
+use crate::decimal::decimal_div;
 use crate::errors::cudf_to_df;
-use arrow_schema::DataType;
+use arrow::array::Array;
+use arrow_schema::{
+    DataType, DECIMAL128_MAX_PRECISION, DECIMAL32_MAX_PRECISION, DECIMAL64_MAX_PRECISION,
+};
 use datafusion::common::exec_err;
 use datafusion::error::Result;
 use datafusion::functions_aggregate::average::Avg;
 use datafusion_expr::AggregateUDF;
+use datafusion_physical_plan::aggregates::AggregateMode;
 use libcudf_rs::{
     cudf_binary_op, AggregationOp, AggregationRequest, CuDFBinaryOp, CuDFColumn, CuDFColumnView,
     CuDFColumnViewOrScalar,
@@ -23,6 +28,23 @@ pub struct CuDFAvg;
 impl CuDFAggregationOp for CuDFAvg {
     fn num_state_columns(&self) -> usize {
         2 // [count, sum]
+    }
+
+    fn supports_input_types(
+        &self,
+        mode: AggregateMode,
+        input_types: &[DataType],
+        output_type: &DataType,
+    ) -> bool {
+        let expected_len = match mode {
+            AggregateMode::Final | AggregateMode::FinalPartitioned => 2,
+            _ => 1,
+        };
+        input_types.len() == expected_len
+            && !matches!(output_type, DataType::Decimal256(_, _))
+            && input_types
+                .iter()
+                .all(|dt| !matches!(dt, DataType::Decimal256(_, _)))
     }
 
     fn partial_requests(&self, args: &[CuDFColumnView]) -> Result<Vec<AggregationRequest>> {
@@ -65,12 +87,20 @@ impl CuDFAggregationOp for CuDFAvg {
         Ok(vec![count_request, sum_request])
     }
 
-    fn finalize(&self, state_cols: &[CuDFColumnView]) -> Result<CuDFColumnView> {
+    fn finalize(
+        &self,
+        state_cols: &[CuDFColumnView],
+        output_type: &DataType,
+    ) -> Result<CuDFColumnView> {
         if state_cols.len() != 2 {
             return exec_err!(
                 "AVG finalize expects 2 state columns, got {}",
                 state_cols.len()
             );
+        }
+
+        if is_decimal(output_type) {
+            return finalize_decimal_avg(&state_cols[1], &state_cols[0], output_type);
         }
 
         let result = cudf_binary_op(
@@ -88,4 +118,48 @@ impl CuDFAggregationOp for CuDFAvg {
             }
         }
     }
+}
+
+fn finalize_decimal_avg(
+    sum: &CuDFColumnView,
+    count: &CuDFColumnView,
+    output_type: &DataType,
+) -> Result<CuDFColumnView> {
+    let sum_type = sum.data_type().clone();
+    let count_type = decimal_count_type(&sum_type)?;
+    let count = libcudf_rs::cast(count, &count_type)
+        .map_err(cudf_to_df)?
+        .into_view();
+
+    let result = decimal_div(
+        CuDFColumnViewOrScalar::ColumnView(sum.clone()),
+        CuDFColumnViewOrScalar::ColumnView(count),
+        &sum_type,
+        &count_type,
+        output_type,
+    )?;
+
+    match result {
+        CuDFColumnViewOrScalar::ColumnView(view) => Ok(view),
+        CuDFColumnViewOrScalar::Scalar(_) => {
+            exec_err!("AVG decimal finalize: expected ColumnView from division, got Scalar")
+        }
+    }
+}
+
+fn decimal_count_type(sum_type: &DataType) -> Result<DataType> {
+    let data_type = match sum_type {
+        DataType::Decimal32(_, _) => DataType::Decimal32(DECIMAL32_MAX_PRECISION, 0),
+        DataType::Decimal64(_, _) => DataType::Decimal64(DECIMAL64_MAX_PRECISION, 0),
+        DataType::Decimal128(_, _) => DataType::Decimal128(DECIMAL128_MAX_PRECISION, 0),
+        _ => return exec_err!("AVG decimal finalize requires decimal sum, got {sum_type}"),
+    };
+    Ok(data_type)
+}
+
+fn is_decimal(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Decimal32(_, _) | DataType::Decimal64(_, _) | DataType::Decimal128(_, _)
+    )
 }

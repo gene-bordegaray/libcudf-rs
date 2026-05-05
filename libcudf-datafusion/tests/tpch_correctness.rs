@@ -18,7 +18,6 @@ mod tests {
     const TPCH_DATA_PARTS: i32 = 16;
 
     #[tokio::test]
-    #[ignore = "cuDF aggregate path currently panics converting decimal aggregate state back through Arrow"]
     async fn test_tpch_1() -> Result<(), Box<dyn Error>> {
         test_tpch_query("q1").await
     }
@@ -29,7 +28,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "cuDF aggregate path currently panics converting decimal aggregate state back through Arrow"]
     async fn test_tpch_3() -> Result<(), Box<dyn Error>> {
         test_tpch_query("q3").await
     }
@@ -40,7 +38,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "cuDF aggregate path currently panics converting decimal aggregate state back through Arrow"]
     async fn test_tpch_5() -> Result<(), Box<dyn Error>> {
         test_tpch_query("q5").await
     }
@@ -66,7 +63,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "cuDF aggregate path currently panics converting decimal aggregate state back through Arrow"]
     async fn test_tpch_10() -> Result<(), Box<dyn Error>> {
         test_tpch_query("q10").await
     }
@@ -92,7 +88,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "cuDF aggregate path currently panics converting decimal aggregate state back through Arrow"]
     async fn test_tpch_15() -> Result<(), Box<dyn Error>> {
         test_tpch_query("q15").await
     }
@@ -103,7 +98,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "cuDF aggregate path currently reaches an unsupported cuDF decimal binary op"]
     async fn test_tpch_17() -> Result<(), Box<dyn Error>> {
         test_tpch_query("q17").await
     }
