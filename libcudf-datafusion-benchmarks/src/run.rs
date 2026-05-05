@@ -26,6 +26,7 @@ use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::{collect, displayable};
 use datafusion::prelude::*;
 use libcudf_datafusion::aggregate::{avg, count, max, min, sum};
+use libcudf_datafusion::configure_default_pools;
 use libcudf_datafusion::{CuDFConfig, SessionStateBuilderExt};
 use libcudf_datafusion_benchmarks::datasets::{clickbench, register_tables, tpcds, tpch};
 use std::fs;
@@ -152,6 +153,10 @@ impl RunOpt {
     }
 
     async fn benchmark(&self) -> Result<BenchmarkRun> {
+        if self.gpu {
+            configure_default_pools();
+        }
+
         let mut state_builder = SessionStateBuilder::new()
             .with_default_features()
             .with_config(self.config()?);
