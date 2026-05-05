@@ -61,7 +61,7 @@ impl CuDFScalar {
     /// let scalar = Scalar::new(&array);
     /// let cudf_scalar = CuDFScalar::from_arrow_host(scalar)?;
     ///
-    /// // Convert back to Arrow (GPU → CPU)
+    /// // Convert back to Arrow (GPU -> CPU)
     /// let arrow_array = cudf_scalar.to_arrow_host()?;
     ///
     /// // Verify the result

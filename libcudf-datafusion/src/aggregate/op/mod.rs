@@ -33,7 +33,7 @@ pub trait CuDFAggregationOp: Debug + Send + Sync {
     /// DataFusion UDF's `state_fields()` contract when emitting `Partial` mode output.
     ///
     /// Override when the cuDF operation used in `partial_requests` returns a narrower
-    /// type than the one used in `merge_requests` (e.g. COUNT → Int32, SUM → Int64).
+    /// type than the one used in `merge_requests` (e.g. COUNT -> Int32, SUM -> Int64).
     /// Default is a no-op.
     fn normalize_partial_state(&self, cols: Vec<CuDFColumn>) -> Result<Vec<CuDFColumn>> {
         Ok(cols)

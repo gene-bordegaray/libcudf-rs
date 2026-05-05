@@ -45,9 +45,9 @@ pub(crate) fn arrow_type_to_cudf_data_type(
 ) -> Option<UniquePtr<ffi::DataType>> {
     match arrow_type {
         // For decimals, negate the scale because Arrow and CuDF use opposite sign conventions:
-        // - Arrow: scale=2 means 2 decimal places (e.g., 123 with scale=2 → 1.23)
-        // - CuDF: scale=-2 means value * 10^(-2) (e.g., 123 with scale=-2 → 1.23)
-        // Therefore when converting Arrow→CuDF: arrow_scale=2 → cudf_scale=-2
+        // - Arrow: scale=2 means 2 decimal places (e.g., 123 with scale=2 -> 1.23)
+        // - CuDF: scale=-2 means value * 10^(-2) (e.g., 123 with scale=-2 -> 1.23)
+        // Therefore when converting Arrow -> CuDF: arrow_scale=2 -> cudf_scale=-2
         DataType::Decimal32(_, scale) => {
             Some(ffi::new_data_type_with_scale(TYPE_DECIMAL32, -scale as i32))
         }
@@ -142,11 +142,11 @@ pub(crate) fn cudf_type_to_arrow(typ: &UniquePtr<ffi::DataType>) -> Option<DataT
         // See https://github.com/rapidsai/cudf/blob/main/cpp/include/cudf/types.hpp#L267-275
         //
         // Scale sign must be negated because CuDF and Arrow use opposite conventions:
-        // - CuDF: scale=-2 means value * 10^(-2), so 123 with scale=-2 → 1.23
+        // - CuDF: scale=-2 means value * 10^(-2), so 123 with scale=-2 -> 1.23
         //   See https://github.com/rapidsai/cudf/blob/main/cpp/include/cudf/fixed_point/fixed_point.hpp#L578-590
-        // - Arrow: scale=2 means 2 decimal places, so 123 with scale=2 → 1.23
+        // - Arrow: scale=2 means 2 decimal places, so 123 with scale=2 -> 1.23
         //   See https://docs.rs/arrow/latest/arrow/datatypes/enum.DataType.html (Decimal256 docs)
-        // Therefore: cudf_scale=-2 → arrow_scale=2
+        // Therefore: cudf_scale=-2 -> arrow_scale=2
         TYPE_DECIMAL32 => Some(DataType::Decimal32(9, -typ.scale() as i8)),
         TYPE_DECIMAL64 => Some(DataType::Decimal64(18, -typ.scale() as i8)),
         TYPE_DECIMAL128 => Some(DataType::Decimal128(38, -typ.scale() as i8)),
