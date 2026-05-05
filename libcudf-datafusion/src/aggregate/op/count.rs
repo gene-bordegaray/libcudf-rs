@@ -52,7 +52,11 @@ impl CuDFAggregationOp for CuDFCount {
         Ok(vec![casted])
     }
 
-    fn finalize(&self, state_cols: &[CuDFColumnView]) -> Result<CuDFColumnView> {
+    fn finalize(
+        &self,
+        state_cols: &[CuDFColumnView],
+        _output_type: &DataType,
+    ) -> Result<CuDFColumnView> {
         if state_cols.len() != 1 {
             return exec_err!(
                 "COUNT finalize expects 1 state column, got {}",

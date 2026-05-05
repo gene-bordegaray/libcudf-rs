@@ -4,6 +4,7 @@
 //! on the GPU using NVIDIA's cuDF library through DataFusion.
 
 pub mod aggregate;
+mod decimal;
 mod errors;
 mod expr;
 mod physical;

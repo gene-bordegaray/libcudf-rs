@@ -1,5 +1,5 @@
+use crate::decimal::{decimal_div, is_decimal_division};
 use crate::errors::cudf_to_df;
-use crate::expr::decimal::{decimal_div, is_decimal_division};
 use crate::expr::{columnar_value_to_cudf, cudf_to_columnar_value, expr_to_cudf_expr};
 use arrow::array::RecordBatch;
 use arrow_schema::{DataType, FieldRef, Schema};

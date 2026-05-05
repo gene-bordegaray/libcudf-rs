@@ -1,16 +1,12 @@
-use crate::aggregate::op::udf::CuDFAggregateUDF;
-use crate::aggregate::CuDFAggregationOp;
+use crate::aggregate::PreparedCuDFAggregate;
 use crate::errors::cudf_to_df;
 use arrow::array::{Array, ArrayRef, RecordBatch};
 use arrow_schema::SchemaRef;
 use datafusion::common::{exec_err, internal_err};
 use datafusion::error::Result;
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream};
-use datafusion::physical_expr::PhysicalExpr;
-use datafusion_physical_plan::aggregates::{
-    aggregate_expressions, evaluate_group_by, evaluate_many, AggregateMode, PhysicalGroupBy,
-};
-use datafusion_physical_plan::udaf::AggregateFunctionExpr;
+use datafusion_physical_plan::aggregates::{evaluate_group_by, evaluate_many, AggregateMode};
+use datafusion_physical_plan::PhysicalExpr;
 use futures::{ready, StreamExt};
 use libcudf_rs::{
     record_batch_with_schema, CuDFColumn, CuDFColumnView, CuDFGroupBy, CuDFTable, CuDFTableView,
@@ -60,14 +56,9 @@ struct RunningState {
 pub struct Stream {
     input: SendableRecordBatchStream,
     output_schema: SchemaRef,
-    mode: AggregateMode,
-    group_by: PhysicalGroupBy,
-    /// DataFusion expressions -> used for schema metadata (e.g., `state_fields()`).
-    aggregate_expr: Vec<Arc<AggregateFunctionExpr>>,
-    /// Physical expressions that extract each op's argument columns from a batch.
+    prepared: PreparedCuDFAggregate,
+    /// cuDF expressions that extract each op's argument columns from a batch.
     aggregate_args: Vec<Vec<Arc<dyn PhysicalExpr>>>,
-    /// GPU aggregation implementations (one per aggregate function).
-    aggregate_ops: Vec<Arc<dyn CuDFAggregationOp>>,
     column_mapping: ColumnMapping,
     state: StreamState,
     /// Batches accumulated since the last flush, cleared on each flush.
@@ -80,34 +71,21 @@ impl Stream {
     pub fn new(
         input: SendableRecordBatchStream,
         output_schema: SchemaRef,
-        mode: AggregateMode,
-        group_by: PhysicalGroupBy,
-        aggregate_expr: Vec<Arc<AggregateFunctionExpr>>,
+        prepared: PreparedCuDFAggregate,
     ) -> Result<Self> {
-        let aggregate_args = aggregate_expressions(&aggregate_expr, &mode, group_by.expr().len())?;
-
-        // Extract the GPU op from each CuDFAggregateUDF wrapper.
-        // Safe to unwrap: the planner only creates CuDFAggregateExec when all
-        // aggregate functions are backed by CuDFAggregateUDF.
-        let aggregate_ops = aggregate_expr
+        let aggregate_args = prepared
+            .aggs
             .iter()
-            .map(|expr| {
-                expr.fun()
-                    .inner()
-                    .as_any()
-                    .downcast_ref::<CuDFAggregateUDF>()
-                    .expect("aggregate expr should be CuDFAggregateUDF")
-                    .gpu()
-                    .clone()
-            })
+            .map(|agg| agg.args.clone())
             .collect::<Vec<_>>();
 
         let column_mapping = {
             let mut offset = 0;
-            let ranges = aggregate_ops
+            let ranges = prepared
+                .aggs
                 .iter()
-                .map(|op| {
-                    let count = op.num_state_columns();
+                .map(|agg| {
+                    let count = agg.op.num_state_columns();
                     let start = offset;
                     offset += count;
                     (start, count)
@@ -119,11 +97,8 @@ impl Stream {
         Ok(Self {
             input,
             output_schema,
-            mode,
-            group_by,
-            aggregate_expr,
+            prepared,
             aggregate_args,
-            aggregate_ops,
             column_mapping,
             state: StreamState::ReadingInput,
             pending_batches: Vec::new(),
@@ -152,7 +127,7 @@ impl Stream {
 
         // Normalize partial state column types so they are compatible with merge_requests.
         if !matches!(
-            self.mode,
+            self.prepared.mode,
             AggregateMode::Final | AggregateMode::FinalPartitioned
         ) {
             chunk_state_columns = self.normalize_partial_state(chunk_state_columns)?;
@@ -165,10 +140,14 @@ impl Stream {
     fn normalize_partial_state(&self, cols: Vec<CuDFColumn>) -> Result<Vec<CuDFColumn>> {
         let mut result = Vec::with_capacity(cols.len());
         let mut col_iter = cols.into_iter();
-        for op_idx in 0..self.aggregate_ops.len() {
+        for op_idx in 0..self.prepared.aggs.len() {
             let (_, count) = self.column_mapping.ranges[op_idx];
             let op_cols: Vec<CuDFColumn> = col_iter.by_ref().take(count).collect();
-            result.extend(self.aggregate_ops[op_idx].normalize_partial_state(op_cols)?);
+            result.extend(
+                self.prepared.aggs[op_idx]
+                    .op
+                    .normalize_partial_state(op_cols)?,
+            );
         }
         Ok(result)
     }
@@ -184,15 +163,15 @@ impl Stream {
         let mut requests = Vec::new();
 
         let use_merge = matches!(
-            self.mode,
+            self.prepared.mode,
             AggregateMode::Final | AggregateMode::FinalPartitioned
         );
 
-        for (op, args) in self.aggregate_ops.iter().zip(evaluated_args) {
+        for (agg, args) in self.prepared.aggs.iter().zip(evaluated_args) {
             let op_requests = if use_merge {
-                op.merge_requests(&args)?
+                agg.op.merge_requests(&args)?
             } else {
-                op.partial_requests(&args)?
+                agg.op.partial_requests(&args)?
             };
             requests.extend(op_requests);
         }
@@ -241,10 +220,10 @@ impl Stream {
 
         // Build merge requests
         let mut requests = Vec::new();
-        for (op_idx, op) in self.aggregate_ops.iter().enumerate() {
+        for (op_idx, agg) in self.prepared.aggs.iter().enumerate() {
             let (start, count) = self.column_mapping.ranges[op_idx];
             let state_views: Vec<CuDFColumnView> = combined_views[start..start + count].to_vec();
-            requests.extend(op.merge_requests(&state_views)?);
+            requests.extend(agg.op.merge_requests(&state_views)?);
         }
 
         // Re-aggregate
@@ -269,7 +248,7 @@ impl Stream {
         let num_rows = running.keys.num_rows();
         let key_columns = running.keys.into_columns();
         let mut arrays: Vec<ArrayRef> =
-            Vec::with_capacity(key_columns.len() + self.aggregate_expr.len());
+            Vec::with_capacity(key_columns.len() + self.prepared.aggs.len());
 
         for col in key_columns {
             arrays.push(Arc::new(col.into_view()));
@@ -281,15 +260,15 @@ impl Stream {
             .map(|c| c.into_view())
             .collect();
 
-        let is_partial = matches!(self.mode, AggregateMode::Partial);
+        let is_partial = matches!(self.prepared.mode, AggregateMode::Partial);
 
-        for (op_idx, op) in self.aggregate_ops.iter().enumerate() {
+        for (op_idx, agg) in self.prepared.aggs.iter().enumerate() {
             let (start, count) = self.column_mapping.ranges[op_idx];
             let state_views: Vec<CuDFColumnView> = state_views[start..start + count].to_vec();
 
             if is_partial {
                 // Partial mode: emit raw state columns, cast to match state_fields schema
-                let state_fields = self.aggregate_expr[op_idx].state_fields()?;
+                let state_fields = agg.expr.state_fields()?;
                 for (col_idx, view) in state_views.into_iter().enumerate() {
                     let target_type = state_fields[col_idx].data_type();
                     if view.data_type() != target_type {
@@ -301,7 +280,7 @@ impl Stream {
                 }
             } else {
                 // Single/Final/FinalPartitioned/SinglePartitioned: finalize
-                let finalized = op.finalize(&state_views)?;
+                let finalized = agg.op.finalize(&state_views, &agg.output_type)?;
                 arrays.push(Arc::new(finalized));
             }
         }
@@ -316,7 +295,7 @@ impl Stream {
     /// Evaluate GROUP BY expressions on a batch and wrap the resulting key
     /// columns into a [`CuDFGroupBy`] for GPU aggregation.
     fn evaluate_batch_groups(&self, batch: &RecordBatch) -> Result<CuDFGroupBy> {
-        let grouping_sets = evaluate_group_by(&self.group_by, batch)?;
+        let grouping_sets = evaluate_group_by(&self.prepared.group_by, batch)?;
 
         if grouping_sets.len() != 1 {
             return exec_err!("Expected single grouping set, got {}", grouping_sets.len());
