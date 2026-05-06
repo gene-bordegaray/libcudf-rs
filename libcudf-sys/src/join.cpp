@@ -226,32 +226,22 @@ std::unique_ptr<Table> hash_join_unmatched_build_gather(
                                 cudf::out_of_bounds_policy::NULLIFY);
 }
 
-std::unique_ptr<Table> left_semi_join_gather(
-    const TableView& left_keys, const TableView& right_keys,
-    const TableView& left_payload)
+std::unique_ptr<Column> left_semi_join_indices(
+    const TableView& left_keys,
+    const TableView& right_keys)
 {
     cudf::filtered_join fj(*right_keys.inner, cudf::null_equality::EQUAL,
                            cudf::set_as_build_table::RIGHT, cudf::get_default_stream());
-    auto idx = fj.semi_join(*left_keys.inner);
-    auto idx_col = uvector_to_column(std::move(idx));
-    auto result = std::make_unique<Table>();
-    result->inner = cudf::gather(*left_payload.inner, idx_col->view(),
-                                 cudf::out_of_bounds_policy::DONT_CHECK);
-    return result;
+    return uvector_to_bridge_column(fj.semi_join(*left_keys.inner));
 }
 
-std::unique_ptr<Table> left_anti_join_gather(
-    const TableView& left_keys, const TableView& right_keys,
-    const TableView& left_payload)
+std::unique_ptr<Column> left_anti_join_indices(
+    const TableView& left_keys,
+    const TableView& right_keys)
 {
     cudf::filtered_join fj(*right_keys.inner, cudf::null_equality::EQUAL,
                            cudf::set_as_build_table::RIGHT, cudf::get_default_stream());
-    auto idx = fj.anti_join(*left_keys.inner);
-    auto idx_col = uvector_to_column(std::move(idx));
-    auto result = std::make_unique<Table>();
-    result->inner = cudf::gather(*left_payload.inner, idx_col->view(),
-                                 cudf::out_of_bounds_policy::DONT_CHECK);
-    return result;
+    return uvector_to_bridge_column(fj.anti_join(*left_keys.inner));
 }
 
 std::unique_ptr<Table> cross_join(const TableView& left, const TableView& right) {

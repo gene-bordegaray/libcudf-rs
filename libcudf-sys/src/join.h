@@ -70,13 +70,13 @@ namespace libcudf_bridge {
         const TableView& left_keys,
         const TableView& right_keys);
 
-    std::unique_ptr<Table> left_semi_join_gather(
-        const TableView& left_keys, const TableView& right_keys,
-        const TableView& left_payload);
+    std::unique_ptr<Column> left_semi_join_indices(
+        const TableView& left_keys,
+        const TableView& right_keys);
 
-    std::unique_ptr<Table> left_anti_join_gather(
-        const TableView& left_keys, const TableView& right_keys,
-        const TableView& left_payload);
+    std::unique_ptr<Column> left_anti_join_indices(
+        const TableView& left_keys,
+        const TableView& right_keys);
 
     std::unique_ptr<Table> cross_join(const TableView& left, const TableView& right);
 } // namespace libcudf_bridge

@@ -285,10 +285,13 @@ pub fn left_semi_join(
     left_on: &[usize],
     right_on: &[usize],
 ) -> Result<CuDFTable, CuDFError> {
-    Ok(CuDFTable::from_inner(ffi::left_semi_join_gather(
-        &select_cols(left, left_on),
-        &select_cols(right, right_on),
+    let left_keys = select_cols(left, left_on);
+    let right_keys = select_cols(right, right_on);
+    let indices = ffi::left_semi_join_indices(&left_keys, &right_keys)?;
+    let indices_view = indices.view();
+    Ok(CuDFTable::from_inner(ffi::gather(
         left.inner(),
+        &indices_view,
     )?))
 }
 
@@ -301,10 +304,13 @@ pub fn left_anti_join(
     left_on: &[usize],
     right_on: &[usize],
 ) -> Result<CuDFTable, CuDFError> {
-    Ok(CuDFTable::from_inner(ffi::left_anti_join_gather(
-        &select_cols(left, left_on),
-        &select_cols(right, right_on),
+    let left_keys = select_cols(left, left_on);
+    let right_keys = select_cols(right, right_on);
+    let indices = ffi::left_anti_join_indices(&left_keys, &right_keys)?;
+    let indices_view = indices.view();
+    Ok(CuDFTable::from_inner(ffi::gather(
         left.inner(),
+        &indices_view,
     )?))
 }
 
@@ -339,6 +345,15 @@ mod tests {
         )
         .unwrap();
         CuDFTable::from_arrow_host(batch).unwrap()
+    }
+
+    fn int32_values(batch: &RecordBatch, column: usize) -> Vec<i32> {
+        let values = batch
+            .column(column)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        (0..values.len()).map(|i| values.value(i)).collect()
     }
 
     #[test]
@@ -575,6 +590,11 @@ mod tests {
         let result = left_semi_join(&left.into_view(), &right.into_view(), &[0], &[0])?;
         assert_eq!(result.num_rows(), 2); // keys 2 and 3 match
         assert_eq!(result.num_columns(), 2); // only left columns
+
+        let batch = result.into_view().to_arrow_host()?;
+        let mut keys = int32_values(&batch, 0);
+        keys.sort();
+        assert_eq!(keys, vec![2, 3]);
         Ok(())
     }
 
@@ -586,6 +606,11 @@ mod tests {
         let result = left_anti_join(&left.into_view(), &right.into_view(), &[0], &[0])?;
         assert_eq!(result.num_rows(), 2); // keys 1 and 4 have no match
         assert_eq!(result.num_columns(), 2); // only left columns
+
+        let batch = result.into_view().to_arrow_host()?;
+        let mut keys = int32_values(&batch, 0);
+        keys.sort();
+        assert_eq!(keys, vec![1, 4]);
         Ok(())
     }
 

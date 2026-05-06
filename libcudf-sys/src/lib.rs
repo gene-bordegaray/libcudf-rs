@@ -526,19 +526,17 @@ pub mod ffi {
             right_keys: &TableView,
         ) -> Result<UniquePtr<JoinIndices>>;
 
-        /// Left semi join: gather only matching left rows (no right columns in output).
-        fn left_semi_join_gather(
+        /// Left semi join: return row indices for matching left rows.
+        fn left_semi_join_indices(
             left_keys: &TableView,
             right_keys: &TableView,
-            left_payload: &TableView,
-        ) -> Result<UniquePtr<Table>>;
+        ) -> Result<UniquePtr<Column>>;
 
-        /// Left anti join: gather only non-matching left rows (no right columns in output).
-        fn left_anti_join_gather(
+        /// Left anti join: return row indices for non-matching left rows.
+        fn left_anti_join_indices(
             left_keys: &TableView,
             right_keys: &TableView,
-            left_payload: &TableView,
-        ) -> Result<UniquePtr<Table>>;
+        ) -> Result<UniquePtr<Column>>;
 
         /// Cross join: returns a full Cartesian product table
         fn cross_join(left: &TableView, right: &TableView) -> Result<UniquePtr<Table>>;
