@@ -5,6 +5,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
+use serde::Deserialize;
+
 macro_rules! join_thread {
     ($handle:expr) => {
         $handle
@@ -18,12 +20,26 @@ const ARCH: &str = "x86_64";
 #[cfg(target_arch = "aarch64")]
 const ARCH: &str = "aarch64";
 
-const CUDF_VERSION: &str = "25.10.00";
-const LIBCUDF_WHEEL: &str = "25.10.0";
-const LIBRMM_WHEEL: &str = "25.10.0";
-const LIBKVIKIO_WHEEL: &str = "25.10.0";
-const RAPIDS_LOGGER_WHEEL: &str = "0.1.19";
+const CUDF_VERSION: &str = "26.02.01";
+const LIBCUDF_WHEEL: &str = "26.2.1";
+const LIBRMM_WHEEL: &str = "26.2.0";
+const LIBKVIKIO_WHEEL: &str = "26.2.0";
+const RAPIDS_LOGGER_WHEEL: &str = "0.2.0";
+const LIBNVCOMP_WHEEL: &str = "5.1.0.21";
 const NANOARROW_COMMIT: &str = "4bf5a9322626e95e3717e43de7616c0a256179eb";
+
+#[derive(Deserialize)]
+struct PypiRelease {
+    urls: Vec<PypiFile>,
+}
+
+#[derive(Deserialize)]
+struct PypiFile {
+    filename: String,
+    packagetype: String,
+    url: String,
+    yanked: bool,
+}
 
 static OUT_DIR: LazyLock<PathBuf> = LazyLock::new(out_dir_lookup);
 static CUDA_ROOT: LazyLock<PathBuf> = LazyLock::new(cuda_root_lookup);
@@ -84,48 +100,66 @@ fn main() {
 fn download_pypi_wheels() {
     // Download main libcudf wheel
     let libcudf_wheel = std::thread::spawn(move || {
-        download_wheel(
-            "libcudf",
-            &format!("https://pypi.nvidia.com/libcudf-cu12/libcudf_cu12-{LIBCUDF_WHEEL}-py3-none-manylinux_2_28_{ARCH}.whl"),
-        )
+        download_wheel_from_pypi("libcudf", "libcudf-cu12", LIBCUDF_WHEEL)
     });
 
     // Download dependencies
-    let librmm_wheel = std::thread::spawn(move || {
-        download_wheel(
-            "librmm",
-            &format!("https://pypi.nvidia.com/librmm-cu12/librmm_cu12-{LIBRMM_WHEEL}-py3-none-manylinux_2_24_{ARCH}.manylinux_2_28_{ARCH}.whl"),
-        )
-    });
+    let librmm_wheel =
+        std::thread::spawn(move || download_wheel_from_pypi("librmm", "librmm-cu12", LIBRMM_WHEEL));
     let libkvikio_wheel = std::thread::spawn(move || {
-        download_wheel(
-            "libkvikio",
-            &format!("https://pypi.nvidia.com/libkvikio-cu12/libkvikio_cu12-{LIBKVIKIO_WHEEL}-py3-none-manylinux_2_28_{ARCH}.whl"),
-        )
+        download_wheel_from_pypi("libkvikio", "libkvikio-cu12", LIBKVIKIO_WHEEL)
     });
     let rapids_logger_wheel = std::thread::spawn(move || {
-        // PyPI uses content-addressed storage, so each architecture has a different hash-based URL path.
-        // To find the correct URL for a new version, visit: https://pypi.org/project/rapids-logger/#files
-        if ARCH == "aarch64" {
-            download_wheel(
-                "rapids_logger",
-                &format!("https://files.pythonhosted.org/packages/0e/b9/5b4158deb206019427867e1ee1729fda85268bdecd9ec116cc611ee75345/rapids_logger-{RAPIDS_LOGGER_WHEEL}-py3-none-manylinux_2_26_{ARCH}.manylinux_2_28_{ARCH}.whl"),
-            )
-        } else {
-            download_wheel(
-                "rapids_logger",
-                &format!("https://files.pythonhosted.org/packages/bf/0e/093fe9791b6b11f7d6d36b604d285b0018512cbdb6b1ce67a128795b7543/rapids_logger-{RAPIDS_LOGGER_WHEEL}-py3-none-manylinux_2_27_{ARCH}.manylinux_2_28_{ARCH}.whl"),
-            )
-        }
+        download_wheel_from_pypi("rapids_logger", "rapids-logger", RAPIDS_LOGGER_WHEEL)
+    });
+    let libnvcomp_wheel = std::thread::spawn(move || {
+        download_wheel_from_pypi("nvidia_libnvcomp", "nvidia-libnvcomp-cu12", LIBNVCOMP_WHEEL)
     });
 
     join_thread!(libcudf_wheel);
     join_thread!(librmm_wheel);
     join_thread!(libkvikio_wheel);
     join_thread!(rapids_logger_wheel);
+    join_thread!(libnvcomp_wheel);
 }
 
-fn download_wheel(lib_name: &str, wheel_url: &str) {
+fn download_wheel_from_pypi(lib_name: &str, package_name: &str, version: &str) {
+    let marker = OUT_DIR.join(format!(".{package_name}-{version}.installed"));
+    if marker.exists() {
+        copy_wheel_shared_libraries(lib_name);
+        return;
+    }
+
+    let wheel_url = pypi_wheel_url(package_name, version);
+    download_wheel(lib_name, package_name, version, &wheel_url);
+    fs::write(&marker, wheel_url).expect(&format!("Failed to write marker for {package_name}"));
+}
+
+fn pypi_wheel_url(package_name: &str, version: &str) -> String {
+    let metadata_url = format!("https://pypi.org/pypi/{package_name}/{version}/json");
+    let body = reqwest::blocking::get(&metadata_url)
+        .expect(&format!("Failed to fetch PyPI metadata for {package_name}"))
+        .text()
+        .expect(&format!("Failed to read PyPI metadata for {package_name}"));
+    let release: PypiRelease = serde_json::from_str(&body)
+        .expect(&format!("Failed to parse PyPI metadata for {package_name}"));
+
+    release
+        .urls
+        .into_iter()
+        .find(|file| {
+            file.packagetype == "bdist_wheel"
+                && !file.yanked
+                && file.filename.ends_with(".whl")
+                && (file.filename.contains(ARCH) || file.filename.contains("any.whl"))
+        })
+        .map(|file| file.url)
+        .expect(&format!(
+            "No {ARCH} wheel found for {package_name} {version}"
+        ))
+}
+
+fn download_wheel(lib_name: &str, package_name: &str, version: &str, wheel_url: &str) {
     // Some wheels ship the shared library as `<name>.so` (e.g. `libcudf.so`,
     // because the wheel's `name` already starts with `lib`), others ship as
     // `lib<name>.so` (e.g. `librapids_logger.so` for the `rapids_logger`
@@ -134,12 +168,12 @@ fn download_wheel(lib_name: &str, wheel_url: &str) {
     if lib_dir.join(format!("{lib_name}.so")).exists()
         || lib_dir.join(format!("lib{lib_name}.so")).exists()
     {
-        copy_so_files_to_lib_dir(&lib_dir, &OUT_DIR);
+        copy_wheel_shared_libraries(lib_name);
         return;
     }
     let wheel_file = wheel_url.split('/').next_back().unwrap();
 
-    println!("cargo:warning=Downloading prebuilt {lib_name}...");
+    println!("cargo:warning=Downloading prebuilt {package_name} {version}...");
 
     let wheel_path = OUT_DIR.join(wheel_file);
 
@@ -180,8 +214,9 @@ fn download_wheel(lib_name: &str, wheel_url: &str) {
 
     let _ = fs::remove_file(&wheel_path);
 
-    // Copy all .so files to lib_dir
-    copy_so_files_to_lib_dir(&OUT_DIR.join(lib_name).join("lib64"), &OUT_DIR);
+    // Copy all .so files into OUT_DIR so link and test runtime lookup can find
+    // transitive dependencies regardless of each wheel's internal layout.
+    copy_wheel_shared_libraries(lib_name);
 }
 
 fn download_cudf_headers() -> PathBuf {
@@ -292,18 +327,32 @@ fn setup_rerun_triggers(manifest_dir: &Path) {
 
 // Helper functions
 
-fn copy_so_files_to_lib_dir(src_lib_dir: &Path, dest_dir: &Path) {
-    if !src_lib_dir.exists() {
+fn copy_wheel_shared_libraries(lib_name: &str) {
+    copy_so_files_to_lib_dir_recursive(&OUT_DIR.join(lib_name), &OUT_DIR);
+    copy_so_files_to_lib_dir_recursive(&OUT_DIR.join("nvidia"), &OUT_DIR);
+}
+
+fn copy_so_files_to_lib_dir_recursive(src_dir: &Path, dest_dir: &Path) {
+    if !src_dir.exists() {
         return;
     }
 
-    if let Ok(entries) = fs::read_dir(src_lib_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Some(filename) = path.file_name() {
-                let filename_str = filename.to_string_lossy();
-                if filename_str.ends_with(".so") || filename_str.contains(".so.") {
-                    let dest = dest_dir.join(filename);
+    let Ok(entries) = fs::read_dir(src_dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            copy_so_files_to_lib_dir_recursive(&path, dest_dir);
+            continue;
+        }
+
+        if let Some(filename) = path.file_name() {
+            let filename_str = filename.to_string_lossy();
+            if filename_str.ends_with(".so") || filename_str.contains(".so.") {
+                let dest = dest_dir.join(filename);
+                if path != dest {
                     let _ = fs::copy(&path, &dest);
                 }
             }

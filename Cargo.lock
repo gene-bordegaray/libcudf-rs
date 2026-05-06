@@ -3431,6 +3431,8 @@ dependencies = [
  "insta",
  "num_cpus",
  "reqwest",
+ "serde",
+ "serde_json",
  "tar",
  "which",
  "zip",

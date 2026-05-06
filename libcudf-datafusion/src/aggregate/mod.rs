@@ -358,6 +358,7 @@ mod test {
     use crate::aggregate::CuDFAggregateExec;
     use crate::assert_snapshot;
     use crate::physical::{CuDFLoadExec, CuDFUnloadExec};
+    use crate::test_utils::sort_batches;
     use crate::CuDFConfig;
     use arrow::array::{record_batch, Array, Int64Array, StringArray, StringViewArray};
     use arrow::record_batch::RecordBatch;
@@ -392,7 +393,8 @@ mod test {
         )
         .await?;
 
-        let output = pretty_format_batches(&batches)?.to_string();
+        let sorted = sort_batches(&batches);
+        let output = pretty_format_batches(&sorted)?.to_string();
         Ok(output)
     }
 
@@ -450,8 +452,8 @@ mod test {
         +-------+--------+
         | c     | SUM(a) |
         +-------+--------+
-        | world | 9      |
         | hello | 15     |
+        | world | 9      |
         +-------+--------+
         ");
 
@@ -486,8 +488,8 @@ mod test {
         +-------+--------+
         | c     | MIN(a) |
         +-------+--------+
-        | world | 3      |
         | hello | 1      |
+        | world | 3      |
         +-------+--------+
         ");
 
@@ -502,8 +504,8 @@ mod test {
         +-------+--------+
         | c     | MAX(a) |
         +-------+--------+
-        | world | 3      |
         | hello | 4      |
+        | world | 3      |
         +-------+--------+
         ");
 
@@ -518,8 +520,8 @@ mod test {
         +-------+----------+
         | c     | COUNT(a) |
         +-------+----------+
-        | world | 3        |
         | hello | 6        |
+        | world | 3        |
         +-------+----------+
         ");
 
@@ -536,8 +538,8 @@ mod test {
         +-------+----------+
         | c     | COUNT(*) |
         +-------+----------+
-        | world | 3        |
         | hello | 6        |
+        | world | 3        |
         +-------+----------+
         ");
 
@@ -552,8 +554,8 @@ mod test {
         +-------+--------+
         | c     | AVG(a) |
         +-------+--------+
-        | world | 3.0    |
         | hello | 2.5    |
+        | world | 3.0    |
         +-------+--------+
         ");
 
