@@ -89,13 +89,12 @@ impl ExecutionPlan for CuDFLoadExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> datafusion::common::Result<SendableRecordBatchStream> {
-        // CoalescePartitionsExec produces a single partition
         let pinned_input = context
             .session_config()
             .options()
             .extensions
             .get::<CuDFConfig>()
-            .map_or(true, |cfg| cfg.pinned_input);
+            .is_none_or(|cfg| cfg.pinned_input);
 
         assert_eq_or_internal_err!(partition, 0, "CuDFLoadExec invalid partition {partition}");
 

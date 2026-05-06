@@ -266,11 +266,7 @@ impl CuDFAggregateStream {
 
         // Concat each state column pair
         let mut combined_state_columns = Vec::with_capacity(running.state_columns.len());
-        for (run_col, new_col) in running
-            .state_columns
-            .into_iter()
-            .zip(new_state_columns.into_iter())
-        {
+        for (run_col, new_col) in running.state_columns.into_iter().zip(new_state_columns) {
             let combined = CuDFColumn::concat(vec![run_col.into_view(), new_col.into_view()])
                 .map_err(cudf_to_df)?;
             combined_state_columns.push(combined);
