@@ -98,6 +98,15 @@ pub mod ffi {
         /// Take the right input indices from this join result.
         fn release_right(self: Pin<&mut JoinIndices>) -> UniquePtr<Column>;
 
+        /// Pair of reusable hash-join probe/build index maps.
+        type HashJoinIndices;
+
+        /// Take the probe-side indices from this reusable hash join result.
+        fn release_probe(self: Pin<&mut HashJoinIndices>) -> UniquePtr<Column>;
+
+        /// Take the build-side indices from this reusable hash join result.
+        fn release_build(self: Pin<&mut HashJoinIndices>) -> UniquePtr<Column>;
+
         /// Opaque owning wrapper for an RMM CUDA stream.
         type CudaStream;
 
@@ -319,6 +328,9 @@ pub mod ffi {
         /// Create a table from vertically concatenating ColumnView together
         fn concat_column_views(views: &[UniquePtr<ColumnView>]) -> Result<UniquePtr<Column>>;
 
+        /// Fill a column with a sequence starting at `init` and stepping by `step`.
+        fn sequence(size: usize, init: &Scalar, step: &Scalar) -> Result<UniquePtr<Column>>;
+
         /// Create a TableView from a set of ColumnView pointers (non-owning)
         fn create_table_view_from_column_views(
             column_views: &[*const ColumnView],
@@ -477,36 +489,17 @@ pub mod ffi {
             nulls_equal: bool,
         ) -> Result<UniquePtr<HashJoin>>;
 
-        /// Probe a reusable hash join object and gather matching payload rows.
-        fn hash_join_inner_join_gather(
+        /// Probe a reusable hash join object and return probe/build row indices.
+        fn hash_join_inner_join_indices(
             join: &HashJoin,
             probe_keys: &TableView,
-            build_payload: &TableView,
-            probe_payload: &TableView,
-        ) -> Result<UniquePtr<Table>>;
+        ) -> Result<UniquePtr<HashJoinIndices>>;
 
-        /// Probe a reusable hash join object, record matched build rows, and gather inner rows.
-        fn hash_join_inner_join_gather_and_mark(
-            join: Pin<&mut HashJoin>,
-            probe_keys: &TableView,
-            build_payload: &TableView,
-            probe_payload: &TableView,
-        ) -> Result<UniquePtr<Table>>;
-
-        /// Probe a reusable hash join object preserving probe rows, recording matched build rows.
-        fn hash_join_probe_left_join_gather_and_mark(
-            join: Pin<&mut HashJoin>,
-            probe_keys: &TableView,
-            build_payload: &TableView,
-            probe_payload: &TableView,
-        ) -> Result<UniquePtr<Table>>;
-
-        /// Gather build rows that did not match any previous marked probe.
-        fn hash_join_unmatched_build_gather(
+        /// Probe a reusable hash join object preserving probe rows.
+        fn hash_join_left_join_indices(
             join: &HashJoin,
-            build_payload: &TableView,
-            probe_payload: &TableView,
-        ) -> Result<UniquePtr<Table>>;
+            probe_keys: &TableView,
+        ) -> Result<UniquePtr<HashJoinIndices>>;
 
         /// Inner join: return row index maps for the matching rows.
         fn inner_join_indices(

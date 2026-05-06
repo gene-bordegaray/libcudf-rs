@@ -22,10 +22,21 @@ namespace libcudf_bridge {
         std::unique_ptr<Column> release_right();
     };
 
+    struct HashJoinIndices {
+        std::unique_ptr<Column> probe;
+        std::unique_ptr<Column> build;
+
+        HashJoinIndices();
+
+        ~HashJoinIndices();
+
+        std::unique_ptr<Column> release_probe();
+
+        std::unique_ptr<Column> release_build();
+    };
+
     struct HashJoin {
         std::unique_ptr<cudf::hash_join> inner;
-        cudf::size_type build_rows = 0;
-        std::vector<std::unique_ptr<cudf::column>> matched_build_indices;
 
         HashJoin();
 
@@ -35,28 +46,13 @@ namespace libcudf_bridge {
     std::unique_ptr<HashJoin> hash_join_create(
         const TableView& build_keys, bool nulls_equal);
 
-    std::unique_ptr<Table> hash_join_inner_join_gather(
+    std::unique_ptr<HashJoinIndices> hash_join_inner_join_indices(
         const HashJoin& join,
-        const TableView& probe_keys,
-        const TableView& build_payload,
-        const TableView& probe_payload);
+        const TableView& probe_keys);
 
-    std::unique_ptr<Table> hash_join_inner_join_gather_and_mark(
-        HashJoin& join,
-        const TableView& probe_keys,
-        const TableView& build_payload,
-        const TableView& probe_payload);
-
-    std::unique_ptr<Table> hash_join_probe_left_join_gather_and_mark(
-        HashJoin& join,
-        const TableView& probe_keys,
-        const TableView& build_payload,
-        const TableView& probe_payload);
-
-    std::unique_ptr<Table> hash_join_unmatched_build_gather(
+    std::unique_ptr<HashJoinIndices> hash_join_left_join_indices(
         const HashJoin& join,
-        const TableView& build_payload,
-        const TableView& probe_payload);
+        const TableView& probe_keys);
 
     std::unique_ptr<JoinIndices> inner_join_indices(
         const TableView& left_keys,

@@ -5,8 +5,11 @@
 #include <cudf/column/column.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/filling.hpp>
 #include <cudf/interop.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/stream_compaction.hpp>
+#include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/pinned_memory.hpp>
 #include <cudf/version_config.hpp>
 
@@ -16,6 +19,7 @@
 
 #include <nanoarrow/nanoarrow.h>
 
+#include <limits>
 #include <sstream>
 
 namespace libcudf_bridge {
@@ -67,6 +71,21 @@ namespace libcudf_bridge {
         auto table = std::make_unique<Column>();
         table->inner = cudf::concatenate(table_views);
         return table;
+    }
+
+    std::unique_ptr<Column> sequence(size_t size, const Scalar &init, const Scalar &step) {
+        if (size > static_cast<size_t>(std::numeric_limits<cudf::size_type>::max())) {
+            throw std::out_of_range("sequence size exceeds cudf::size_type");
+        }
+
+        auto stream = cudf::get_default_stream();
+        auto result = std::make_unique<Column>();
+        result->inner = cudf::sequence(
+            static_cast<cudf::size_type>(size),
+            *init.inner,
+            *step.inner,
+            stream);
+        return result;
     }
 
     // Direct cuDF operations - 1:1 mappings
