@@ -73,6 +73,82 @@ impl CuDFHashJoin {
         )?;
         Ok(CuDFTable::from_inner(result))
     }
+
+    /// Probe this hash join, record matched build rows, and emit inner-join rows.
+    pub fn inner_join_and_record_matches(
+        &mut self,
+        probe: &CuDFTableView,
+        probe_on: &[usize],
+        build_payload: &CuDFTableView,
+        probe_payload: &CuDFTableView,
+        build_out_cols: Option<&[usize]>,
+        probe_out_cols: Option<&[usize]>,
+    ) -> Result<CuDFTable, CuDFError> {
+        let probe_keys = select_cols(probe, probe_on);
+        let selected_build_payload = build_out_cols.map(|c| select_cols(build_payload, c));
+        let selected_probe_payload = probe_out_cols.map(|c| select_cols(probe_payload, c));
+        let result = ffi::hash_join_inner_join_gather_and_mark(
+            self.inner.pin_mut(),
+            &probe_keys,
+            selected_build_payload
+                .as_ref()
+                .unwrap_or_else(|| build_payload.inner()),
+            selected_probe_payload
+                .as_ref()
+                .unwrap_or_else(|| probe_payload.inner()),
+        )?;
+        Ok(CuDFTable::from_inner(result))
+    }
+
+    /// Probe this hash join preserving probe rows and record matched build rows.
+    ///
+    /// Output columns are concatenated as `[build_cols | probe_cols]`.
+    pub fn probe_left_join_and_record_matches(
+        &mut self,
+        probe: &CuDFTableView,
+        probe_on: &[usize],
+        build_payload: &CuDFTableView,
+        probe_payload: &CuDFTableView,
+        build_out_cols: Option<&[usize]>,
+        probe_out_cols: Option<&[usize]>,
+    ) -> Result<CuDFTable, CuDFError> {
+        let probe_keys = select_cols(probe, probe_on);
+        let selected_build_payload = build_out_cols.map(|c| select_cols(build_payload, c));
+        let selected_probe_payload = probe_out_cols.map(|c| select_cols(probe_payload, c));
+        let result = ffi::hash_join_probe_left_join_gather_and_mark(
+            self.inner.pin_mut(),
+            &probe_keys,
+            selected_build_payload
+                .as_ref()
+                .unwrap_or_else(|| build_payload.inner()),
+            selected_probe_payload
+                .as_ref()
+                .unwrap_or_else(|| probe_payload.inner()),
+        )?;
+        Ok(CuDFTable::from_inner(result))
+    }
+
+    /// Gather build rows not matched by previous recorded probes.
+    pub fn unmatched_build_rows(
+        &self,
+        build_payload: &CuDFTableView,
+        probe_payload: &CuDFTableView,
+        build_out_cols: Option<&[usize]>,
+        probe_out_cols: Option<&[usize]>,
+    ) -> Result<CuDFTable, CuDFError> {
+        let selected_build_payload = build_out_cols.map(|c| select_cols(build_payload, c));
+        let selected_probe_payload = probe_out_cols.map(|c| select_cols(probe_payload, c));
+        let result = ffi::hash_join_unmatched_build_gather(
+            &self.inner,
+            selected_build_payload
+                .as_ref()
+                .unwrap_or_else(|| build_payload.inner()),
+            selected_probe_payload
+                .as_ref()
+                .unwrap_or_else(|| probe_payload.inner()),
+        )?;
+        Ok(CuDFTable::from_inner(result))
+    }
 }
 
 /// Perform an inner join on two tables using the specified key columns.

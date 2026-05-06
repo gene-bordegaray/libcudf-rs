@@ -271,10 +271,11 @@ impl ExecutionPlan for CuDFHashJoinExec {
         let right_schema = self.right.schema();
 
         if matches!(self.partition_mode, PartitionMode::CollectLeft)
-            && matches!(join_type, JoinType::Inner)
+            && matches!(join_type, JoinType::Inner | JoinType::Left | JoinType::Full)
         {
             let stream = futures::stream::try_unfold(
-                InnerJoinStreamState {
+                StreamingJoinState {
+                    join_type,
                     left_fut: Some(left_fut),
                     left: None,
                     join: None,
@@ -283,11 +284,13 @@ impl ExecutionPlan for CuDFHashJoinExec {
                     left_on,
                     right_on,
                     output_schema: output_schema.clone(),
+                    right_schema,
                     projection,
                     left_out: None,
                     right_out: None,
+                    emitted_unmatched_build: false,
                 },
-                next_inner_join_batch,
+                next_streaming_join_batch,
             );
             return Ok(Box::pin(RecordBatchStreamAdapter::new(
                 output_schema,
@@ -378,7 +381,8 @@ fn collect_shared(
     })
 }
 
-struct InnerJoinStreamState {
+struct StreamingJoinState {
+    join_type: JoinType,
     left_fut: Option<SharedTableFuture>,
     left: Option<Arc<CuDFTable>>,
     join: Option<CuDFHashJoin>,
@@ -387,12 +391,16 @@ struct InnerJoinStreamState {
     left_on: Vec<usize>,
     right_on: Vec<usize>,
     output_schema: SchemaRef,
+    right_schema: SchemaRef,
     projection: Option<Vec<usize>>,
     left_out: Option<Vec<usize>>,
     right_out: Option<Vec<usize>>,
+    emitted_unmatched_build: bool,
 }
 
-async fn ensure_inner_join_ready(state: &mut InnerJoinStreamState) -> Result<(), DataFusionError> {
+async fn ensure_streaming_join_ready(
+    state: &mut StreamingJoinState,
+) -> Result<(), DataFusionError> {
     if state.join.is_some() {
         return Ok(());
     }
@@ -417,10 +425,10 @@ async fn ensure_inner_join_ready(state: &mut InnerJoinStreamState) -> Result<(),
     Ok(())
 }
 
-async fn next_inner_join_batch(
-    mut state: InnerJoinStreamState,
-) -> Result<Option<(RecordBatch, InnerJoinStreamState)>, DataFusionError> {
-    ensure_inner_join_ready(&mut state).await?;
+async fn next_streaming_join_batch(
+    mut state: StreamingJoinState,
+) -> Result<Option<(RecordBatch, StreamingJoinState)>, DataFusionError> {
+    ensure_streaming_join_ready(&mut state).await?;
 
     loop {
         let right_batch = {
@@ -428,6 +436,15 @@ async fn next_inner_join_batch(
             state.right_stream.next().await.transpose()?
         };
         let Some(right_batch) = right_batch else {
+            if matches!(state.join_type, JoinType::Left | JoinType::Full)
+                && !state.emitted_unmatched_build
+            {
+                state.emitted_unmatched_build = true;
+                if let Some(batch) = unmatched_build_batch(&state)? {
+                    state.metrics.baseline.record_output(&batch);
+                    return Ok(Some((batch, state)));
+                }
+            }
             state.metrics.baseline.done();
             return Ok(None);
         };
@@ -442,28 +459,7 @@ async fn next_inner_join_batch(
 
         let right =
             Arc::new(batches_to_table(std::slice::from_ref(&right_batch)).map_err(cudf_to_df)?);
-        let result = {
-            let left = state
-                .left
-                .as_ref()
-                .expect("left table should be initialized before probing");
-            let join = state
-                .join
-                .as_ref()
-                .expect("hash join should be initialized before probing");
-            let left_view = Arc::clone(left).view();
-            let right_view = Arc::clone(&right).view();
-            let _timer = state.metrics.join_time.timer();
-            join.inner_join(
-                &right_view,
-                &state.right_on,
-                &left_view,
-                &right_view,
-                state.left_out.as_deref(),
-                state.right_out.as_deref(),
-            )
-            .map_err(cudf_to_df)?
-        };
+        let result = probe_streaming_join(&mut state, right)?;
         let batch = result
             .into_view()
             .to_record_batch_with_schema(&state.output_schema)
@@ -475,6 +471,106 @@ async fn next_inner_join_batch(
 
         state.metrics.baseline.record_output(&batch);
         return Ok(Some((batch, state)));
+    }
+}
+
+fn probe_streaming_join(
+    state: &mut StreamingJoinState,
+    right: Arc<CuDFTable>,
+) -> Result<CuDFTable, DataFusionError> {
+    let left = Arc::clone(
+        state
+            .left
+            .as_ref()
+            .expect("left table should be initialized before probing"),
+    );
+    let left_view = left.view();
+    let right_view = right.view();
+    let _timer = state.metrics.join_time.timer();
+
+    let result = match state.join_type {
+        JoinType::Inner => state
+            .join
+            .as_ref()
+            .expect("hash join should be initialized before probing")
+            .inner_join(
+                &right_view,
+                &state.right_on,
+                &left_view,
+                &right_view,
+                state.left_out.as_deref(),
+                state.right_out.as_deref(),
+            ),
+        JoinType::Left => state
+            .join
+            .as_mut()
+            .expect("hash join should be initialized before probing")
+            .inner_join_and_record_matches(
+                &right_view,
+                &state.right_on,
+                &left_view,
+                &right_view,
+                state.left_out.as_deref(),
+                state.right_out.as_deref(),
+            ),
+        JoinType::Full => state
+            .join
+            .as_mut()
+            .expect("hash join should be initialized before probing")
+            .probe_left_join_and_record_matches(
+                &right_view,
+                &state.right_on,
+                &left_view,
+                &right_view,
+                state.left_out.as_deref(),
+                state.right_out.as_deref(),
+            ),
+        other => {
+            return Err(DataFusionError::NotImplemented(format!(
+                "CuDFHashJoinExec: unsupported streaming join type {other:?}"
+            )))
+        }
+    };
+
+    result.map_err(cudf_to_df)
+}
+
+fn unmatched_build_batch(
+    state: &StreamingJoinState,
+) -> Result<Option<RecordBatch>, DataFusionError> {
+    let left = state
+        .left
+        .as_ref()
+        .expect("left table should be initialized before finalizing");
+    let join = state
+        .join
+        .as_ref()
+        .expect("hash join should be initialized before finalizing");
+    let left_view = Arc::clone(left).view();
+    let empty_right =
+        CuDFTable::from_arrow_host(RecordBatch::new_empty(Arc::clone(&state.right_schema)))
+            .map_err(cudf_to_df)?;
+    let right_view = empty_right.into_view();
+
+    let result = {
+        let _timer = state.metrics.join_time.timer();
+        join.unmatched_build_rows(
+            &left_view,
+            &right_view,
+            state.left_out.as_deref(),
+            state.right_out.as_deref(),
+        )
+        .map_err(cudf_to_df)?
+    };
+
+    let batch = result
+        .into_view()
+        .to_record_batch_with_schema(&state.output_schema)
+        .map_err(cudf_to_df)?;
+    if batch.num_rows() == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(batch))
     }
 }
 
@@ -759,6 +855,10 @@ mod test {
         batches.iter().map(|b| b.num_rows()).sum()
     }
 
+    fn total_nulls(batches: &[RecordBatch], column: usize) -> usize {
+        batches.iter().map(|b| b.column(column).null_count()).sum()
+    }
+
     #[tokio::test]
     async fn test_inner_join() -> Result<(), Box<dyn Error>> {
         let out = run_join(
@@ -814,6 +914,73 @@ mod test {
 
         assert_eq!(out.len(), 2);
         assert_eq!(total_rows(&out), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_collect_left_left_join_streams_and_finalizes_unmatched(
+    ) -> Result<(), Box<dyn Error>> {
+        let schema = right_batch().schema();
+        let right_a = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![2])),
+                Arc::new(Int32Array::from(vec![200])),
+            ],
+        )?;
+        let right_b = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![3])),
+                Arc::new(Int32Array::from(vec![300])),
+            ],
+        )?;
+
+        let out = run_join_with_right_batches(
+            left_batch(),
+            vec![right_a, right_b],
+            JoinType::Left,
+            PartitionMode::CollectLeft,
+        )
+        .await?;
+
+        assert_eq!(out.len(), 3);
+        assert_eq!(total_rows(&out), 4);
+        assert_eq!(total_nulls(&out, 2), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_collect_left_full_join_streams_and_finalizes_unmatched(
+    ) -> Result<(), Box<dyn Error>> {
+        let schema = right_batch().schema();
+        let right_a = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![2, 5])),
+                Arc::new(Int32Array::from(vec![200, 500])),
+            ],
+        )?;
+        let right_b = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![3, 6])),
+                Arc::new(Int32Array::from(vec![300, 600])),
+            ],
+        )?;
+
+        let out = run_join_with_right_batches(
+            left_batch(),
+            vec![right_a, right_b],
+            JoinType::Full,
+            PartitionMode::CollectLeft,
+        )
+        .await?;
+
+        assert_eq!(out.len(), 3);
+        assert_eq!(total_rows(&out), 6);
+        assert_eq!(total_nulls(&out, 0), 2);
+        assert_eq!(total_nulls(&out, 2), 2);
         Ok(())
     }
 

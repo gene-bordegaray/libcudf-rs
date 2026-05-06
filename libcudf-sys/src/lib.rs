@@ -469,6 +469,29 @@ pub mod ffi {
             probe_payload: &TableView,
         ) -> Result<UniquePtr<Table>>;
 
+        /// Probe a reusable hash join object, record matched build rows, and gather inner rows.
+        fn hash_join_inner_join_gather_and_mark(
+            join: Pin<&mut HashJoin>,
+            probe_keys: &TableView,
+            build_payload: &TableView,
+            probe_payload: &TableView,
+        ) -> Result<UniquePtr<Table>>;
+
+        /// Probe a reusable hash join object preserving probe rows, recording matched build rows.
+        fn hash_join_probe_left_join_gather_and_mark(
+            join: Pin<&mut HashJoin>,
+            probe_keys: &TableView,
+            build_payload: &TableView,
+            probe_payload: &TableView,
+        ) -> Result<UniquePtr<Table>>;
+
+        /// Gather build rows that did not match any previous marked probe.
+        fn hash_join_unmatched_build_gather(
+            join: &HashJoin,
+            build_payload: &TableView,
+            probe_payload: &TableView,
+        ) -> Result<UniquePtr<Table>>;
+
         /// Inner join: gather matching rows from both payloads into one output table.
         fn inner_join_gather(
             left_keys: &TableView,

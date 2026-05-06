@@ -5,10 +5,14 @@
 #include "table.h"
 #include "column.h"
 #include <cudf/join/hash_join.hpp>
+#include <cudf/column/column.hpp>
+#include <vector>
 
 namespace libcudf_bridge {
     struct HashJoin {
         std::unique_ptr<cudf::hash_join> inner;
+        cudf::size_type build_rows = 0;
+        std::vector<std::unique_ptr<cudf::column>> matched_build_indices;
 
         HashJoin();
 
@@ -21,6 +25,23 @@ namespace libcudf_bridge {
     std::unique_ptr<Table> hash_join_inner_join_gather(
         const HashJoin& join,
         const TableView& probe_keys,
+        const TableView& build_payload,
+        const TableView& probe_payload);
+
+    std::unique_ptr<Table> hash_join_inner_join_gather_and_mark(
+        HashJoin& join,
+        const TableView& probe_keys,
+        const TableView& build_payload,
+        const TableView& probe_payload);
+
+    std::unique_ptr<Table> hash_join_probe_left_join_gather_and_mark(
+        HashJoin& join,
+        const TableView& probe_keys,
+        const TableView& build_payload,
+        const TableView& probe_payload);
+
+    std::unique_ptr<Table> hash_join_unmatched_build_gather(
+        const HashJoin& join,
         const TableView& build_payload,
         const TableView& probe_payload);
 
