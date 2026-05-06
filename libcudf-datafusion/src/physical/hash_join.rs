@@ -1,4 +1,5 @@
 use crate::errors::cudf_to_df;
+use crate::metrics::CuDFBaselineMetrics;
 use crate::physical::cudf_load::cudf_schema_compatibility_map;
 use arrow::array::RecordBatch;
 use arrow_schema::{Field, Schema, SchemaRef};
@@ -8,6 +9,9 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion_physical_plan::expressions::Column;
 use datafusion_physical_plan::joins::{HashJoinExec, PartitionMode};
+use datafusion_physical_plan::metrics::{
+    Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder, MetricsSet, Time,
+};
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::{
     execute_stream, project_schema, DisplayAs, DisplayFormatType, ExecutionPlan,
@@ -36,6 +40,7 @@ pub struct CuDFHashJoinExec {
     right_on: Vec<usize>,
     properties: Arc<PlanProperties>,
     shared_table: Arc<OnceCell<Arc<CuDFTable>>>,
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl std::fmt::Debug for CuDFHashJoinExec {
@@ -147,6 +152,7 @@ impl CuDFHashJoinExec {
             right_on,
             properties,
             shared_table: Arc::new(OnceCell::new()),
+            metrics: ExecutionPlanMetricsSet::new(),
         })
     }
 
@@ -200,6 +206,10 @@ impl ExecutionPlan for CuDFHashJoinExec {
         vec![&self.left, &self.right]
     }
 
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -222,6 +232,7 @@ impl ExecutionPlan for CuDFHashJoinExec {
         context: Arc<TaskContext>,
     ) -> datafusion::common::Result<SendableRecordBatchStream> {
         let right_stream = self.right.execute(partition, Arc::clone(&context))?;
+        let metrics = CuDFHashJoinMetrics::new(&self.metrics, partition);
 
         // CollectLeft: all partition streams share one left table via OnceCell,
         // so the left child is executed at most once regardless of partition count.
@@ -231,11 +242,15 @@ impl ExecutionPlan for CuDFHashJoinExec {
                 Arc::clone(&self.shared_table),
                 Arc::clone(&self.left),
                 Arc::clone(&context),
+                metrics.clone(),
             ),
             _ => {
                 let left_stream = self.left.execute(partition, Arc::clone(&context))?;
+                let metrics = metrics.clone();
                 Box::pin(async move {
+                    let _timer = metrics.build_time.timer();
                     let batches: Vec<RecordBatch> = left_stream.try_collect().await?;
+                    metrics.record_build_input(&batches);
                     batches_to_table(&batches).map(Arc::new).map_err(cudf_to_df)
                 })
             }
@@ -250,7 +265,12 @@ impl ExecutionPlan for CuDFHashJoinExec {
 
         let stream = futures::stream::once(async move {
             let left = left_fut.await?;
-            let right_batches: Vec<RecordBatch> = right_stream.try_collect().await?;
+            let right_batches: Vec<RecordBatch> = {
+                let _timer = metrics.probe_collect_time.timer();
+                let batches: Vec<RecordBatch> = right_stream.try_collect().await?;
+                metrics.record_probe_input(&batches);
+                batches
+            };
 
             let right_empty =
                 right_batches.is_empty() || right_batches.iter().all(|b| b.num_rows() == 0);
@@ -270,15 +290,22 @@ impl ExecutionPlan for CuDFHashJoinExec {
                 Arc::new(batches_to_table(&right_batches).map_err(cudf_to_df)?)
             };
 
-            perform_join(
-                left,
-                right,
-                join_type,
-                &left_on,
-                &right_on,
-                &output_schema,
-                &projection,
-            )
+            let result = {
+                let _timer = metrics.join_time.timer();
+                perform_join(
+                    left,
+                    right,
+                    join_type,
+                    &left_on,
+                    &right_on,
+                    &output_schema,
+                    &projection,
+                )
+            };
+            if let Ok(Some(batch)) = &result {
+                metrics.baseline.record_output(batch);
+            }
+            result
         })
         .filter_map(|result| async move {
             match result {
@@ -300,14 +327,17 @@ fn collect_shared(
     shared: Arc<OnceCell<Arc<CuDFTable>>>,
     left_child: Arc<dyn ExecutionPlan>,
     ctx: Arc<TaskContext>,
+    metrics: CuDFHashJoinMetrics,
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<Arc<CuDFTable>, DataFusionError>> + Send>,
 > {
     Box::pin(async move {
         shared
             .get_or_try_init(|| async move {
+                let _timer = metrics.build_time.timer();
                 let stream = execute_stream(left_child, ctx).map_err(Arc::new)?;
                 let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(Arc::new)?;
+                metrics.record_build_input(&batches);
                 batches_to_table(&batches)
                     .map(Arc::new)
                     .map_err(|e| Arc::new(cudf_to_df(e)))
@@ -316,6 +346,72 @@ fn collect_shared(
             .map(Arc::clone)
             .map_err(|e: Arc<DataFusionError>| DataFusionError::External(Box::new(e)))
     })
+}
+
+#[derive(Clone)]
+struct CuDFHashJoinMetrics {
+    baseline: CuDFBaselineMetrics,
+    build_time: Time,
+    probe_collect_time: Time,
+    join_time: Time,
+    build_input_batches: Count,
+    build_input_rows: Count,
+    build_input_bytes: Count,
+    probe_input_batches: Count,
+    probe_input_rows: Count,
+    probe_input_bytes: Count,
+    join_input_bytes: Gauge,
+}
+
+impl CuDFHashJoinMetrics {
+    fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
+        Self {
+            baseline: CuDFBaselineMetrics::new(metrics, partition),
+            build_time: MetricBuilder::new(metrics).subset_time("build_time", partition),
+            probe_collect_time: MetricBuilder::new(metrics)
+                .subset_time("probe_collect_time", partition),
+            join_time: MetricBuilder::new(metrics).subset_time("join_time", partition),
+            build_input_batches: MetricBuilder::new(metrics)
+                .counter("build_input_batches", partition),
+            build_input_rows: MetricBuilder::new(metrics).counter("build_input_rows", partition),
+            build_input_bytes: MetricBuilder::new(metrics).counter("build_input_bytes", partition),
+            probe_input_batches: MetricBuilder::new(metrics)
+                .counter("probe_input_batches", partition),
+            probe_input_rows: MetricBuilder::new(metrics).counter("probe_input_rows", partition),
+            probe_input_bytes: MetricBuilder::new(metrics).counter("probe_input_bytes", partition),
+            join_input_bytes: MetricBuilder::new(metrics).gauge("join_input_bytes", partition),
+        }
+    }
+
+    fn record_build_input(&self, batches: &[RecordBatch]) {
+        let stats = batch_stats(batches);
+        self.build_input_batches.add(stats.batches);
+        self.build_input_rows.add(stats.rows);
+        self.build_input_bytes.add(stats.bytes);
+        self.join_input_bytes.add(stats.bytes);
+    }
+
+    fn record_probe_input(&self, batches: &[RecordBatch]) {
+        let stats = batch_stats(batches);
+        self.probe_input_batches.add(stats.batches);
+        self.probe_input_rows.add(stats.rows);
+        self.probe_input_bytes.add(stats.bytes);
+        self.join_input_bytes.add(stats.bytes);
+    }
+}
+
+struct BatchStats {
+    batches: usize,
+    rows: usize,
+    bytes: usize,
+}
+
+fn batch_stats(batches: &[RecordBatch]) -> BatchStats {
+    BatchStats {
+        batches: batches.len(),
+        rows: batches.iter().map(|b| b.num_rows()).sum(),
+        bytes: batches.iter().map(|b| b.get_array_memory_size()).sum(),
+    }
 }
 
 /// Run the cuDF join kernel and apply the output projection. Returns `None`
