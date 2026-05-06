@@ -89,6 +89,15 @@ pub mod ffi {
         /// Builds a hash table once and probes it with subsequent join calls.
         type HashJoin;
 
+        /// Pair of cuDF join index maps.
+        type JoinIndices;
+
+        /// Take the left input indices from this join result.
+        fn release_left(self: Pin<&mut JoinIndices>) -> UniquePtr<Column>;
+
+        /// Take the right input indices from this join result.
+        fn release_right(self: Pin<&mut JoinIndices>) -> UniquePtr<Column>;
+
         /// Opaque owning wrapper for an RMM CUDA stream.
         type CudaStream;
 
@@ -491,6 +500,12 @@ pub mod ffi {
             build_payload: &TableView,
             probe_payload: &TableView,
         ) -> Result<UniquePtr<Table>>;
+
+        /// Inner join: return row index maps for the matching rows.
+        fn inner_join_indices(
+            left_keys: &TableView,
+            right_keys: &TableView,
+        ) -> Result<UniquePtr<JoinIndices>>;
 
         /// Inner join: gather matching rows from both payloads into one output table.
         fn inner_join_gather(

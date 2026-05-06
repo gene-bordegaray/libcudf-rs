@@ -8,6 +8,19 @@ fn select_cols(view: &CuDFTableView, cols: &[usize]) -> cxx::UniquePtr<ffi::Tabl
     view.inner().select(&indices)
 }
 
+fn gather_join_output(
+    left_payload: &ffi::TableView,
+    right_payload: &ffi::TableView,
+    left_indices: &ffi::ColumnView,
+    right_indices: &ffi::ColumnView,
+) -> Result<CuDFTable, CuDFError> {
+    let left = CuDFTable::from_inner(ffi::gather(left_payload, left_indices)?);
+    let right = CuDFTable::from_inner(ffi::gather(right_payload, right_indices)?);
+    let mut columns = left.into_columns();
+    columns.extend(right.into_columns());
+    Ok(CuDFTable::from_columns(columns))
+}
+
 /// Reusable hash join built from a fixed build-side key table.
 ///
 /// The build-side table is kept alive for the lifetime of this object.
@@ -168,13 +181,17 @@ pub fn inner_join(
     let right_keys = select_cols(right, right_on);
     let left_payload = left_out_cols.map(|c| select_cols(left, c));
     let right_payload = right_out_cols.map(|c| select_cols(right, c));
-    let result = ffi::inner_join_gather(
-        &left_keys,
-        &right_keys,
+    let mut indices = ffi::inner_join_indices(&left_keys, &right_keys)?;
+    let left_indices = indices.pin_mut().release_left();
+    let right_indices = indices.pin_mut().release_right();
+    let left_indices_view = left_indices.view();
+    let right_indices_view = right_indices.view();
+    gather_join_output(
         left_payload.as_ref().unwrap_or_else(|| left.inner()),
         right_payload.as_ref().unwrap_or_else(|| right.inner()),
-    )?;
-    Ok(CuDFTable::from_inner(result))
+        &left_indices_view,
+        &right_indices_view,
+    )
 }
 
 /// Perform a left outer join on two tables.

@@ -19,6 +19,24 @@ static std::unique_ptr<cudf::column> uvector_to_column(
     return std::make_unique<cudf::column>(std::move(*vec), rmm::device_buffer{}, 0);
 }
 
+static std::unique_ptr<Column> uvector_to_bridge_column(
+    std::unique_ptr<rmm::device_uvector<cudf::size_type>> vec)
+{
+    auto result = std::make_unique<Column>();
+    result->inner = uvector_to_column(std::move(vec));
+    return result;
+}
+
+static std::unique_ptr<JoinIndices> make_join_indices(
+    std::unique_ptr<rmm::device_uvector<cudf::size_type>> left_idx,
+    std::unique_ptr<rmm::device_uvector<cudf::size_type>> right_idx)
+{
+    auto result = std::make_unique<JoinIndices>();
+    result->left = uvector_to_bridge_column(std::move(left_idx));
+    result->right = uvector_to_bridge_column(std::move(right_idx));
+    return result;
+}
+
 static std::unique_ptr<cudf::column> sequence_column(
     cudf::size_type size,
     cudf::size_type init,
@@ -93,6 +111,26 @@ static std::unique_ptr<Table> gather_combine(
     return gather_combine_views(left_col->view(), right_col->view(),
                                 left_payload, right_payload,
                                 left_policy, right_policy);
+}
+
+JoinIndices::JoinIndices() = default;
+
+JoinIndices::~JoinIndices() = default;
+
+std::unique_ptr<Column> JoinIndices::release_left() {
+    return std::move(left);
+}
+
+std::unique_ptr<Column> JoinIndices::release_right() {
+    return std::move(right);
+}
+
+std::unique_ptr<JoinIndices> inner_join_indices(
+    const TableView& left_keys,
+    const TableView& right_keys)
+{
+    auto [left_idx, right_idx] = cudf::inner_join(*left_keys.inner, *right_keys.inner);
+    return make_join_indices(std::move(left_idx), std::move(right_idx));
 }
 
 std::unique_ptr<Table> inner_join_gather(

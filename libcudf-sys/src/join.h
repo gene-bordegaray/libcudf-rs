@@ -9,6 +9,19 @@
 #include <vector>
 
 namespace libcudf_bridge {
+    struct JoinIndices {
+        std::unique_ptr<Column> left;
+        std::unique_ptr<Column> right;
+
+        JoinIndices();
+
+        ~JoinIndices();
+
+        std::unique_ptr<Column> release_left();
+
+        std::unique_ptr<Column> release_right();
+    };
+
     struct HashJoin {
         std::unique_ptr<cudf::hash_join> inner;
         cudf::size_type build_rows = 0;
@@ -44,6 +57,10 @@ namespace libcudf_bridge {
         const HashJoin& join,
         const TableView& build_payload,
         const TableView& probe_payload);
+
+    std::unique_ptr<JoinIndices> inner_join_indices(
+        const TableView& left_keys,
+        const TableView& right_keys);
 
     std::unique_ptr<Table> inner_join_gather(
         const TableView& left_keys,  const TableView& right_keys,
