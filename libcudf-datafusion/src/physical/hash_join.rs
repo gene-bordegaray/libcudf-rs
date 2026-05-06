@@ -706,20 +706,28 @@ pub fn try_as_cudf_hash_join(
 
 #[cfg(test)]
 mod tests {
-    use super::{try_as_cudf_hash_join, CuDFHashJoinExec};
+    use super::{cudf_schema_compatibility_map, try_as_cudf_hash_join, CuDFHashJoinExec};
+    use crate::errors::cudf_to_df;
     use crate::physical::{CuDFLoadExec, CuDFUnloadExec};
-    use arrow::array::record_batch;
-    use arrow::array::{Int32Array, RecordBatch};
+    use arrow::array::{record_batch, Array, Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use datafusion::common::{JoinSide, JoinType, NullEquality};
     use datafusion::execution::TaskContext;
+    use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
     use datafusion_physical_plan::expressions::Column;
     use datafusion_physical_plan::joins::utils::{ColumnIndex, JoinFilter};
     use datafusion_physical_plan::joins::{HashJoinExec, PartitionMode};
+    use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion_physical_plan::test::TestMemoryExec;
-    use datafusion_physical_plan::{ExecutionPlan, PhysicalExpr};
+    use datafusion_physical_plan::{
+        DisplayAs, DisplayFormatType, ExecutionPlan, PhysicalExpr, PlanProperties,
+    };
+    use futures::stream;
     use futures_util::TryStreamExt;
+    use libcudf_rs::CuDFTable;
+    use std::any::Any;
     use std::error::Error;
+    use std::fmt::Formatter;
     use std::sync::Arc;
 
     fn left_batch() -> RecordBatch {
@@ -801,17 +809,32 @@ mod tests {
             PartitionMode::Auto => unreachable!("Auto joins are not supported by CuDFHashJoinExec"),
         };
 
-        // Both sides go through CuDFLoadExec — symmetric GPU upload.
-        let left_in = Arc::new(CuDFLoadExec::try_new(Arc::new(TestMemoryExec::try_new(
-            &left_partitions,
-            left_schema,
-            None,
-        )?))?);
-        let right_in = Arc::new(CuDFLoadExec::try_new(Arc::new(TestMemoryExec::try_new(
-            &right_partitions,
-            right_schema,
-            None,
-        )?))?);
+        let (left_in, right_in): (Arc<dyn ExecutionPlan>, Arc<dyn ExecutionPlan>) =
+            match partition_mode {
+                PartitionMode::CollectLeft => {
+                    // CuDFLoadExec intentionally coalesces host input partitions into one GPU
+                    // partition. CollectLeft tests use that production upload path.
+                    let left = Arc::new(CuDFLoadExec::try_new(Arc::new(TestMemoryExec::try_new(
+                        &left_partitions,
+                        left_schema,
+                        None,
+                    )?))?);
+                    let right = Arc::new(CuDFLoadExec::try_new(Arc::new(
+                        TestMemoryExec::try_new(&right_partitions, right_schema, None)?,
+                    ))?);
+                    (left, right)
+                }
+                PartitionMode::Partitioned => {
+                    // Partitioned join execution needs GPU-resident children that preserve
+                    // partition counts; CuDFLoadExec is no longer that shape.
+                    let left = Arc::new(TestGpuExec::try_new(left_partitions, left_schema)?);
+                    let right = Arc::new(TestGpuExec::try_new(right_partitions, right_schema)?);
+                    (left, right)
+                }
+                PartitionMode::Auto => {
+                    unreachable!("Auto joins are not supported by CuDFHashJoinExec")
+                }
+            };
         let exec = CuDFHashJoinExec::try_new(
             left_in,
             right_in,
@@ -828,6 +851,106 @@ mod tests {
             out.extend(stream.try_collect::<Vec<_>>().await?);
         }
         Ok(out)
+    }
+
+    #[derive(Debug)]
+    struct TestGpuExec {
+        partitions: Vec<Vec<RecordBatch>>,
+        properties: Arc<PlanProperties>,
+    }
+
+    impl TestGpuExec {
+        fn try_new(
+            partitions: Vec<Vec<RecordBatch>>,
+            schema: SchemaRef,
+        ) -> Result<Self, Box<dyn Error>> {
+            let input = TestMemoryExec::try_new(&partitions, schema, None)?;
+            let properties = Arc::new(PlanProperties::new(
+                EquivalenceProperties::new(cudf_schema_compatibility_map(input.schema())),
+                Partitioning::UnknownPartitioning(partitions.len()),
+                input.properties().emission_type,
+                input.properties().boundedness,
+            ));
+            Ok(Self {
+                partitions,
+                properties,
+            })
+        }
+    }
+
+    impl DisplayAs for TestGpuExec {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
+            write!(f, "TestGpuExec")
+        }
+    }
+
+    impl ExecutionPlan for TestGpuExec {
+        fn name(&self) -> &str {
+            "TestGpuExec"
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn properties(&self) -> &Arc<PlanProperties> {
+            &self.properties
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+            if !children.is_empty() {
+                return datafusion::common::plan_err!(
+                    "TestGpuExec expects no children, {} were provided",
+                    children.len()
+                );
+            }
+            Ok(self)
+        }
+
+        fn execute(
+            &self,
+            partition: usize,
+            _context: Arc<TaskContext>,
+        ) -> datafusion::common::Result<datafusion::execution::SendableRecordBatchStream> {
+            let Some(batches) = self.partitions.get(partition).cloned() else {
+                return datafusion::common::internal_err!(
+                    "TestGpuExec invalid partition {partition}"
+                );
+            };
+            let schema = self.schema();
+            let stream = stream::iter(
+                batches
+                    .into_iter()
+                    .map(move |batch| host_batch_to_gpu(batch, Arc::clone(&schema))),
+            );
+            Ok(Box::pin(RecordBatchStreamAdapter::new(
+                self.schema(),
+                stream,
+            )))
+        }
+    }
+
+    fn host_batch_to_gpu(
+        batch: RecordBatch,
+        schema: SchemaRef,
+    ) -> datafusion::common::Result<RecordBatch> {
+        let table = CuDFTable::from_arrow_host(batch).map_err(cudf_to_df)?;
+        let num_rows = table.num_rows();
+        let columns = table
+            .into_columns()
+            .into_iter()
+            .map(|column| Arc::new(column.into_view()) as Arc<dyn Array>)
+            .collect();
+        Ok(libcudf_rs::record_batch_with_schema(
+            columns, &schema, num_rows,
+        )?)
     }
 
     fn partition_schema(partitions: &[Vec<RecordBatch>], default: SchemaRef) -> SchemaRef {
