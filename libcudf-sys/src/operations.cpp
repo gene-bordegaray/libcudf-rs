@@ -78,11 +78,19 @@ namespace libcudf_bridge {
 
     // Gather rows from a table based on a gather map
     std::unique_ptr<Table> gather(const TableView &source_table, const ColumnView &gather_map) {
+        return gather_with_policy(source_table, gather_map,
+                                  static_cast<int32_t>(cudf::out_of_bounds_policy::DONT_CHECK));
+    }
+
+    std::unique_ptr<Table> gather_with_policy(
+        const TableView &source_table,
+        const ColumnView &gather_map,
+        int32_t out_of_bounds_policy) {
         auto result = std::make_unique<Table>();
         result->inner = cudf::gather(
             *source_table.inner,
             *gather_map.inner,
-            cudf::out_of_bounds_policy::DONT_CHECK
+            static_cast<cudf::out_of_bounds_policy>(out_of_bounds_policy)
         );
         return result;
     }

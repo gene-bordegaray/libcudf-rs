@@ -133,39 +133,20 @@ std::unique_ptr<JoinIndices> inner_join_indices(
     return make_join_indices(std::move(left_idx), std::move(right_idx));
 }
 
-std::unique_ptr<Table> inner_join_gather(
-    const TableView& left_keys,  const TableView& right_keys,
-    const TableView& left_payload, const TableView& right_payload)
-{
-    auto [left_idx, right_idx] = cudf::inner_join(*left_keys.inner, *right_keys.inner);
-    return gather_combine(std::move(left_idx), std::move(right_idx),
-                          *left_payload.inner, *right_payload.inner,
-                          cudf::out_of_bounds_policy::DONT_CHECK,
-                          cudf::out_of_bounds_policy::DONT_CHECK);
-}
-
-std::unique_ptr<Table> left_join_gather(
-    const TableView& left_keys,  const TableView& right_keys,
-    const TableView& left_payload, const TableView& right_payload)
+std::unique_ptr<JoinIndices> left_join_indices(
+    const TableView& left_keys,
+    const TableView& right_keys)
 {
     auto [left_idx, right_idx] = cudf::left_join(*left_keys.inner, *right_keys.inner);
-    // Left map never contains sentinels (all left rows appear), right map uses INT32_MIN
-    // for unmatched rows which NULLIFY converts to null output rows.
-    return gather_combine(std::move(left_idx), std::move(right_idx),
-                          *left_payload.inner, *right_payload.inner,
-                          cudf::out_of_bounds_policy::DONT_CHECK,
-                          cudf::out_of_bounds_policy::NULLIFY);
+    return make_join_indices(std::move(left_idx), std::move(right_idx));
 }
 
-std::unique_ptr<Table> full_join_gather(
-    const TableView& left_keys,  const TableView& right_keys,
-    const TableView& left_payload, const TableView& right_payload)
+std::unique_ptr<JoinIndices> full_join_indices(
+    const TableView& left_keys,
+    const TableView& right_keys)
 {
     auto [left_idx, right_idx] = cudf::full_join(*left_keys.inner, *right_keys.inner);
-    return gather_combine(std::move(left_idx), std::move(right_idx),
-                          *left_payload.inner, *right_payload.inner,
-                          cudf::out_of_bounds_policy::NULLIFY,
-                          cudf::out_of_bounds_policy::NULLIFY);
+    return make_join_indices(std::move(left_idx), std::move(right_idx));
 }
 
 HashJoin::HashJoin() = default;

@@ -1,6 +1,6 @@
 use crate::{CuDFError, CuDFRef, CuDFTable, CuDFTableView};
 use cxx::UniquePtr;
-use libcudf_sys::ffi;
+use libcudf_sys::{ffi, OutOfBoundsPolicy};
 use std::sync::Arc;
 
 fn select_cols(view: &CuDFTableView, cols: &[usize]) -> cxx::UniquePtr<ffi::TableView> {
@@ -13,12 +13,43 @@ fn gather_join_output(
     right_payload: &ffi::TableView,
     left_indices: &ffi::ColumnView,
     right_indices: &ffi::ColumnView,
+    left_policy: OutOfBoundsPolicy,
+    right_policy: OutOfBoundsPolicy,
 ) -> Result<CuDFTable, CuDFError> {
-    let left = CuDFTable::from_inner(ffi::gather(left_payload, left_indices)?);
-    let right = CuDFTable::from_inner(ffi::gather(right_payload, right_indices)?);
+    let left = CuDFTable::from_inner(ffi::gather_with_policy(
+        left_payload,
+        left_indices,
+        left_policy as i32,
+    )?);
+    let right = CuDFTable::from_inner(ffi::gather_with_policy(
+        right_payload,
+        right_indices,
+        right_policy as i32,
+    )?);
     let mut columns = left.into_columns();
     columns.extend(right.into_columns());
     Ok(CuDFTable::from_columns(columns))
+}
+
+fn gather_join_indices(
+    mut indices: UniquePtr<ffi::JoinIndices>,
+    left_payload: &ffi::TableView,
+    right_payload: &ffi::TableView,
+    left_policy: OutOfBoundsPolicy,
+    right_policy: OutOfBoundsPolicy,
+) -> Result<CuDFTable, CuDFError> {
+    let left_indices = indices.pin_mut().release_left();
+    let right_indices = indices.pin_mut().release_right();
+    let left_indices_view = left_indices.view();
+    let right_indices_view = right_indices.view();
+    gather_join_output(
+        left_payload,
+        right_payload,
+        &left_indices_view,
+        &right_indices_view,
+        left_policy,
+        right_policy,
+    )
 }
 
 /// Reusable hash join built from a fixed build-side key table.
@@ -181,16 +212,13 @@ pub fn inner_join(
     let right_keys = select_cols(right, right_on);
     let left_payload = left_out_cols.map(|c| select_cols(left, c));
     let right_payload = right_out_cols.map(|c| select_cols(right, c));
-    let mut indices = ffi::inner_join_indices(&left_keys, &right_keys)?;
-    let left_indices = indices.pin_mut().release_left();
-    let right_indices = indices.pin_mut().release_right();
-    let left_indices_view = left_indices.view();
-    let right_indices_view = right_indices.view();
-    gather_join_output(
+    let indices = ffi::inner_join_indices(&left_keys, &right_keys)?;
+    gather_join_indices(
+        indices,
         left_payload.as_ref().unwrap_or_else(|| left.inner()),
         right_payload.as_ref().unwrap_or_else(|| right.inner()),
-        &left_indices_view,
-        &right_indices_view,
+        OutOfBoundsPolicy::DontCheck,
+        OutOfBoundsPolicy::DontCheck,
     )
 }
 
@@ -211,13 +239,14 @@ pub fn left_join(
     let right_keys = select_cols(right, right_on);
     let left_payload = left_out_cols.map(|c| select_cols(left, c));
     let right_payload = right_out_cols.map(|c| select_cols(right, c));
-    let result = ffi::left_join_gather(
-        &left_keys,
-        &right_keys,
+    let indices = ffi::left_join_indices(&left_keys, &right_keys)?;
+    gather_join_indices(
+        indices,
         left_payload.as_ref().unwrap_or_else(|| left.inner()),
         right_payload.as_ref().unwrap_or_else(|| right.inner()),
-    )?;
-    Ok(CuDFTable::from_inner(result))
+        OutOfBoundsPolicy::DontCheck,
+        OutOfBoundsPolicy::Nullify,
+    )
 }
 
 /// Perform a full outer join on two tables.
@@ -237,13 +266,14 @@ pub fn full_join(
     let right_keys = select_cols(right, right_on);
     let left_payload = left_out_cols.map(|c| select_cols(left, c));
     let right_payload = right_out_cols.map(|c| select_cols(right, c));
-    let result = ffi::full_join_gather(
-        &left_keys,
-        &right_keys,
+    let indices = ffi::full_join_indices(&left_keys, &right_keys)?;
+    gather_join_indices(
+        indices,
         left_payload.as_ref().unwrap_or_else(|| left.inner()),
         right_payload.as_ref().unwrap_or_else(|| right.inner()),
-    )?;
-    Ok(CuDFTable::from_inner(result))
+        OutOfBoundsPolicy::Nullify,
+        OutOfBoundsPolicy::Nullify,
+    )
 }
 
 /// Perform a left semi join - return only left rows that have at least one match.
@@ -362,6 +392,49 @@ mod tests {
         )?;
         assert_eq!(result.num_rows(), 3); // key 2 matches, key 1 left-only, key 3 right-only
         assert_eq!(result.num_columns(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn test_full_join_column_subset_nulls() -> Result<(), Box<dyn std::error::Error>> {
+        let left = make_table(vec![1, 2], vec![10, 20]);
+        let right = make_table(vec![2, 3], vec![200, 300]);
+
+        let result = full_join(
+            &left.into_view(),
+            &right.into_view(),
+            &[0],
+            &[0],
+            Some(&[1]),
+            Some(&[1]),
+        )?;
+
+        assert_eq!(result.num_rows(), 3);
+        assert_eq!(result.num_columns(), 2);
+
+        let batch = result.into_view().to_arrow_host()?;
+        let left_vals = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let right_vals = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(
+            (0..left_vals.len())
+                .filter(|&i| left_vals.is_null(i))
+                .count(),
+            1
+        );
+        assert_eq!(
+            (0..right_vals.len())
+                .filter(|&i| right_vals.is_null(i))
+                .count(),
+            1
+        );
         Ok(())
     }
 

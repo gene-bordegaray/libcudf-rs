@@ -350,6 +350,13 @@ pub mod ffi {
         /// The resulting table will have the same number of rows as `gather_map` has elements.
         fn gather(source_table: &TableView, gather_map: &ColumnView) -> Result<UniquePtr<Table>>;
 
+        /// Gather rows from a table using an explicit out-of-bounds policy.
+        fn gather_with_policy(
+            source_table: &TableView,
+            gather_map: &ColumnView,
+            out_of_bounds_policy: i32,
+        ) -> Result<UniquePtr<Table>>;
+
         /// Create a sliced view of a column
         ///
         /// Returns a new column view that is a slice of the input column from `offset` to `offset + length`.
@@ -507,29 +514,17 @@ pub mod ffi {
             right_keys: &TableView,
         ) -> Result<UniquePtr<JoinIndices>>;
 
-        /// Inner join: gather matching rows from both payloads into one output table.
-        fn inner_join_gather(
+        /// Left join: return row index maps for the output rows.
+        fn left_join_indices(
             left_keys: &TableView,
             right_keys: &TableView,
-            left_payload: &TableView,
-            right_payload: &TableView,
-        ) -> Result<UniquePtr<Table>>;
+        ) -> Result<UniquePtr<JoinIndices>>;
 
-        /// Left outer join: all left rows appear; unmatched right columns are null.
-        fn left_join_gather(
+        /// Full join: return row index maps for the output rows.
+        fn full_join_indices(
             left_keys: &TableView,
             right_keys: &TableView,
-            left_payload: &TableView,
-            right_payload: &TableView,
-        ) -> Result<UniquePtr<Table>>;
-
-        /// Full outer join: all rows from both sides; unmatched columns on either side are null.
-        fn full_join_gather(
-            left_keys: &TableView,
-            right_keys: &TableView,
-            left_payload: &TableView,
-            right_payload: &TableView,
-        ) -> Result<UniquePtr<Table>>;
+        ) -> Result<UniquePtr<JoinIndices>>;
 
         /// Left semi join: gather only matching left rows (no right columns in output).
         fn left_semi_join_gather(
@@ -735,6 +730,16 @@ pub enum NullOrder {
     After = 0,
     /// Nulls appear before all other values
     Before = 1,
+}
+
+/// Policy for out-of-bounds gather indices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum OutOfBoundsPolicy {
+    /// Out-of-bounds rows become null rows.
+    Nullify = 0,
+    /// Do not check bounds.
+    DontCheck = 1,
 }
 
 /// Binary operators supported by cuDF

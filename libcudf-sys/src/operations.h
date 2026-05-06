@@ -27,6 +27,11 @@ namespace libcudf_bridge {
     // Gather rows from a table based on a gather map (column of indices)
     std::unique_ptr<Table> gather(const TableView &source_table, const ColumnView &gather_map);
 
+    std::unique_ptr<Table> gather_with_policy(
+        const TableView &source_table,
+        const ColumnView &gather_map,
+        int32_t out_of_bounds_policy);
+
     // Create a sliced view of a column
     std::unique_ptr<ColumnView> slice_column(const ColumnView &column, size_t offset, size_t length);
 

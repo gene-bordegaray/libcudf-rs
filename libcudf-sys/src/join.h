@@ -62,17 +62,13 @@ namespace libcudf_bridge {
         const TableView& left_keys,
         const TableView& right_keys);
 
-    std::unique_ptr<Table> inner_join_gather(
-        const TableView& left_keys,  const TableView& right_keys,
-        const TableView& left_payload, const TableView& right_payload);
+    std::unique_ptr<JoinIndices> left_join_indices(
+        const TableView& left_keys,
+        const TableView& right_keys);
 
-    std::unique_ptr<Table> left_join_gather(
-        const TableView& left_keys,  const TableView& right_keys,
-        const TableView& left_payload, const TableView& right_payload);
-
-    std::unique_ptr<Table> full_join_gather(
-        const TableView& left_keys,  const TableView& right_keys,
-        const TableView& left_payload, const TableView& right_payload);
+    std::unique_ptr<JoinIndices> full_join_indices(
+        const TableView& left_keys,
+        const TableView& right_keys);
 
     std::unique_ptr<Table> left_semi_join_gather(
         const TableView& left_keys, const TableView& right_keys,
