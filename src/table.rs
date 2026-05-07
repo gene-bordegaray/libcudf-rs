@@ -133,13 +133,14 @@ impl CuDFTable {
 
         let stream = ffi::get_default_stream();
         let mr = ffi::get_current_device_resource_ref();
-        let inner = ffi::read_parquet_with_options(
+        let mut result = ffi::read_parquet_with_options(
             options
                 .as_ref()
                 .expect("parquet_reader_options should not be null"),
             stream.as_ref().expect("default stream should not be null"),
             mr.as_ref().expect("device resource should not be null"),
         )?;
+        let inner = result.pin_mut().release_table();
         Ok(Self { inner })
     }
 

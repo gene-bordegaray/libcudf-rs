@@ -81,6 +81,9 @@ pub mod ffi {
         /// cuDF Parquet reader options.
         type ParquetReaderOptions;
 
+        /// cuDF table and metadata returned by I/O readers.
+        type TableWithMetadata;
+
         /// Aggregation operation accepted by cuDF reductions.
         type ReduceAggregation;
 
@@ -441,12 +444,24 @@ pub mod ffi {
             col_names: Vec<String>,
         );
 
+        /// Take ownership of the table from `cudf::io::table_with_metadata`.
+        fn release_table(self: Pin<&mut TableWithMetadata>) -> UniquePtr<Table>;
+
+        /// Return the number of per-source row counts in the metadata.
+        fn num_rows_per_source_count(self: &TableWithMetadata) -> usize;
+
+        /// Return the row count for one input source.
+        fn num_rows_per_source(self: &TableWithMetadata, index: usize) -> usize;
+
+        /// Return the total number of input row groups.
+        fn num_input_row_groups(self: &TableWithMetadata) -> i32;
+
         /// Read Parquet using explicit reader options, CUDA stream, and device resource.
         fn read_parquet_with_options(
             options: &ParquetReaderOptions,
             stream: &CudaStreamView,
             mr: &DeviceAsyncResourceRef,
-        ) -> Result<UniquePtr<Table>>;
+        ) -> Result<UniquePtr<TableWithMetadata>>;
 
         /// Read a Parquet file into a table
         fn read_parquet(filename: &str) -> Result<UniquePtr<Table>>;
@@ -1573,6 +1588,37 @@ mod tests {
             "../testdata/weather/result-000001.parquet".to_string(),
         ]);
         assert_eq!(multiple.num_sources(), 2);
+    }
+
+    #[test]
+    fn test_read_parquet_with_options_metadata() -> Result<(), Box<dyn std::error::Error>> {
+        let source = ffi::source_info_from_file_paths(vec![
+            "../testdata/weather/result-000000.parquet".to_string(),
+            "../testdata/weather/result-000001.parquet".to_string(),
+        ]);
+        let options = ffi::parquet_reader_options_create(
+            source.as_ref().expect("source_info should not be null"),
+        );
+        let stream = ffi::get_default_stream();
+        let mr = ffi::get_current_device_resource_ref();
+
+        let mut result = ffi::read_parquet_with_options(
+            options
+                .as_ref()
+                .expect("parquet_reader_options should not be null"),
+            stream.as_ref().expect("default stream should not be null"),
+            mr.as_ref().expect("device resource should not be null"),
+        )?;
+
+        assert_eq!(result.num_rows_per_source_count(), 2);
+        assert!(result.num_rows_per_source(0) > 0);
+        assert!(result.num_rows_per_source(1) > 0);
+        assert!(result.num_input_row_groups() > 0);
+
+        let table = result.pin_mut().release_table();
+        assert!(table.num_rows() > 0);
+
+        Ok(())
     }
 
     // Sorting tests

@@ -44,6 +44,29 @@ namespace libcudf_bridge {
         inner.set_columns(to_std_strings(col_names));
     }
 
+    TableWithMetadata::TableWithMetadata(cudf::io::table_with_metadata result)
+        : inner(std::move(result)) {}
+
+    TableWithMetadata::~TableWithMetadata() = default;
+
+    std::unique_ptr<Table> TableWithMetadata::release_table() {
+        auto table = std::make_unique<Table>();
+        table->inner = std::move(inner.tbl);
+        return table;
+    }
+
+    size_t TableWithMetadata::num_rows_per_source_count() const {
+        return inner.metadata.num_rows_per_source.size();
+    }
+
+    size_t TableWithMetadata::num_rows_per_source(size_t index) const {
+        return inner.metadata.num_rows_per_source.at(index);
+    }
+
+    int32_t TableWithMetadata::num_input_row_groups() const {
+        return inner.metadata.num_input_row_groups;
+    }
+
     std::unique_ptr<SourceInfo> source_info_from_file_path(const rust::Str file_path) {
         return std::make_unique<SourceInfo>(cudf::io::source_info{to_std_string(file_path)});
     }
@@ -67,15 +90,12 @@ namespace libcudf_bridge {
         options.set_columns(std::move(col_names));
     }
 
-    std::unique_ptr<Table> read_parquet_with_options(
+    std::unique_ptr<TableWithMetadata> read_parquet_with_options(
         const ParquetReaderOptions& options,
         const CudaStreamView& stream,
         const DeviceAsyncResourceRef& mr) {
-        auto [tbl, metadata] = cudf::io::read_parquet(options.inner, stream.inner, mr.inner);
-
-        auto table = std::make_unique<Table>();
-        table->inner = std::move(tbl);
-        return table;
+        auto result = cudf::io::read_parquet(options.inner, stream.inner, mr.inner);
+        return std::make_unique<TableWithMetadata>(std::move(result));
     }
 
     // Parquet I/O

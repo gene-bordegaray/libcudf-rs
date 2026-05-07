@@ -1,7 +1,7 @@
 use crate::errors::cudf_to_df;
 use crate::metrics::CuDFBaselineMetrics;
 use arrow::array::Array;
-use arrow_schema::{Schema, SchemaRef};
+use arrow_schema::SchemaRef;
 use datafusion::common::{assert_eq_or_internal_err, plan_err};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
@@ -10,7 +10,9 @@ use datafusion_physical_plan::metrics::{
     Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet, Time,
 };
 use datafusion_physical_plan::stream::RecordBatchReceiverStream;
-use datafusion_physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use datafusion_physical_plan::{
+    project_schema, DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
+};
 use libcudf_rs::{synchronize_default_stream, CuDFTable};
 use std::any::Any;
 use std::fmt::Formatter;
@@ -19,42 +21,71 @@ use std::sync::Arc;
 
 const DEFAULT_FILES_PER_BATCH: usize = 8;
 
+/// Configuration for a cuDF-backed Parquet scan.
+#[derive(Debug, Clone)]
+pub struct CuDFParquetScanConfig {
+    files: Vec<PathBuf>,
+    file_schema: SchemaRef,
+    projection: Option<Vec<usize>>,
+    files_per_batch: usize,
+}
+
+impl CuDFParquetScanConfig {
+    /// Create a scan config that reads every column from the provided files.
+    pub fn new(files: Vec<PathBuf>, file_schema: SchemaRef) -> Self {
+        Self {
+            files,
+            file_schema,
+            projection: None,
+            files_per_batch: DEFAULT_FILES_PER_BATCH,
+        }
+    }
+
+    /// Set an optional projection using file schema column indices.
+    pub fn with_projection(mut self, projection: Option<Vec<usize>>) -> Self {
+        self.projection = projection;
+        self
+    }
+
+    /// Set the maximum number of files per cuDF read.
+    pub fn with_files_per_batch(mut self, files_per_batch: usize) -> Self {
+        self.files_per_batch = files_per_batch;
+        self
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CuDFParquetReadPlan {
+    batches: Arc<[CuDFParquetFileBatch]>,
+    projected_columns: Option<Arc<[String]>>,
+    file_count: usize,
+    files_per_batch: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CuDFParquetFileBatch {
+    files: Arc<[PathBuf]>,
+    file_bytes: usize,
+}
+
+/// DataFusion execution plan that scans Parquet files directly with cuDF.
 #[derive(Debug)]
 pub struct CuDFParquetScanExec {
-    files: Arc<[PathBuf]>,
-    projected_columns: Option<Arc<[String]>>,
-    files_per_batch: usize,
+    read_plan: CuDFParquetReadPlan,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
 
 impl CuDFParquetScanExec {
-    /// Create a cuDF Parquet scan that reads all columns from the provided files.
-    pub fn try_new(files: Vec<PathBuf>, schema: SchemaRef) -> datafusion::common::Result<Self> {
-        Self::try_new_with_projection(files, schema, None)
-    }
-
-    /// Create a cuDF Parquet scan with an optional projection by schema index.
-    pub fn try_new_with_projection(
-        files: Vec<PathBuf>,
-        file_schema: SchemaRef,
-        projection: Option<Vec<usize>>,
-    ) -> datafusion::common::Result<Self> {
-        Self::try_new_with_projection_and_files_per_batch(
+    /// Create a cuDF Parquet scan from a validated scan config.
+    pub fn try_new(config: CuDFParquetScanConfig) -> datafusion::common::Result<Self> {
+        let CuDFParquetScanConfig {
             files,
             file_schema,
             projection,
-            DEFAULT_FILES_PER_BATCH,
-        )
-    }
+            files_per_batch,
+        } = config;
 
-    /// Create a cuDF Parquet scan with projection and bounded file grouping.
-    pub fn try_new_with_projection_and_files_per_batch(
-        files: Vec<PathBuf>,
-        file_schema: SchemaRef,
-        projection: Option<Vec<usize>>,
-        files_per_batch: usize,
-    ) -> datafusion::common::Result<Self> {
         if files.is_empty() {
             return plan_err!("CuDFParquetScanExec requires at least one parquet file");
         }
@@ -62,11 +93,11 @@ impl CuDFParquetScanExec {
             return plan_err!("CuDFParquetScanExec files_per_batch must be greater than zero");
         }
 
-        let (projected_columns, output_schema) = match projection {
+        let output_schema = project_schema(&file_schema, projection.as_ref())?;
+        let projected_columns = match projection.as_ref() {
             Some(projection) => {
                 let mut columns = Vec::with_capacity(projection.len());
-                let mut fields = Vec::with_capacity(projection.len());
-                for index in projection {
+                for &index in projection {
                     let Some(field) = file_schema.fields().get(index) else {
                         return plan_err!(
                             "CuDFParquetScanExec projection index {index} out of bounds for schema with {} fields",
@@ -74,11 +105,10 @@ impl CuDFParquetScanExec {
                         );
                     };
                     columns.push(field.name().clone());
-                    fields.push(Arc::clone(field));
                 }
-                (Some(Arc::from(columns)), Arc::new(Schema::new(fields)))
+                Some(Arc::from(columns))
             }
-            None => (None, file_schema),
+            None => None,
         };
 
         let properties = Arc::new(PlanProperties::new(
@@ -88,14 +118,50 @@ impl CuDFParquetScanExec {
             Boundedness::Bounded,
         ));
         let files_per_batch = files_per_batch.min(files.len());
+        let read_plan = CuDFParquetReadPlan::new(files, projected_columns, files_per_batch);
 
         Ok(Self {
-            files: files.into(),
-            projected_columns,
-            files_per_batch,
+            read_plan,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         })
+    }
+}
+
+impl CuDFParquetReadPlan {
+    fn new(
+        files: Vec<PathBuf>,
+        projected_columns: Option<Arc<[String]>>,
+        files_per_batch: usize,
+    ) -> Self {
+        let file_count = files.len();
+        let batches = files
+            .chunks(files_per_batch)
+            .map(CuDFParquetFileBatch::new)
+            .collect::<Vec<_>>()
+            .into();
+
+        Self {
+            batches,
+            projected_columns,
+            file_count,
+            files_per_batch,
+        }
+    }
+}
+
+impl CuDFParquetFileBatch {
+    fn new(files: &[PathBuf]) -> Self {
+        let file_bytes = files
+            .iter()
+            .filter_map(|path| std::fs::metadata(path).ok())
+            .map(|metadata| metadata.len() as usize)
+            .sum();
+
+        Self {
+            files: Arc::from(files.to_vec()),
+            file_bytes,
+        }
     }
 }
 
@@ -103,10 +169,12 @@ impl DisplayAs for CuDFParquetScanExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
         write!(
             f,
-            "CuDFParquetScanExec: files={}, files_per_batch={}, projected_columns={}",
-            self.files.len(),
-            self.files_per_batch,
-            self.projected_columns
+            "CuDFParquetScanExec: files={}, batches={}, files_per_batch={}, projected_columns={}",
+            self.read_plan.file_count,
+            self.read_plan.batches.len(),
+            self.read_plan.files_per_batch,
+            self.read_plan
+                .projected_columns
                 .as_ref()
                 .map_or(0, |columns| columns.len())
         )
@@ -155,25 +223,27 @@ impl ExecutionPlan for CuDFParquetScanExec {
         );
 
         let schema = self.schema();
-        let files = Arc::clone(&self.files);
-        let metrics = CuDFParquetScanMetrics::new(&self.metrics, partition)
-            .with_scan_config(self.projected_columns.clone(), self.files_per_batch);
+        let read_plan = self.read_plan.clone();
+        let metrics = CuDFParquetScanMetrics::new(&self.metrics, partition);
         let mut builder = RecordBatchReceiverStream::builder(Arc::clone(&schema), 1);
         let output = builder.tx();
 
         builder.spawn_blocking(move || {
             let compute_timer = metrics.baseline.elapsed_compute().timer();
 
-            for chunk in files.chunks(metrics.files_per_batch) {
-                metrics.record_files(chunk);
+            for batch in read_plan.batches.iter() {
+                metrics.record_file_batch(batch);
 
                 let read_timer = metrics.read_time.timer();
-                let table = match metrics.projected_columns.as_deref() {
-                    Some(columns) => {
-                        CuDFTable::from_parquet_files_with_columns(chunk, Some(columns))
-                            .map_err(cudf_to_df)?
+                let table = match read_plan.projected_columns.as_deref() {
+                    Some(columns) => CuDFTable::from_parquet_files_with_columns(
+                        batch.files.as_ref(),
+                        Some(columns),
+                    )
+                    .map_err(cudf_to_df)?,
+                    None => {
+                        CuDFTable::from_parquet_files(batch.files.as_ref()).map_err(cudf_to_df)?
                     }
-                    None => CuDFTable::from_parquet_files(chunk).map_err(cudf_to_df)?,
                 };
                 read_timer.done();
 
@@ -192,7 +262,10 @@ impl ExecutionPlan for CuDFParquetScanExec {
                 output_batch_timer.done();
 
                 metrics.baseline.record_output(&batch);
-                if output.blocking_send(Ok(batch)).is_err() {
+                let send_timer = metrics.output_send_time.timer();
+                let send_result = output.blocking_send(Ok(batch));
+                send_timer.done();
+                if send_result.is_err() {
                     break;
                 }
             }
@@ -212,11 +285,10 @@ impl ExecutionPlan for CuDFParquetScanExec {
 #[derive(Clone)]
 struct CuDFParquetScanMetrics {
     baseline: CuDFBaselineMetrics,
-    projected_columns: Option<Arc<[String]>>,
-    files_per_batch: usize,
     read_time: Time,
     sync_time: Time,
     output_batch_time: Time,
+    output_send_time: Time,
     files: Count,
     file_bytes: Count,
 }
@@ -225,40 +297,26 @@ impl CuDFParquetScanMetrics {
     fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
         Self {
             baseline: CuDFBaselineMetrics::new(metrics, partition),
-            projected_columns: None,
-            files_per_batch: 1,
             read_time: MetricBuilder::new(metrics).subset_time("read_time", partition),
             sync_time: MetricBuilder::new(metrics).subset_time("sync_time", partition),
             output_batch_time: MetricBuilder::new(metrics)
                 .subset_time("output_batch_time", partition),
+            output_send_time: MetricBuilder::new(metrics)
+                .subset_time("output_send_time", partition),
             files: MetricBuilder::new(metrics).counter("files", partition),
             file_bytes: MetricBuilder::new(metrics).counter("file_bytes", partition),
         }
     }
 
-    fn with_scan_config(
-        mut self,
-        projected_columns: Option<Arc<[String]>>,
-        files_per_batch: usize,
-    ) -> Self {
-        self.projected_columns = projected_columns;
-        self.files_per_batch = files_per_batch.max(1);
-        self
-    }
-
-    fn record_files(&self, paths: &[PathBuf]) {
-        self.files.add(paths.len());
-        for path in paths {
-            if let Ok(metadata) = std::fs::metadata(path) {
-                self.file_bytes.add(metadata.len() as usize);
-            }
-        }
+    fn record_file_batch(&self, batch: &CuDFParquetFileBatch) {
+        self.files.add(batch.files.len());
+        self.file_bytes.add(batch.file_bytes);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::CuDFParquetScanExec;
+    use super::{CuDFParquetScanConfig, CuDFParquetScanExec};
     use datafusion::execution::TaskContext;
     use datafusion_physical_plan::{execute_stream, ExecutionPlan};
     use futures_util::TryStreamExt;
@@ -270,15 +328,14 @@ mod tests {
 
     #[tokio::test]
     async fn reads_parquet_as_cudf_batches() -> Result<(), Box<dyn std::error::Error>> {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../testdata/weather/result-000000.parquet");
+        let path = weather_file("result-000000.parquet");
         let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(&path)?)?;
         let schema = reader.schema().clone();
         let expected_rows = reader.metadata().file_metadata().num_rows() as usize;
         let expected_columns = schema.fields().len();
 
-        let plan: Arc<dyn ExecutionPlan> =
-            Arc::new(CuDFParquetScanExec::try_new(vec![path], schema)?);
+        let config = CuDFParquetScanConfig::new(vec![path], schema);
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(CuDFParquetScanExec::try_new(config)?);
         let batches = execute_stream(plan, Arc::new(TaskContext::default()))?
             .try_collect::<Vec<_>>()
             .await?;
@@ -296,17 +353,14 @@ mod tests {
 
     #[tokio::test]
     async fn reads_projected_parquet_columns() -> Result<(), Box<dyn std::error::Error>> {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../testdata/weather/result-000000.parquet");
+        let path = weather_file("result-000000.parquet");
         let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(&path)?)?;
         let schema = reader.schema().clone();
         let expected_rows = reader.metadata().file_metadata().num_rows() as usize;
 
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(CuDFParquetScanExec::try_new_with_projection(
-            vec![path],
-            schema,
-            Some(vec![0, 1]),
-        )?);
+        let config =
+            CuDFParquetScanConfig::new(vec![path], schema).with_projection(Some(vec![0, 1]));
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(CuDFParquetScanExec::try_new(config)?);
         let batches = execute_stream(plan, Arc::new(TaskContext::default()))?
             .try_collect::<Vec<_>>()
             .await?;
@@ -320,5 +374,44 @@ mod tests {
             .all(|column| is_cudf_array(column.as_ref())));
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn reads_multiple_files_in_bounded_batches() -> Result<(), Box<dyn std::error::Error>> {
+        let paths = vec![
+            weather_file("result-000000.parquet"),
+            weather_file("result-000001.parquet"),
+            weather_file("result-000002.parquet"),
+        ];
+        let mut expected_rows = 0;
+        for path in &paths {
+            let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(path)?)?;
+            expected_rows += reader.metadata().file_metadata().num_rows() as usize;
+        }
+
+        let schema = ParquetRecordBatchReaderBuilder::try_new(File::open(&paths[0])?)?
+            .schema()
+            .clone();
+        let config = CuDFParquetScanConfig::new(paths, schema).with_files_per_batch(2);
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(CuDFParquetScanExec::try_new(config)?);
+        let batches = execute_stream(plan, Arc::new(TaskContext::default()))?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(
+            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+            expected_rows
+        );
+        assert!(batches.iter().all(|batch| batch
+            .columns()
+            .iter()
+            .all(|column| is_cudf_array(column.as_ref()))));
+
+        Ok(())
+    }
+
+    fn weather_file(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("../testdata/weather/{name}"))
     }
 }

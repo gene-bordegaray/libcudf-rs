@@ -11,7 +11,7 @@ mod sort;
 
 pub use cudf_load::CuDFLoadExec;
 pub(crate) use cudf_load::{cudf_schema_compatibility_map, normalize_scalar_for_cudf};
-pub use cudf_parquet_scan::CuDFParquetScanExec;
+pub use cudf_parquet_scan::{CuDFParquetScanConfig, CuDFParquetScanExec};
 pub use cudf_unload::CuDFUnloadExec;
 pub use filter::CuDFFilterExec;
 pub use hash_join::{try_as_cudf_hash_join, CuDFHashJoinExec};

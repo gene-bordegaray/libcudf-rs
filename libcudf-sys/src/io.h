@@ -37,6 +37,23 @@ namespace libcudf_bridge {
         void set_columns(rust::Vec<rust::String> col_names);
     };
 
+    // Opaque wrapper for cudf::io::table_with_metadata.
+    struct TableWithMetadata {
+        cudf::io::table_with_metadata inner;
+
+        explicit TableWithMetadata(cudf::io::table_with_metadata result);
+
+        ~TableWithMetadata();
+
+        std::unique_ptr<Table> release_table();
+
+        [[nodiscard]] size_t num_rows_per_source_count() const;
+
+        [[nodiscard]] size_t num_rows_per_source(size_t index) const;
+
+        [[nodiscard]] int32_t num_input_row_groups() const;
+    };
+
     std::unique_ptr<SourceInfo> source_info_from_file_path(rust::Str file_path);
 
     std::unique_ptr<SourceInfo> source_info_from_file_paths(rust::Vec<rust::String> file_paths);
@@ -49,7 +66,7 @@ namespace libcudf_bridge {
         ParquetReaderOptions& options,
         rust::Vec<rust::String> col_names);
 
-    std::unique_ptr<Table> read_parquet_with_options(
+    std::unique_ptr<TableWithMetadata> read_parquet_with_options(
         const ParquetReaderOptions& options,
         const CudaStreamView& stream,
         const DeviceAsyncResourceRef& mr);

@@ -14,5 +14,5 @@ mod planner;
 #[cfg(any(feature = "integration", test))]
 pub mod test_utils;
 
-pub use physical::{CuDFLoadExec, CuDFParquetScanExec, CuDFUnloadExec};
+pub use physical::{CuDFLoadExec, CuDFParquetScanConfig, CuDFParquetScanExec, CuDFUnloadExec};
 pub use planner::{CuDFConfig, SessionStateBuilderExt};

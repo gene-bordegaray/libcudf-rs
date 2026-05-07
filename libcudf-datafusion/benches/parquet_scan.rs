@@ -7,7 +7,7 @@ use datafusion::execution::{SessionStateBuilder, TaskContext};
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 use datafusion_physical_plan::{execute_stream, ExecutionPlan};
 use futures_util::TryStreamExt;
-use libcudf_datafusion::{CuDFLoadExec, CuDFParquetScanExec};
+use libcudf_datafusion::{CuDFLoadExec, CuDFParquetScanConfig, CuDFParquetScanExec};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::env;
 use std::fs;
@@ -126,15 +126,10 @@ fn cudf_scan_plan(
     projection: Option<Vec<usize>>,
     files_per_batch: usize,
 ) -> Arc<dyn ExecutionPlan> {
-    Arc::new(
-        CuDFParquetScanExec::try_new_with_projection_and_files_per_batch(
-            files,
-            schema,
-            projection,
-            files_per_batch,
-        )
-        .unwrap(),
-    )
+    let config = CuDFParquetScanConfig::new(files, schema)
+        .with_projection(projection)
+        .with_files_per_batch(files_per_batch);
+    Arc::new(CuDFParquetScanExec::try_new(config).unwrap())
 }
 
 fn projection_for_columns(schema: &SchemaRef, columns: &[String]) -> Option<Vec<usize>> {
