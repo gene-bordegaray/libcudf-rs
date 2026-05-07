@@ -4,11 +4,12 @@ use crate::table_view::CuDFTableView;
 use crate::{CuDFColumn, CuDFColumnView, CuDFTable};
 use cxx::UniquePtr;
 use libcudf_sys::ffi::{
-    self, aggregation_request_create, make_count_aggregation_groupby, make_max_aggregation_groupby,
-    make_mean_aggregation_groupby, make_median_aggregation_groupby, make_min_aggregation_groupby,
-    make_nunique_aggregation_groupby, make_std_aggregation_groupby, make_sum_aggregation_groupby,
-    make_variance_aggregation_groupby,
+    self, aggregation_request_create, aggregation_requests_create, make_count_aggregation_groupby,
+    make_max_aggregation_groupby, make_mean_aggregation_groupby, make_median_aggregation_groupby,
+    make_min_aggregation_groupby, make_nunique_aggregation_groupby, make_std_aggregation_groupby,
+    make_sum_aggregation_groupby, make_variance_aggregation_groupby,
 };
+use libcudf_sys::{NullPolicy, Sorted};
 use std::sync::Arc;
 
 /// A group-by operation builder
@@ -27,7 +28,15 @@ impl CuDFGroupBy {
     /// The keys determine how rows are grouped. Rows with matching key
     /// values will be grouped together for aggregation.
     pub fn from_table_view(view: CuDFTableView) -> Self {
-        let inner = ffi::groupby_create(view.inner());
+        let column_order: &[i32] = &[];
+        let null_precedence: &[i32] = &[];
+        let inner = ffi::groupby_create(
+            view.inner(),
+            NullPolicy::Exclude as i32,
+            Sorted::No as i32,
+            column_order,
+            null_precedence,
+        );
         Self {
             _ref: Some(Arc::new(view)),
             inner,
@@ -39,19 +48,18 @@ impl CuDFGroupBy {
     /// Each request specifies a column to aggregate and the aggregations
     /// to perform on it. Returns the unique group keys and aggregation
     /// results for each group.
-    pub fn aggregate(
-        &self,
-        requests: &[AggregationRequest],
-    ) -> Result<(CuDFTable, Vec<Vec<CuDFColumn>>)> {
-        let mut _refs = Vec::with_capacity(requests.len());
-        let requests = requests
-            .iter()
-            .map(|x| {
-                _refs.push(x._ref.clone());
-                x.inner.as_ptr()
-            })
-            .collect::<Vec<_>>();
-        let mut gby_result = self.inner.aggregate(&requests)?;
+    pub fn aggregate<I>(&self, requests: I) -> Result<(CuDFTable, Vec<Vec<CuDFColumn>>)>
+    where
+        I: IntoIterator<Item = AggregationRequest>,
+    {
+        let mut _refs = Vec::new();
+        let mut requests_inner = aggregation_requests_create();
+        for request in requests {
+            _refs.push(request._ref.clone());
+            requests_inner.pin_mut().add(request.inner);
+        }
+
+        let mut gby_result = self.inner.aggregate(&requests_inner)?;
         let keys = gby_result.pin_mut().release_keys();
         let keys = CuDFTable::from_ptr(keys);
 
@@ -96,25 +104,28 @@ impl AggregationRequest {
     ///
     /// Multiple aggregations can be added to aggregate the same column
     /// in different ways (e.g., both SUM and COUNT).
-    pub fn add(&mut self, aggregation: Aggregation) {
+    pub fn add(&mut self, aggregation: GroupByAggregation) {
         self.inner.add(aggregation.inner);
     }
 }
 
-/// An aggregation operation specification
+/// A groupby aggregation operation specification
 ///
 /// Specifies how to aggregate values within each group. Created using
 /// factory methods from `AggregationOp`.
-pub struct Aggregation {
-    inner: UniquePtr<ffi::Aggregation>,
+pub struct GroupByAggregation {
+    inner: UniquePtr<ffi::GroupByAggregation>,
 }
 
-impl Aggregation {
-    /// Create an aggregation from a cuDF aggregation pointer
-    pub fn new(inner: UniquePtr<ffi::Aggregation>) -> Self {
+impl GroupByAggregation {
+    /// Create a groupby aggregation from a cuDF aggregation pointer
+    pub fn new(inner: UniquePtr<ffi::GroupByAggregation>) -> Self {
         Self { inner }
     }
 }
+
+/// Backwards-compatible alias for groupby aggregations.
+pub type Aggregation = GroupByAggregation;
 
 /// Types of aggregation operations
 ///
@@ -157,18 +168,22 @@ impl AggregationOp {
     /// let sum_agg = AggregationOp::SUM.group_by();
     /// let count_agg = AggregationOp::COUNT.group_by();
     /// ```
-    pub fn group_by(&self) -> Aggregation {
+    pub fn group_by(&self) -> GroupByAggregation {
         use AggregationOp::*;
         match self {
-            SUM => Aggregation::new(make_sum_aggregation_groupby()),
-            MIN => Aggregation::new(make_min_aggregation_groupby()),
-            MAX => Aggregation::new(make_max_aggregation_groupby()),
-            MEAN => Aggregation::new(make_mean_aggregation_groupby()),
-            COUNT => Aggregation::new(make_count_aggregation_groupby()),
-            VARIANCE { ddof } => Aggregation::new(make_variance_aggregation_groupby(*ddof)),
-            STD { ddof } => Aggregation::new(make_std_aggregation_groupby(*ddof)),
-            NUNIQUE => Aggregation::new(make_nunique_aggregation_groupby()),
-            MEDIAN => Aggregation::new(make_median_aggregation_groupby()),
+            SUM => GroupByAggregation::new(make_sum_aggregation_groupby()),
+            MIN => GroupByAggregation::new(make_min_aggregation_groupby()),
+            MAX => GroupByAggregation::new(make_max_aggregation_groupby()),
+            MEAN => GroupByAggregation::new(make_mean_aggregation_groupby()),
+            COUNT => {
+                GroupByAggregation::new(make_count_aggregation_groupby(NullPolicy::Exclude as i32))
+            }
+            VARIANCE { ddof } => GroupByAggregation::new(make_variance_aggregation_groupby(*ddof)),
+            STD { ddof } => GroupByAggregation::new(make_std_aggregation_groupby(*ddof)),
+            NUNIQUE => GroupByAggregation::new(make_nunique_aggregation_groupby(
+                NullPolicy::Exclude as i32,
+            )),
+            MEDIAN => GroupByAggregation::new(make_median_aggregation_groupby()),
         }
     }
 }
@@ -298,7 +313,7 @@ mod tests {
         let mut request = AggregationRequest::from_column_view(values_col.into_view());
         request.add(AggregationOp::SUM.group_by());
 
-        let (result_keys, results) = groupby.aggregate(&[request])?;
+        let (result_keys, results) = groupby.aggregate([request])?;
 
         assert_eq!(result_keys.num_rows(), 2);
 
@@ -350,7 +365,7 @@ mod tests {
         let mut request = AggregationRequest::from_column_view(values_col.into_view());
         request.add(agg_op.group_by());
 
-        let (_result_keys, results) = groupby.aggregate(&[request])?;
+        let (_result_keys, results) = groupby.aggregate([request])?;
         let result_col = results
             .into_iter()
             .next()

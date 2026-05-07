@@ -185,7 +185,7 @@ impl CuDFAggregateStream {
 
         let (chunk_keys, chunk_results) = {
             let _timer = self.group_by_metrics.aggregation_time.timer();
-            group_by.aggregate(&requests).map_err(cudf_to_df)?
+            group_by.aggregate(requests).map_err(cudf_to_df)?
         };
         let mut chunk_state_columns = chunk_results.into_iter().flatten().collect();
 
@@ -290,7 +290,7 @@ impl CuDFAggregateStream {
         let group_by = CuDFGroupBy::from_table_view(combined_keys.into_view());
         let (merged_keys, merged_results) = {
             let _timer = self.group_by_metrics.aggregation_time.timer();
-            group_by.aggregate(&requests).map_err(cudf_to_df)?
+            group_by.aggregate(requests).map_err(cudf_to_df)?
         };
         let merged_state_columns = merged_results.into_iter().flatten().collect();
 

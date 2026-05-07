@@ -4,6 +4,7 @@
 #include <cudf/table/table.hpp>
 #include <cudf/groupby.hpp>
 #include <cudf/aggregation.hpp>
+#include <cudf/types.hpp>
 
 namespace libcudf_bridge {
     // ColumnVectorHelper implementation
@@ -26,34 +27,14 @@ namespace libcudf_bridge {
         return std::make_unique<Column>(std::move(columns[index]));
     }
 
-    // Aggregation implementation
-    Aggregation::Aggregation() : inner(nullptr) {
-    }
-
-    Aggregation::~Aggregation() = default;
-
     // GroupBy implementation
     GroupBy::GroupBy() : inner(nullptr) {
     }
 
     GroupBy::~GroupBy() = default;
 
-    // TODO: this is big, there are clones... I'm not sure if this is right.
-    std::unique_ptr<GroupByResult> GroupBy::aggregate(rust::Slice<const AggregationRequest * const> requests) const {
-        std::vector<cudf::groupby::aggregation_request> cudf_requests;
-        cudf_requests.reserve(requests.size());
-        for (auto *req: requests) {
-            cudf::groupby::aggregation_request cudf_req;
-            cudf_req.values = req->inner->values;
-            for (auto &agg: req->inner->aggregations) {
-                auto cloned = agg->clone();
-                auto *groupby_agg = dynamic_cast<cudf::groupby_aggregation *>(cloned.release());
-                cudf_req.aggregations.push_back(std::unique_ptr<cudf::groupby_aggregation>(groupby_agg));
-            }
-            cudf_requests.push_back(std::move(cudf_req));
-        }
-
-        auto aggregate_result = inner->aggregate(cudf_requests);
+    std::unique_ptr<GroupByResult> GroupBy::aggregate(const AggregationRequests &requests) const {
+        auto aggregate_result = inner->aggregate(requests.inner);
 
         auto group_by_result = std::make_unique<GroupByResult>();
         group_by_result->keys.inner = std::move(aggregate_result.first);
@@ -76,9 +57,16 @@ namespace libcudf_bridge {
 
     AggregationRequest::~AggregationRequest() = default;
 
-    void AggregationRequest::add(std::unique_ptr<Aggregation> agg) const {
-        auto *groupby_agg = dynamic_cast<cudf::groupby_aggregation *>(agg->inner.release());
-        inner->aggregations.push_back(std::unique_ptr<cudf::groupby_aggregation>(groupby_agg));
+    void AggregationRequest::add(std::unique_ptr<GroupByAggregation> agg) const {
+        inner->aggregations.push_back(std::move(agg->inner));
+    }
+
+    AggregationRequests::AggregationRequests() = default;
+
+    AggregationRequests::~AggregationRequests() = default;
+
+    void AggregationRequests::add(std::unique_ptr<AggregationRequest> request) {
+        inner.push_back(std::move(*request->inner));
     }
 
     // GroupByResult implementation
@@ -107,5 +95,43 @@ namespace libcudf_bridge {
         auto helper = std::make_unique<ColumnVectorHelper>();
         helper->columns = std::move(results[index]);
         return helper;
+    }
+
+    std::unique_ptr<GroupBy> groupby_create(
+        const TableView &keys,
+        int32_t null_handling,
+        int32_t keys_are_sorted,
+        rust::Slice<const int32_t> column_order,
+        rust::Slice<const int32_t> null_precedence) {
+        std::vector<cudf::order> orders;
+        orders.reserve(column_order.size());
+        for (auto ord: column_order) {
+            orders.push_back(static_cast<cudf::order>(ord));
+        }
+
+        std::vector<cudf::null_order> null_orders;
+        null_orders.reserve(null_precedence.size());
+        for (auto null_ord: null_precedence) {
+            null_orders.push_back(static_cast<cudf::null_order>(null_ord));
+        }
+
+        auto result = std::make_unique<GroupBy>();
+        result->inner = std::make_unique<cudf::groupby::groupby>(
+            *keys.inner,
+            static_cast<cudf::null_policy>(null_handling),
+            static_cast<cudf::sorted>(keys_are_sorted),
+            orders,
+            null_orders);
+        return result;
+    }
+
+    std::unique_ptr<AggregationRequest> aggregation_request_create(const ColumnView &values) {
+        auto result = std::make_unique<AggregationRequest>();
+        result->inner->values = *values.inner;
+        return result;
+    }
+
+    std::unique_ptr<AggregationRequests> aggregation_requests_create() {
+        return std::make_unique<AggregationRequests>();
     }
 } // namespace libcudf_bridge

@@ -76,11 +76,11 @@ pub mod ffi {
         /// Owning cuDF AST expression tree.
         type AstExpressionTree;
 
-        /// Abstract base class for specifying aggregation operations
-        ///
-        /// Represents the desired aggregation in an aggregation_request. Different aggregation
-        /// types (SUM, MIN, MAX, MEAN, COUNT, etc.) are created using factory functions.
-        type Aggregation;
+        /// Aggregation operation accepted by cuDF reductions.
+        type ReduceAggregation;
+
+        /// Aggregation operation accepted by cuDF groupby aggregation requests.
+        type GroupByAggregation;
 
         /// Groups values by keys and computes aggregations on those groups
         ///
@@ -158,6 +158,16 @@ pub mod ffi {
         /// need to worry about invalidating a stream at the moment.
         fn is_valid(self: &CudaStream) -> bool;
 
+        /// Request for groupby aggregation(s) to perform on a column
+        ///
+        /// The group membership of each value is determined by the corresponding row
+        /// in the original order of keys used to construct the groupby. Contains a column
+        /// of values to aggregate and a set of aggregations to perform on those elements.
+        type AggregationRequest;
+
+        /// Contiguous storage for groupby aggregation requests.
+        type AggregationRequests;
+
         // GroupBy methods - direct cuDF class methods
 
         /// Performs grouped aggregations on the specified values
@@ -166,20 +176,16 @@ pub mod ffi {
         /// `values[j]` where rows `i` and `j` in `keys` are equivalent.
         fn aggregate(
             self: &GroupBy,
-            requests: &[*const AggregationRequest],
+            requests: &AggregationRequests,
         ) -> Result<UniquePtr<GroupByResult>>;
-
-        /// Request for groupby aggregation(s) to perform on a column
-        ///
-        /// The group membership of each value is determined by the corresponding row
-        /// in the original order of keys used to construct the groupby. Contains a column
-        /// of values to aggregate and a set of aggregations to perform on those elements.
-        type AggregationRequest;
 
         // AggregationRequest methods
 
         /// Add an aggregation to this request
-        fn add(self: &AggregationRequest, agg: UniquePtr<Aggregation>);
+        fn add(self: &AggregationRequest, agg: UniquePtr<GroupByAggregation>);
+
+        /// Add an aggregation request to the request span.
+        fn add(self: Pin<&mut AggregationRequests>, request: UniquePtr<AggregationRequest>);
 
         /// Helper to extract columns from a vector by moving them
         type ColumnVectorHelper;
@@ -601,60 +607,60 @@ pub mod ffi {
         // Aggregation factory functions - direct cuDF mappings (for reduce)
 
         /// Create a SUM aggregation
-        fn make_sum_aggregation() -> UniquePtr<Aggregation>;
+        fn make_sum_aggregation() -> UniquePtr<ReduceAggregation>;
 
         /// Create a MIN aggregation
-        fn make_min_aggregation() -> UniquePtr<Aggregation>;
+        fn make_min_aggregation() -> UniquePtr<ReduceAggregation>;
 
         /// Create a MAX aggregation
-        fn make_max_aggregation() -> UniquePtr<Aggregation>;
+        fn make_max_aggregation() -> UniquePtr<ReduceAggregation>;
 
         /// Create a MEAN aggregation
-        fn make_mean_aggregation() -> UniquePtr<Aggregation>;
+        fn make_mean_aggregation() -> UniquePtr<ReduceAggregation>;
 
         /// Create a COUNT aggregation
-        fn make_count_aggregation() -> UniquePtr<Aggregation>;
+        fn make_count_aggregation(null_handling: i32) -> UniquePtr<ReduceAggregation>;
 
         /// Create a VARIANCE aggregation
-        fn make_variance_aggregation(ddof: i32) -> UniquePtr<Aggregation>;
+        fn make_variance_aggregation(ddof: i32) -> UniquePtr<ReduceAggregation>;
 
         /// Create a STD aggregation
-        fn make_std_aggregation(ddof: i32) -> UniquePtr<Aggregation>;
+        fn make_std_aggregation(ddof: i32) -> UniquePtr<ReduceAggregation>;
 
         /// Create a NUNIQUE aggregation
-        fn make_nunique_aggregation() -> UniquePtr<Aggregation>;
+        fn make_nunique_aggregation(null_handling: i32) -> UniquePtr<ReduceAggregation>;
 
         /// Create a MEDIAN aggregation
-        fn make_median_aggregation() -> UniquePtr<Aggregation>;
+        fn make_median_aggregation() -> UniquePtr<ReduceAggregation>;
 
         // Aggregation factory functions - direct cuDF mappings (for groupby)
 
         /// Create a SUM aggregation for groupby operations
-        fn make_sum_aggregation_groupby() -> UniquePtr<Aggregation>;
+        fn make_sum_aggregation_groupby() -> UniquePtr<GroupByAggregation>;
 
         /// Create a MIN aggregation for groupby operations
-        fn make_min_aggregation_groupby() -> UniquePtr<Aggregation>;
+        fn make_min_aggregation_groupby() -> UniquePtr<GroupByAggregation>;
 
         /// Create a MAX aggregation for groupby operations
-        fn make_max_aggregation_groupby() -> UniquePtr<Aggregation>;
+        fn make_max_aggregation_groupby() -> UniquePtr<GroupByAggregation>;
 
         /// Create a MEAN aggregation for groupby operations
-        fn make_mean_aggregation_groupby() -> UniquePtr<Aggregation>;
+        fn make_mean_aggregation_groupby() -> UniquePtr<GroupByAggregation>;
 
         /// Create a COUNT aggregation for groupby operations
-        fn make_count_aggregation_groupby() -> UniquePtr<Aggregation>;
+        fn make_count_aggregation_groupby(null_handling: i32) -> UniquePtr<GroupByAggregation>;
 
         /// Create a VARIANCE aggregation for groupby operations
-        fn make_variance_aggregation_groupby(ddof: i32) -> UniquePtr<Aggregation>;
+        fn make_variance_aggregation_groupby(ddof: i32) -> UniquePtr<GroupByAggregation>;
 
         /// Create a STD aggregation for groupby operations
-        fn make_std_aggregation_groupby(ddof: i32) -> UniquePtr<Aggregation>;
+        fn make_std_aggregation_groupby(ddof: i32) -> UniquePtr<GroupByAggregation>;
 
         /// Create a NUNIQUE aggregation for groupby operations
-        fn make_nunique_aggregation_groupby() -> UniquePtr<Aggregation>;
+        fn make_nunique_aggregation_groupby(null_handling: i32) -> UniquePtr<GroupByAggregation>;
 
         /// Create a MEDIAN aggregation for groupby operations
-        fn make_median_aggregation_groupby() -> UniquePtr<Aggregation>;
+        fn make_median_aggregation_groupby() -> UniquePtr<GroupByAggregation>;
 
         // Reduction - direct cuDF mapping
 
@@ -663,9 +669,17 @@ pub mod ffi {
         /// This function does not detect overflows in reductions. Any null values are skipped
         /// for the operation. If the reduction fails, the output scalar returns with `is_valid()==false`.
         fn reduce(
-            col: &Column,
-            agg: &Aggregation,
-            output_type_id: i32,
+            col: &ColumnView,
+            agg: &ReduceAggregation,
+            output_type: &DataType,
+        ) -> Result<UniquePtr<Scalar>>;
+
+        /// Computes a reduction with an initial scalar value.
+        fn reduce_with_init(
+            col: &ColumnView,
+            agg: &ReduceAggregation,
+            output_type: &DataType,
+            init: &Scalar,
         ) -> Result<UniquePtr<Scalar>>;
 
         // GroupBy operations - direct cuDF mappings
@@ -673,13 +687,22 @@ pub mod ffi {
         /// Construct a groupby object with the specified keys
         ///
         /// The groupby object groups values by keys and computes aggregations on those groups.
-        fn groupby_create(keys: &TableView) -> UniquePtr<GroupBy>;
+        fn groupby_create(
+            keys: &TableView,
+            null_handling: i32,
+            keys_are_sorted: i32,
+            column_order: &[i32],
+            null_precedence: &[i32],
+        ) -> UniquePtr<GroupBy>;
 
         /// Create an aggregation request for a column of values
         ///
         /// The group membership of each `value[i]` is determined by the corresponding row `i`
         /// in the original order of `keys` used to construct the groupby.
         fn aggregation_request_create(values: &ColumnView) -> UniquePtr<AggregationRequest>;
+
+        /// Create contiguous storage for groupby aggregation requests.
+        fn aggregation_requests_create() -> UniquePtr<AggregationRequests>;
 
         // Arrow interop - direct cuDF calls
 
@@ -785,6 +808,26 @@ pub enum NullOrder {
     After = 0,
     /// Nulls appear before all other values
     Before = 1,
+}
+
+/// Null handling policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum NullPolicy {
+    /// Exclude null elements.
+    Exclude = 0,
+    /// Include null elements.
+    Include = 1,
+}
+
+/// Whether values are known to be sorted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum Sorted {
+    /// Values are not known to be sorted.
+    No = 0,
+    /// Values are known to be sorted.
+    Yes = 1,
 }
 
 /// Policy for out-of-bounds gather indices.
@@ -1288,11 +1331,17 @@ unsafe impl Send for ffi::AstExpressionTree {}
 /// SAFETY: AstExpressionTree can be safely accessed from multiple threads after construction.
 unsafe impl Sync for ffi::AstExpressionTree {}
 
-/// SAFETY: Aggregation is a configuration object with no thread-local state.
-unsafe impl Send for ffi::Aggregation {}
+/// SAFETY: ReduceAggregation is a configuration object with no thread-local state.
+unsafe impl Send for ffi::ReduceAggregation {}
 
-/// SAFETY: Aggregation can be safely accessed from multiple threads.
-unsafe impl Sync for ffi::Aggregation {}
+/// SAFETY: ReduceAggregation can be safely accessed from multiple threads.
+unsafe impl Sync for ffi::ReduceAggregation {}
+
+/// SAFETY: GroupByAggregation is a configuration object with no thread-local state.
+unsafe impl Send for ffi::GroupByAggregation {}
+
+/// SAFETY: GroupByAggregation can be safely accessed from multiple threads.
+unsafe impl Sync for ffi::GroupByAggregation {}
 
 /// SAFETY: GroupBy configuration can be sent between threads.
 unsafe impl Send for ffi::GroupBy {}
@@ -1308,6 +1357,12 @@ unsafe impl Send for ffi::AggregationRequest {}
 
 /// SAFETY: AggregationRequest configuration can be accessed from multiple threads.
 unsafe impl Sync for ffi::AggregationRequest {}
+
+/// SAFETY: AggregationRequests owns request configuration and can be sent between threads.
+unsafe impl Send for ffi::AggregationRequests {}
+
+/// SAFETY: AggregationRequests can be safely accessed from multiple threads during aggregation.
+unsafe impl Sync for ffi::AggregationRequests {}
 
 /// SAFETY: GroupByResult contains GPU data that can be sent between threads.
 unsafe impl Send for ffi::GroupByResult {}
@@ -1325,7 +1380,7 @@ unsafe impl Sync for ffi::CudaStream {}
 mod tests {
     use super::*;
     use crate::ffi::ColumnView;
-    use arrow::array::{make_array, Array, Int32Array, RecordBatch, StructArray};
+    use arrow::array::{make_array, Array, Decimal128Array, Int32Array, RecordBatch, StructArray};
     use arrow::ffi::{from_ffi, from_ffi_and_data_type, FFI_ArrowArray};
     use arrow::util::pretty::{pretty_format_batches, pretty_format_columns};
     use arrow_schema::ffi::FFI_ArrowSchema;
@@ -1563,6 +1618,83 @@ mod tests {
     }
 
     #[test]
+    fn test_reduce_uses_full_output_data_type() -> Result<(), Box<dyn std::error::Error>> {
+        let table = table_from_decimal128_column("amount", vec![12345, 67890], 2)?;
+        let column = table.view().column(0);
+        let output_type = ffi::new_data_type_with_scale(TypeId::Decimal128 as i32, -2);
+
+        let result = ffi::reduce(&column, &ffi::make_sum_aggregation(), &output_type)?;
+        let result_type = result.data_type();
+
+        assert!(result.is_valid());
+        assert_eq!(result_type.id(), TypeId::Decimal128 as i32);
+        assert_eq!(result_type.scale(), -2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_reduce_with_init() -> Result<(), Box<dyn std::error::Error>> {
+        let table = table_from_i32_columns(&[("values", vec![1, 2, 3])])?;
+        let values = table.view().column(0);
+        let init_table = table_from_i32_columns(&[("init", vec![10])])?;
+        let init = ffi::get_element(&init_table.view().column(0), 0);
+        let output_type = ffi::new_data_type(TypeId::Int32 as i32);
+
+        let result =
+            ffi::reduce_with_init(&values, &ffi::make_sum_aggregation(), &output_type, &init)?;
+        let result_column = ffi::make_column_from_scalar(&result, 1)?;
+
+        assert_snapshot!(pretty_column(&result_column.view(), DataType::Int32)?, @r"
+        +------+
+        | test |
+        +------+
+        | 16   |
+        +------+
+        ");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_count_aggregation_respects_null_policy() -> Result<(), Box<dyn std::error::Error>> {
+        let table = table_from_nullable_i32_column("values", vec![Some(1), None, Some(3), None])?;
+        let values = table.view().column(0);
+        let output_type = ffi::new_data_type(TypeId::Int32 as i32);
+
+        let exclude = ffi::reduce(
+            &values,
+            &ffi::make_count_aggregation(NullPolicy::Exclude as i32),
+            &output_type,
+        )?;
+        let include = ffi::reduce(
+            &values,
+            &ffi::make_count_aggregation(NullPolicy::Include as i32),
+            &output_type,
+        )?;
+
+        let exclude_column = ffi::make_column_from_scalar(&exclude, 1)?;
+        let include_column = ffi::make_column_from_scalar(&include, 1)?;
+
+        assert_snapshot!(pretty_column(&exclude_column.view(), DataType::Int32)?, @r"
+        +------+
+        | test |
+        +------+
+        | 2    |
+        +------+
+        ");
+        assert_snapshot!(pretty_column(&include_column.view(), DataType::Int32)?, @r"
+        +------+
+        | test |
+        +------+
+        | 4    |
+        +------+
+        ");
+
+        Ok(())
+    }
+
+    #[test]
     fn test_ast_filter_join_indices() -> Result<(), Box<dyn std::error::Error>> {
         let left =
             table_from_i32_columns(&[("key", vec![1, 2, 2, 3]), ("val", vec![10, 20, 25, 30])])?;
@@ -1648,14 +1780,23 @@ mod tests {
         let table = ffi::read_parquet("../testdata/weather/result-000000.parquet")?;
         let table_view = table.view();
 
-        let groupby = ffi::groupby_create(&table_view.select(&[21]));
+        let column_order: &[i32] = &[];
+        let null_precedence: &[i32] = &[];
+        let groupby = ffi::groupby_create(
+            &table_view.select(&[21]),
+            NullPolicy::Exclude as i32,
+            Sorted::No as i32,
+            column_order,
+            null_precedence,
+        );
 
         let value_column = table_view.column(1);
         let mut request = ffi::aggregation_request_create(&value_column);
         request.pin_mut().add(ffi::make_max_aggregation_groupby());
 
-        let agg_requests = &[&*request as *const ffi::AggregationRequest];
-        let mut groupby_result = groupby.aggregate(agg_requests)?;
+        let mut agg_requests = ffi::aggregation_requests_create();
+        agg_requests.pin_mut().add(request);
+        let mut groupby_result = groupby.aggregate(&agg_requests)?;
 
         let mut aggregation_result = groupby_result.pin_mut().release_result(0);
         let keys = groupby_result.pin_mut().release_keys();
@@ -1675,7 +1816,15 @@ mod tests {
         let table_view = table.view();
 
         let keys_view = table_view.select(&[0]);
-        let groupby = ffi::groupby_create(&keys_view);
+        let column_order: &[i32] = &[];
+        let null_precedence: &[i32] = &[];
+        let groupby = ffi::groupby_create(
+            &keys_view,
+            NullPolicy::Exclude as i32,
+            Sorted::No as i32,
+            column_order,
+            null_precedence,
+        );
 
         let value_column = table_view.column(1);
         let mut agg_request = ffi::aggregation_request_create(&value_column);
@@ -1689,8 +1838,9 @@ mod tests {
             .pin_mut()
             .add(ffi::make_max_aggregation_groupby());
 
-        let requests = &[&*agg_request as *const ffi::AggregationRequest];
-        let mut groupby_result = groupby.aggregate(requests)?;
+        let mut requests = ffi::aggregation_requests_create();
+        requests.pin_mut().add(agg_request);
+        let mut groupby_result = groupby.aggregate(&requests)?;
 
         assert_eq!(groupby_result.len(), 1);
         let mut agg_result = groupby_result.pin_mut().release_result(0);
@@ -1815,6 +1965,44 @@ mod tests {
             .map(|(_, values)| Arc::new(Int32Array::from(values.clone())) as _)
             .collect();
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), arrays)?;
+        let struct_array = StructArray::from(batch);
+        let array_data = struct_array.into_data();
+        let ffi_array = FFI_ArrowArray::new(&array_data);
+        let ffi_schema = FFI_ArrowSchema::try_from(schema)?;
+        let device_array = ArrowDeviceArray::new_cpu().with_array(ffi_array);
+
+        let schema_ptr = &ffi_schema as *const FFI_ArrowSchema as *const u8;
+        let device_array_ptr = &device_array as *const ArrowDeviceArray as *const u8;
+        Ok(unsafe { ffi::table_from_arrow_host(schema_ptr, device_array_ptr) }?)
+    }
+
+    fn table_from_nullable_i32_column(
+        name: &str,
+        values: Vec<Option<i32>>,
+    ) -> Result<cxx::UniquePtr<ffi::Table>, Box<dyn std::error::Error>> {
+        let schema = Schema::new(vec![Field::new(name, DataType::Int32, true)]);
+        let array = Int32Array::from(values);
+        let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(array)])?;
+        let struct_array = StructArray::from(batch);
+        let array_data = struct_array.into_data();
+        let ffi_array = FFI_ArrowArray::new(&array_data);
+        let ffi_schema = FFI_ArrowSchema::try_from(schema)?;
+        let device_array = ArrowDeviceArray::new_cpu().with_array(ffi_array);
+
+        let schema_ptr = &ffi_schema as *const FFI_ArrowSchema as *const u8;
+        let device_array_ptr = &device_array as *const ArrowDeviceArray as *const u8;
+        Ok(unsafe { ffi::table_from_arrow_host(schema_ptr, device_array_ptr) }?)
+    }
+
+    fn table_from_decimal128_column(
+        name: &str,
+        values: Vec<i128>,
+        scale: i8,
+    ) -> Result<cxx::UniquePtr<ffi::Table>, Box<dyn std::error::Error>> {
+        let data_type = DataType::Decimal128(38, scale);
+        let schema = Schema::new(vec![Field::new(name, data_type.clone(), false)]);
+        let array = Decimal128Array::from(values).with_precision_and_scale(38, scale)?;
+        let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(array)])?;
         let struct_array = StructArray::from(batch);
         let array_data = struct_array.into_data();
         let ffi_array = FFI_ArrowArray::new(&array_data);
