@@ -1766,6 +1766,26 @@ mod integration {
         Ok(())
     }
 
+    async fn check_filtered_join_sql(sql: &str) -> Result<(), Box<dyn Error>> {
+        let setup = r#"
+            CREATE TABLE filter_left (k INT, v INT) AS VALUES
+                (1, 10), (2, 20), (2, 30), (4, 40);
+            CREATE TABLE filter_right (k INT, v INT) AS VALUES
+                (2, 25), (3, 35), (5, 50), (6, 60), (7, 70)
+        "#;
+
+        let cudf_tf = TestFramework::new().await;
+        let cpu_tf = TestFramework::new().await;
+        let cudf = cudf_tf
+            .execute(&format!("SET cudf.enable=true; {setup}; {sql}"))
+            .await?;
+        let cpu = cpu_tf.execute(&format!("{setup}; {sql}")).await?;
+        assert_contains!(&cudf.plan, "CuDFHashJoinExec");
+        assert_contains!(&cudf.plan, "filter=");
+        assert_eq!(cpu.pretty_print, cudf.pretty_print);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_inner_join() -> Result<(), Box<dyn Error>> {
         check(
@@ -1782,6 +1802,45 @@ mod integration {
             r#"SELECT a."MinTemp", a."MaxTemp" FROM weather a
                JOIN weather b ON a."MinTemp" = b."MinTemp" AND a."MaxTemp" = b."MaxTemp"
                ORDER BY a."MinTemp", a."MaxTemp" LIMIT 10"#,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_filtered_inner_join_sql() -> Result<(), Box<dyn Error>> {
+        check_filtered_join_sql(
+            r#"
+            SELECT l.k AS lk, l.v AS lv, r.k AS rk, r.v AS rv
+            FROM filter_left l
+            JOIN filter_right r ON l.k = r.k AND l.v < r.v
+            ORDER BY lk, lv, rk, rv
+            "#,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_filtered_left_join_sql() -> Result<(), Box<dyn Error>> {
+        check_filtered_join_sql(
+            r#"
+            SELECT l.k AS lk, l.v AS lv, r.k AS rk, r.v AS rv
+            FROM filter_left l
+            LEFT JOIN filter_right r ON l.k = r.k AND l.v < r.v
+            ORDER BY lk, lv, rk, rv
+            "#,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_filtered_full_join_sql() -> Result<(), Box<dyn Error>> {
+        check_filtered_join_sql(
+            r#"
+            SELECT l.k AS lk, l.v AS lv, r.k AS rk, r.v AS rv
+            FROM filter_left l
+            FULL JOIN filter_right r ON l.k = r.k AND l.v < r.v
+            ORDER BY COALESCE(l.k, r.k), l.v, r.v
+            "#,
         )
         .await
     }
