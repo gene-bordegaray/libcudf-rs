@@ -11,112 +11,126 @@
 #include <stdexcept>
 
 namespace libcudf_bridge {
+    ReduceAggregation::ReduceAggregation() : inner(nullptr) {
+    }
+
+    ReduceAggregation::~ReduceAggregation() = default;
+
+    GroupByAggregation::GroupByAggregation() : inner(nullptr) {
+    }
+
+    GroupByAggregation::~GroupByAggregation() = default;
+
     // Aggregation factory functions - direct cuDF mappings (for reduce)
-    std::unique_ptr<Aggregation> make_sum_aggregation() {
-        auto result = std::make_unique<Aggregation>();
+    std::unique_ptr<ReduceAggregation> make_sum_aggregation() {
+        auto result = std::make_unique<ReduceAggregation>();
         result->inner = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
         return result;
     }
 
-    std::unique_ptr<Aggregation> make_min_aggregation() {
-        auto result = std::make_unique<Aggregation>();
+    std::unique_ptr<ReduceAggregation> make_min_aggregation() {
+        auto result = std::make_unique<ReduceAggregation>();
         result->inner = cudf::make_min_aggregation<cudf::reduce_aggregation>();
         return result;
     }
 
-    std::unique_ptr<Aggregation> make_max_aggregation() {
-        auto result = std::make_unique<Aggregation>();
+    std::unique_ptr<ReduceAggregation> make_max_aggregation() {
+        auto result = std::make_unique<ReduceAggregation>();
         result->inner = cudf::make_max_aggregation<cudf::reduce_aggregation>();
         return result;
     }
 
-    std::unique_ptr<Aggregation> make_mean_aggregation() {
-        auto result = std::make_unique<Aggregation>();
+    std::unique_ptr<ReduceAggregation> make_mean_aggregation() {
+        auto result = std::make_unique<ReduceAggregation>();
         result->inner = cudf::make_mean_aggregation<cudf::reduce_aggregation>();
         return result;
     }
 
-    std::unique_ptr<Aggregation> make_count_aggregation() {
-        auto result = std::make_unique<Aggregation>();
-        result->inner = cudf::make_count_aggregation<cudf::reduce_aggregation>();
+    std::unique_ptr<ReduceAggregation> make_count_aggregation(int32_t null_handling) {
+        auto result = std::make_unique<ReduceAggregation>();
+        result->inner = cudf::make_count_aggregation<cudf::reduce_aggregation>(
+            static_cast<cudf::null_policy>(null_handling));
         return result;
     }
 
-    std::unique_ptr<Aggregation> make_variance_aggregation(int32_t ddof) {
-        auto result = std::make_unique<Aggregation>();
+    std::unique_ptr<ReduceAggregation> make_variance_aggregation(int32_t ddof) {
+        auto result = std::make_unique<ReduceAggregation>();
         result->inner = cudf::make_variance_aggregation<cudf::reduce_aggregation>(ddof);
         return result;
     }
 
-    std::unique_ptr<Aggregation> make_std_aggregation(int32_t ddof) {
-        auto result = std::make_unique<Aggregation>();
+    std::unique_ptr<ReduceAggregation> make_std_aggregation(int32_t ddof) {
+        auto result = std::make_unique<ReduceAggregation>();
         result->inner = cudf::make_std_aggregation<cudf::reduce_aggregation>(ddof);
         return result;
     }
 
-    std::unique_ptr<Aggregation> make_nunique_aggregation() {
-        auto result = std::make_unique<Aggregation>();
-        result->inner = cudf::make_nunique_aggregation<cudf::reduce_aggregation>();
+    std::unique_ptr<ReduceAggregation> make_nunique_aggregation(int32_t null_handling) {
+        auto result = std::make_unique<ReduceAggregation>();
+        result->inner = cudf::make_nunique_aggregation<cudf::reduce_aggregation>(
+            static_cast<cudf::null_policy>(null_handling));
         return result;
     }
 
-    std::unique_ptr<Aggregation> make_median_aggregation() {
-        auto result = std::make_unique<Aggregation>();
+    std::unique_ptr<ReduceAggregation> make_median_aggregation() {
+        auto result = std::make_unique<ReduceAggregation>();
         result->inner = cudf::make_median_aggregation<cudf::reduce_aggregation>();
         return result;
     }
 
     // Aggregation factory functions - direct cuDF mappings (for groupby)
-    std::unique_ptr<Aggregation> make_sum_aggregation_groupby() {
-        auto result = std::make_unique<Aggregation>();
+    std::unique_ptr<GroupByAggregation> make_sum_aggregation_groupby() {
+        auto result = std::make_unique<GroupByAggregation>();
         result->inner = cudf::make_sum_aggregation<cudf::groupby_aggregation>();
         return result;
     }
 
-    std::unique_ptr<Aggregation> make_min_aggregation_groupby() {
-        auto result = std::make_unique<Aggregation>();
+    std::unique_ptr<GroupByAggregation> make_min_aggregation_groupby() {
+        auto result = std::make_unique<GroupByAggregation>();
         result->inner = cudf::make_min_aggregation<cudf::groupby_aggregation>();
         return result;
     }
 
-    std::unique_ptr<Aggregation> make_max_aggregation_groupby() {
-        auto result = std::make_unique<Aggregation>();
+    std::unique_ptr<GroupByAggregation> make_max_aggregation_groupby() {
+        auto result = std::make_unique<GroupByAggregation>();
         result->inner = cudf::make_max_aggregation<cudf::groupby_aggregation>();
         return result;
     }
 
-    std::unique_ptr<Aggregation> make_mean_aggregation_groupby() {
-        auto result = std::make_unique<Aggregation>();
+    std::unique_ptr<GroupByAggregation> make_mean_aggregation_groupby() {
+        auto result = std::make_unique<GroupByAggregation>();
         result->inner = cudf::make_mean_aggregation<cudf::groupby_aggregation>();
         return result;
     }
 
-    std::unique_ptr<Aggregation> make_count_aggregation_groupby() {
-        auto result = std::make_unique<Aggregation>();
-        result->inner = cudf::make_count_aggregation<cudf::groupby_aggregation>();
+    std::unique_ptr<GroupByAggregation> make_count_aggregation_groupby(int32_t null_handling) {
+        auto result = std::make_unique<GroupByAggregation>();
+        result->inner = cudf::make_count_aggregation<cudf::groupby_aggregation>(
+            static_cast<cudf::null_policy>(null_handling));
         return result;
     }
 
-    std::unique_ptr<Aggregation> make_variance_aggregation_groupby(int32_t ddof) {
-        auto result = std::make_unique<Aggregation>();
+    std::unique_ptr<GroupByAggregation> make_variance_aggregation_groupby(int32_t ddof) {
+        auto result = std::make_unique<GroupByAggregation>();
         result->inner = cudf::make_variance_aggregation<cudf::groupby_aggregation>(ddof);
         return result;
     }
 
-    std::unique_ptr<Aggregation> make_std_aggregation_groupby(int32_t ddof) {
-        auto result = std::make_unique<Aggregation>();
+    std::unique_ptr<GroupByAggregation> make_std_aggregation_groupby(int32_t ddof) {
+        auto result = std::make_unique<GroupByAggregation>();
         result->inner = cudf::make_std_aggregation<cudf::groupby_aggregation>(ddof);
         return result;
     }
 
-    std::unique_ptr<Aggregation> make_nunique_aggregation_groupby() {
-        auto result = std::make_unique<Aggregation>();
-        result->inner = cudf::make_nunique_aggregation<cudf::groupby_aggregation>();
+    std::unique_ptr<GroupByAggregation> make_nunique_aggregation_groupby(int32_t null_handling) {
+        auto result = std::make_unique<GroupByAggregation>();
+        result->inner = cudf::make_nunique_aggregation<cudf::groupby_aggregation>(
+            static_cast<cudf::null_policy>(null_handling));
         return result;
     }
 
-    std::unique_ptr<Aggregation> make_median_aggregation_groupby() {
-        auto result = std::make_unique<Aggregation>();
+    std::unique_ptr<GroupByAggregation> make_median_aggregation_groupby() {
+        auto result = std::make_unique<GroupByAggregation>();
         result->inner = cudf::make_median_aggregation<cudf::groupby_aggregation>();
         return result;
     }
@@ -125,46 +139,24 @@ namespace libcudf_bridge {
     // Reduction - direct cuDF mapping
     std::unique_ptr<Scalar> reduce(
         const ColumnView &col,
-        const Aggregation &agg,
+        const ReduceAggregation &agg,
         const DataType &output_type) {
         auto result = std::make_unique<Scalar>();
-        auto *reduce_agg = dynamic_cast<cudf::reduce_aggregation const *>(agg.inner.get());
-        if (reduce_agg == nullptr) {
-            throw std::runtime_error("Aggregation is not a reduce aggregation");
-        }
-        result->inner = cudf::reduce(*col.inner, *reduce_agg, output_type.inner);
+        result->inner = cudf::reduce(*col.inner, *agg.inner, output_type.inner);
         return result;
     }
 
     std::unique_ptr<Scalar> reduce_with_init(
         const ColumnView &col,
-        const Aggregation &agg,
+        const ReduceAggregation &agg,
         const DataType &output_type,
         const Scalar &init) {
         auto result = std::make_unique<Scalar>();
-        auto *reduce_agg = dynamic_cast<cudf::reduce_aggregation const *>(agg.inner.get());
-        if (reduce_agg == nullptr) {
-            throw std::runtime_error("Aggregation is not a reduce aggregation");
-        }
         result->inner = cudf::reduce(
             *col.inner,
-            *reduce_agg,
+            *agg.inner,
             output_type.inner,
             std::cref(*init.inner));
-        return result;
-    }
-
-    // GroupBy factory
-    std::unique_ptr<GroupBy> groupby_create(const TableView &keys) {
-        auto result = std::make_unique<GroupBy>();
-        result->inner = std::make_unique<cudf::groupby::groupby>(*keys.inner);
-        return result;
-    }
-
-    // AggregationRequest factory
-    std::unique_ptr<AggregationRequest> aggregation_request_create(const ColumnView &values) {
-        auto result = std::make_unique<AggregationRequest>();
-        result->inner->values = *values.inner;
         return result;
     }
 } // namespace libcudf_bridge

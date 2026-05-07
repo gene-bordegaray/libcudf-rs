@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <vector>
 #include "rust/cxx.h"
@@ -48,7 +49,18 @@ namespace libcudf_bridge {
         ~AggregationRequest();
 
         // Direct cuDF method (adds aggregation to the request)
-        void add(std::unique_ptr<Aggregation> agg) const;
+        void add(std::unique_ptr<GroupByAggregation> agg) const;
+    };
+
+    // FFI storage for the contiguous host_span expected by groupby::aggregate
+    struct AggregationRequests {
+        std::vector<cudf::groupby::aggregation_request> inner;
+
+        AggregationRequests();
+
+        ~AggregationRequests();
+
+        void add(std::unique_ptr<AggregationRequest> request);
     };
 
     // Opaque wrapper for cuDF groupby
@@ -61,11 +73,18 @@ namespace libcudf_bridge {
 
         // Direct cuDF method
         [[nodiscard]] std::unique_ptr<GroupByResult> aggregate(
-            rust::Slice<const AggregationRequest * const> requests) const;
+            const AggregationRequests &requests) const;
     };
 
     // GroupBy operations - direct cuDF mappings
-    std::unique_ptr<GroupBy> groupby_create(const TableView &keys);
+    std::unique_ptr<GroupBy> groupby_create(
+        const TableView &keys,
+        int32_t null_handling,
+        int32_t keys_are_sorted,
+        rust::Slice<const int32_t> column_order,
+        rust::Slice<const int32_t> null_precedence);
 
     std::unique_ptr<AggregationRequest> aggregation_request_create(const ColumnView &values);
+
+    std::unique_ptr<AggregationRequests> aggregation_requests_create();
 } // namespace libcudf_bridge
