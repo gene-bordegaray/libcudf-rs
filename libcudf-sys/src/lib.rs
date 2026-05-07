@@ -75,6 +75,12 @@ pub mod ffi {
         /// Owning cuDF AST expression tree.
         type AstExpressionTree;
 
+        /// cuDF source information for IO readers.
+        type SourceInfo;
+
+        /// cuDF Parquet reader options.
+        type ParquetReaderOptions;
+
         /// Aggregation operation accepted by cuDF reductions.
         type ReduceAggregation;
 
@@ -410,6 +416,37 @@ pub mod ffi {
         ) -> UniquePtr<TableView>;
 
         // Parquet I/O
+
+        /// Construct `cudf::io::source_info` from one file path.
+        fn source_info_from_file_path(file_path: &str) -> UniquePtr<SourceInfo>;
+
+        /// Construct `cudf::io::source_info` from multiple file paths.
+        fn source_info_from_file_paths(file_paths: Vec<String>) -> UniquePtr<SourceInfo>;
+
+        /// Return the number of sources in this `source_info`.
+        fn num_sources(self: &SourceInfo) -> usize;
+
+        /// Build `cudf::io::parquet_reader_options` from `source_info`.
+        fn parquet_reader_options_create(source: &SourceInfo) -> UniquePtr<ParquetReaderOptions>;
+
+        /// Set the source on `cudf::io::parquet_reader_options`.
+        fn parquet_reader_options_set_source(
+            options: Pin<&mut ParquetReaderOptions>,
+            source: &SourceInfo,
+        );
+
+        /// Set projected columns on `cudf::io::parquet_reader_options`.
+        fn parquet_reader_options_set_columns(
+            options: Pin<&mut ParquetReaderOptions>,
+            col_names: Vec<String>,
+        );
+
+        /// Read Parquet using explicit reader options, CUDA stream, and device resource.
+        fn read_parquet_with_options(
+            options: &ParquetReaderOptions,
+            stream: &CudaStreamView,
+            mr: &DeviceAsyncResourceRef,
+        ) -> Result<UniquePtr<Table>>;
 
         /// Read a Parquet file into a table
         fn read_parquet(filename: &str) -> Result<UniquePtr<Table>>;
@@ -1525,6 +1562,19 @@ mod tests {
 
     const CUDA_STREAM_FLAG_SYNC_DEFAULT: u32 = 0;
     const CUDA_STREAM_FLAG_NON_BLOCKING: u32 = 1;
+
+    #[test]
+    fn test_source_info_file_path_count() {
+        let single = ffi::source_info_from_file_path("../testdata/weather/result-000000.parquet");
+        assert_eq!(single.num_sources(), 1);
+
+        let multiple = ffi::source_info_from_file_paths(vec![
+            "../testdata/weather/result-000000.parquet".to_string(),
+            "../testdata/weather/result-000001.parquet".to_string(),
+        ]);
+        assert_eq!(multiple.num_sources(), 2);
+    }
+
     // Sorting tests
     #[test]
     fn test_sort_table_ascending() -> Result<(), Box<dyn std::error::Error>> {

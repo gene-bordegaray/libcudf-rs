@@ -84,6 +84,65 @@ impl CuDFTable {
         Ok(Self { inner })
     }
 
+    /// Read a table from one or more Parquet files.
+    pub fn from_parquet_files<P: AsRef<Path>>(paths: &[P]) -> Result<Self, CuDFError> {
+        Self::from_parquet_files_with_columns(paths, Option::<&[String]>::None)
+    }
+
+    /// Read selected columns from one or more Parquet files.
+    pub fn from_parquet_files_with_columns<P, S>(
+        paths: &[P],
+        columns: Option<&[S]>,
+    ) -> Result<Self, CuDFError>
+    where
+        P: AsRef<Path>,
+        S: AsRef<str>,
+    {
+        crate::config::ensure_pools_configured();
+        if paths.is_empty() {
+            return Err(ArrowError::InvalidArgumentError(
+                "at least one Parquet file is required".to_string(),
+            )
+            .into());
+        }
+
+        let path_strings = paths
+            .iter()
+            .map(|path| {
+                path.as_ref()
+                    .to_str()
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(|| {
+                        ArrowError::InvalidArgumentError("Path contains invalid UTF-8".to_string())
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let source = ffi::source_info_from_file_paths(path_strings);
+        let source = source.as_ref().expect("source_info should not be null");
+        let mut options = ffi::parquet_reader_options_create(source);
+        if let Some(columns) = columns {
+            ffi::parquet_reader_options_set_columns(
+                options.pin_mut(),
+                columns
+                    .iter()
+                    .map(|column| column.as_ref().to_string())
+                    .collect(),
+            );
+        }
+
+        let stream = ffi::get_default_stream();
+        let mr = ffi::get_current_device_resource_ref();
+        let inner = ffi::read_parquet_with_options(
+            options
+                .as_ref()
+                .expect("parquet_reader_options should not be null"),
+            stream.as_ref().expect("default stream should not be null"),
+            mr.as_ref().expect("device resource should not be null"),
+        )?;
+        Ok(Self { inner })
+    }
+
     /// Write the table to a Parquet file
     ///
     /// # Arguments
@@ -459,5 +518,21 @@ mod tests {
             assert!(table.num_rows() > 0);
             assert!(table.num_columns() > 0);
         }
+    }
+
+    #[test]
+    fn test_read_multiple_parquet_files_with_columns() -> Result<(), Box<dyn std::error::Error>> {
+        let files = [
+            "testdata/weather/result-000000.parquet",
+            "testdata/weather/result-000001.parquet",
+        ];
+        let columns = vec!["MinTemp".to_string(), "MaxTemp".to_string()];
+
+        let projected = CuDFTable::from_parquet_files_with_columns(&files, Some(&columns))?;
+
+        assert!(projected.num_rows() > 0);
+        assert_eq!(projected.num_columns(), columns.len());
+
+        Ok(())
     }
 }

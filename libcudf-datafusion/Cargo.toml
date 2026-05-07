@@ -76,6 +76,10 @@ name = "load_unload"
 harness = false
 
 [[bench]]
+name = "parquet_scan"
+harness = false
+
+[[bench]]
 name = "tpch_pipeline"
 harness = false
 
