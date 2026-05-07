@@ -61,6 +61,18 @@ pub enum CuDFAstOperator {
     LogicalOr,
     /// Null-aware logical OR.
     NullLogicalOr,
+    /// Modulo.
+    Mod,
+    /// Null-aware equality comparison.
+    NullEqual,
+    /// Null check.
+    IsNull,
+    /// Logical NOT.
+    Not,
+    /// Cast to int64.
+    CastToInt64,
+    /// Cast to uint64.
+    CastToUint64,
     /// Cast to float64.
     CastToFloat64,
 }
@@ -82,6 +94,12 @@ impl CuDFAstOperator {
             Self::NullLogicalAnd => AstOperator::NullLogicalAnd,
             Self::LogicalOr => AstOperator::LogicalOr,
             Self::NullLogicalOr => AstOperator::NullLogicalOr,
+            Self::Mod => AstOperator::Mod,
+            Self::NullEqual => AstOperator::NullEqual,
+            Self::IsNull => AstOperator::IsNull,
+            Self::Not => AstOperator::Not,
+            Self::CastToInt64 => AstOperator::CastToInt64,
+            Self::CastToUint64 => AstOperator::CastToUint64,
             Self::CastToFloat64 => AstOperator::CastToFloat64,
         }
     }
