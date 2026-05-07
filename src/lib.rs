@@ -17,6 +17,7 @@
 //! table.to_parquet("output.parquet").expect("Failed to write Parquet");
 //! ```
 
+mod ast;
 mod binary_op;
 mod column;
 mod column_view;
@@ -36,6 +37,7 @@ mod stream;
 mod table;
 mod table_view;
 
+pub use ast::{CuDFAstExpression, CuDFAstNode, CuDFAstOperator, CuDFAstTableReference};
 pub use binary_op::{cudf_binary_op, CuDFBinaryOp};
 pub use column::CuDFColumn;
 pub use column_view::CuDFColumnView;

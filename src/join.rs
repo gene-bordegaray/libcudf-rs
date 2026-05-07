@@ -1,10 +1,13 @@
 use crate::data_type::arrow_type_to_cudf_data_type;
-use crate::{CuDFColumn, CuDFError, CuDFRef, CuDFScalar, CuDFTable, CuDFTableView};
+use crate::{
+    CuDFAstExpression, CuDFColumn, CuDFError, CuDFRef, CuDFScalar, CuDFTable, CuDFTableView,
+};
 use arrow::array::{BooleanArray, Int32Array, Scalar};
 use arrow_schema::DataType;
 use cxx::UniquePtr;
 use libcudf_sys::{
-    ffi, BinaryOperator, DuplicateKeepOption, NanEquality, NullEquality, OutOfBoundsPolicy,
+    ffi, BinaryOperator, DuplicateKeepOption, JoinKind, NanEquality, NullEquality,
+    OutOfBoundsPolicy,
 };
 use std::sync::Arc;
 
@@ -79,6 +82,49 @@ fn gather_hash_join_indices(
         probe_policy,
     )?;
     Ok((result, build_indices))
+}
+
+fn gather_filtered_hash_join_indices(
+    mut indices: UniquePtr<ffi::HashJoinIndices>,
+    build_conditional: &ffi::TableView,
+    probe_conditional: &ffi::TableView,
+    predicate: &CuDFAstExpression,
+    join_kind: JoinKind,
+    build_payload: &ffi::TableView,
+    probe_payload: &ffi::TableView,
+    build_policy: OutOfBoundsPolicy,
+    probe_policy: OutOfBoundsPolicy,
+) -> Result<(CuDFTable, Arc<CuDFColumn>, Arc<CuDFColumn>), CuDFError> {
+    // Hash join returns probe/build maps. cuDF filter_join_indices expects
+    // left/right maps, so pass build as left and probe as right to preserve
+    // the public `[build_cols | probe_cols]` output order.
+    let probe_indices = indices.pin_mut().release_probe();
+    let build_indices = indices.pin_mut().release_build();
+    let probe_indices_view = probe_indices.view();
+    let build_indices_view = build_indices.view();
+    let mut filtered_indices = ffi::filter_join_indices(
+        build_conditional,
+        probe_conditional,
+        &build_indices_view,
+        &probe_indices_view,
+        predicate.inner(),
+        join_kind as i32,
+    )?;
+    let filtered_build_indices =
+        Arc::new(CuDFColumn::new(filtered_indices.pin_mut().release_left()));
+    let filtered_probe_indices =
+        Arc::new(CuDFColumn::new(filtered_indices.pin_mut().release_right()));
+    let filtered_build_indices_view = Arc::clone(&filtered_build_indices).view();
+    let filtered_probe_indices_view = Arc::clone(&filtered_probe_indices).view();
+    let result = gather_join_output(
+        build_payload,
+        probe_payload,
+        filtered_build_indices_view.inner(),
+        filtered_probe_indices_view.inner(),
+        build_policy,
+        probe_policy,
+    )?;
+    Ok((result, filtered_build_indices, filtered_probe_indices))
 }
 
 fn join_index_sequence(size: usize, init: i32, step: i32) -> Result<Arc<CuDFColumn>, CuDFError> {
@@ -170,6 +216,56 @@ impl CuDFHashJoin {
         let indices = ffi::hash_join_inner_join_indices(&self.inner, &probe_keys)?;
         let (result, _) = gather_hash_join_indices(
             indices,
+            selected_build_payload
+                .as_ref()
+                .unwrap_or_else(|| build_payload.inner()),
+            selected_probe_payload
+                .as_ref()
+                .unwrap_or_else(|| probe_payload.inner()),
+            OutOfBoundsPolicy::DontCheck,
+            OutOfBoundsPolicy::DontCheck,
+        )?;
+        Ok(result)
+    }
+
+    /// Probe this hash join, filter equality matches with an AST predicate, and gather payload rows.
+    ///
+    /// Output columns are concatenated as `[build_cols | probe_cols]`.
+    ///
+    /// `build_conditional` and `probe_conditional` are the tables referenced by
+    /// `predicate`; AST `Left` column references read from `build_conditional`
+    /// and AST `Right` column references read from `probe_conditional`.
+    ///
+    /// `build_payload` and `probe_payload` are the tables gathered into the
+    /// output. Use `build_out_cols` and `probe_out_cols` to gather only selected
+    /// payload columns.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if probing, predicate filtering, or payload gathering
+    /// fails in cuDF.
+    pub fn inner_join_filtered(
+        &self,
+        probe: &CuDFTableView,
+        probe_on: &[usize],
+        build_conditional: &CuDFTableView,
+        probe_conditional: &CuDFTableView,
+        predicate: &CuDFAstExpression,
+        build_payload: &CuDFTableView,
+        probe_payload: &CuDFTableView,
+        build_out_cols: Option<&[usize]>,
+        probe_out_cols: Option<&[usize]>,
+    ) -> Result<CuDFTable, CuDFError> {
+        let probe_keys = select_cols(probe, probe_on);
+        let selected_build_payload = build_out_cols.map(|c| select_cols(build_payload, c));
+        let selected_probe_payload = probe_out_cols.map(|c| select_cols(probe_payload, c));
+        let indices = ffi::hash_join_inner_join_indices(&self.inner, &probe_keys)?;
+        let (result, _, _) = gather_filtered_hash_join_indices(
+            indices,
+            build_conditional.inner(),
+            probe_conditional.inner(),
+            predicate,
+            JoinKind::Inner,
             selected_build_payload
                 .as_ref()
                 .unwrap_or_else(|| build_payload.inner()),
@@ -509,6 +605,7 @@ pub fn cross_join(left: &CuDFTableView, right: &CuDFTableView) -> Result<CuDFTab
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{CuDFAstOperator, CuDFAstTableReference};
     use arrow::array::{Array, Int32Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
@@ -729,6 +826,58 @@ mod tests {
             .unwrap();
         assert_eq!((left_a.value(0), right_a.value(0)), (20, 200));
         assert_eq!((left_b.value(0), right_b.value(0)), (30, 300));
+        Ok(())
+    }
+
+    #[test]
+    fn test_gather_filtered_hash_join_indices() -> Result<(), Box<dyn std::error::Error>> {
+        let build = Arc::new(make_table(vec![1, 2, 2, 3], vec![10, 20, 25, 30]));
+        let build_view = Arc::clone(&build).view();
+        let join = CuDFHashJoin::try_new(&build_view, &[0], CuDFNullEquality::Unequal)?;
+
+        let probe = make_table(vec![2, 2, 3], vec![15, 30, 35]);
+        let probe_view = probe.into_view();
+
+        let mut predicate = CuDFAstExpression::new();
+        let build_value = predicate.column_reference(0, CuDFAstTableReference::Left)?;
+        let probe_value = predicate.column_reference(0, CuDFAstTableReference::Right)?;
+        let five = predicate.literal(int32_scalar(5)?)?;
+        let build_plus_five =
+            predicate.binary_operation(CuDFAstOperator::Add, build_value, five)?;
+        predicate.binary_operation(CuDFAstOperator::LessEqual, build_plus_five, probe_value)?;
+
+        let build_values = select_cols(&build_view, &[1]);
+        let probe_values = select_cols(&probe_view, &[1]);
+        let build_values_view = CuDFTableView::new_with_ref(build_values, build_view._ref.clone());
+        let probe_values_view = CuDFTableView::new_with_ref(probe_values, probe_view._ref.clone());
+        let result = join.inner_join_filtered(
+            &probe_view,
+            &[0],
+            &build_values_view,
+            &probe_values_view,
+            &predicate,
+            &build_view,
+            &probe_view,
+            Some(&[1]),
+            Some(&[1]),
+        )?;
+
+        let batch = result.into_view().to_arrow_host()?;
+        let left_vals = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let right_vals = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let mut pairs: Vec<_> = (0..batch.num_rows())
+            .map(|i| (left_vals.value(i), right_vals.value(i)))
+            .collect();
+        pairs.sort();
+        assert_eq!(pairs, vec![(20, 30), (25, 30), (30, 35)]);
         Ok(())
     }
 
