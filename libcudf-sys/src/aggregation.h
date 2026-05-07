@@ -4,6 +4,7 @@
 #include <memory>
 #include "rust/cxx.h"
 #include "column.h"
+#include "data_type.h"
 #include "scalar.h"
 #include <cudf/aggregation.hpp>
 
@@ -40,5 +41,14 @@ namespace libcudf_bridge {
     std::unique_ptr<Aggregation> make_median_aggregation_groupby();
 
     // Reduction - direct cuDF mapping
-    std::unique_ptr<Scalar> reduce(const Column &col, const Aggregation &agg, int32_t output_type_id);
+    std::unique_ptr<Scalar> reduce(
+        const ColumnView &col,
+        const Aggregation &agg,
+        const DataType &output_type);
+
+    std::unique_ptr<Scalar> reduce_with_init(
+        const ColumnView &col,
+        const Aggregation &agg,
+        const DataType &output_type,
+        const Scalar &init);
 } // namespace libcudf_bridge

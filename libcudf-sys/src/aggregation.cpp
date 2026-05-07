@@ -7,6 +7,9 @@
 #include <cudf/reduction.hpp>
 #include <cudf/groupby.hpp>
 
+#include <functional>
+#include <stdexcept>
+
 namespace libcudf_bridge {
     // Aggregation factory functions - direct cuDF mappings (for reduce)
     std::unique_ptr<Aggregation> make_sum_aggregation() {
@@ -120,11 +123,34 @@ namespace libcudf_bridge {
 
 
     // Reduction - direct cuDF mapping
-    std::unique_ptr<Scalar> reduce(const Column &col, const Aggregation &agg, int32_t output_type_id) {
+    std::unique_ptr<Scalar> reduce(
+        const ColumnView &col,
+        const Aggregation &agg,
+        const DataType &output_type) {
         auto result = std::make_unique<Scalar>();
-        const auto output_type = cudf::data_type{static_cast<cudf::type_id>(output_type_id)};
         auto *reduce_agg = dynamic_cast<cudf::reduce_aggregation const *>(agg.inner.get());
-        result->inner = cudf::reduce(col.inner->view(), *reduce_agg, output_type);
+        if (reduce_agg == nullptr) {
+            throw std::runtime_error("Aggregation is not a reduce aggregation");
+        }
+        result->inner = cudf::reduce(*col.inner, *reduce_agg, output_type.inner);
+        return result;
+    }
+
+    std::unique_ptr<Scalar> reduce_with_init(
+        const ColumnView &col,
+        const Aggregation &agg,
+        const DataType &output_type,
+        const Scalar &init) {
+        auto result = std::make_unique<Scalar>();
+        auto *reduce_agg = dynamic_cast<cudf::reduce_aggregation const *>(agg.inner.get());
+        if (reduce_agg == nullptr) {
+            throw std::runtime_error("Aggregation is not a reduce aggregation");
+        }
+        result->inner = cudf::reduce(
+            *col.inner,
+            *reduce_agg,
+            output_type.inner,
+            std::cref(*init.inner));
         return result;
     }
 

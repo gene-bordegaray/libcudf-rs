@@ -663,9 +663,17 @@ pub mod ffi {
         /// This function does not detect overflows in reductions. Any null values are skipped
         /// for the operation. If the reduction fails, the output scalar returns with `is_valid()==false`.
         fn reduce(
-            col: &Column,
+            col: &ColumnView,
             agg: &Aggregation,
-            output_type_id: i32,
+            output_type: &DataType,
+        ) -> Result<UniquePtr<Scalar>>;
+
+        /// Computes a reduction with an initial scalar value.
+        fn reduce_with_init(
+            col: &ColumnView,
+            agg: &Aggregation,
+            output_type: &DataType,
+            init: &Scalar,
         ) -> Result<UniquePtr<Scalar>>;
 
         // GroupBy operations - direct cuDF mappings
@@ -1325,7 +1333,7 @@ unsafe impl Sync for ffi::CudaStream {}
 mod tests {
     use super::*;
     use crate::ffi::ColumnView;
-    use arrow::array::{make_array, Array, Int32Array, RecordBatch, StructArray};
+    use arrow::array::{make_array, Array, Decimal128Array, Int32Array, RecordBatch, StructArray};
     use arrow::ffi::{from_ffi, from_ffi_and_data_type, FFI_ArrowArray};
     use arrow::util::pretty::{pretty_format_batches, pretty_format_columns};
     use arrow_schema::ffi::FFI_ArrowSchema;
@@ -1560,6 +1568,45 @@ mod tests {
         assert_eq!(TypeId::Int32 as i32, 3);
         assert_eq!(TypeId::Float32 as i32, 9);
         assert_eq!(TypeId::Float64 as i32, 10);
+    }
+
+    #[test]
+    fn test_reduce_uses_full_output_data_type() -> Result<(), Box<dyn std::error::Error>> {
+        let table = table_from_decimal128_column("amount", vec![12345, 67890], 2)?;
+        let column = table.view().column(0);
+        let output_type = ffi::new_data_type_with_scale(TypeId::Decimal128 as i32, -2);
+
+        let result = ffi::reduce(&column, &ffi::make_sum_aggregation(), &output_type)?;
+        let result_type = result.data_type();
+
+        assert!(result.is_valid());
+        assert_eq!(result_type.id(), TypeId::Decimal128 as i32);
+        assert_eq!(result_type.scale(), -2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_reduce_with_init() -> Result<(), Box<dyn std::error::Error>> {
+        let table = table_from_i32_columns(&[("values", vec![1, 2, 3])])?;
+        let values = table.view().column(0);
+        let init_table = table_from_i32_columns(&[("init", vec![10])])?;
+        let init = ffi::get_element(&init_table.view().column(0), 0);
+        let output_type = ffi::new_data_type(TypeId::Int32 as i32);
+
+        let result =
+            ffi::reduce_with_init(&values, &ffi::make_sum_aggregation(), &output_type, &init)?;
+        let result_column = ffi::make_column_from_scalar(&result, 1)?;
+
+        assert_snapshot!(pretty_column(&result_column.view(), DataType::Int32)?, @r"
+        +------+
+        | test |
+        +------+
+        | 16   |
+        +------+
+        ");
+
+        Ok(())
     }
 
     #[test]
@@ -1815,6 +1862,26 @@ mod tests {
             .map(|(_, values)| Arc::new(Int32Array::from(values.clone())) as _)
             .collect();
         let batch = RecordBatch::try_new(Arc::new(schema.clone()), arrays)?;
+        let struct_array = StructArray::from(batch);
+        let array_data = struct_array.into_data();
+        let ffi_array = FFI_ArrowArray::new(&array_data);
+        let ffi_schema = FFI_ArrowSchema::try_from(schema)?;
+        let device_array = ArrowDeviceArray::new_cpu().with_array(ffi_array);
+
+        let schema_ptr = &ffi_schema as *const FFI_ArrowSchema as *const u8;
+        let device_array_ptr = &device_array as *const ArrowDeviceArray as *const u8;
+        Ok(unsafe { ffi::table_from_arrow_host(schema_ptr, device_array_ptr) }?)
+    }
+
+    fn table_from_decimal128_column(
+        name: &str,
+        values: Vec<i128>,
+        scale: i8,
+    ) -> Result<cxx::UniquePtr<ffi::Table>, Box<dyn std::error::Error>> {
+        let data_type = DataType::Decimal128(38, scale);
+        let schema = Schema::new(vec![Field::new(name, data_type.clone(), false)]);
+        let array = Decimal128Array::from(values).with_precision_and_scale(38, scale)?;
+        let batch = RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(array)])?;
         let struct_array = StructArray::from(batch);
         let array_data = struct_array.into_data();
         let ffi_array = FFI_ArrowArray::new(&array_data);
