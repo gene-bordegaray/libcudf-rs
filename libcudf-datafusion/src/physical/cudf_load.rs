@@ -6,8 +6,9 @@ use datafusion::common::{assert_eq_or_internal_err, exec_err, plan_err, ScalarVa
 use datafusion::error::DataFusionError;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
-use datafusion::physical_expr_common::metrics::MetricsSet;
-use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
+use datafusion::physical_expr_common::metrics::{
+    Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet, Time,
+};
 use datafusion_physical_plan::stream::{
     RecordBatchReceiverStream, RecordBatchReceiverStreamBuilder,
 };
@@ -97,7 +98,7 @@ impl ExecutionPlan for CuDFLoadExec {
             inner: RecordBatchReceiverStream::builder(self.schema(), input_partitions),
             ctx: CuDFRecordBatchReceiverStreamBuilderCtx {
                 schema: self.schema(),
-                metrics: CuDFBaselineMetrics::new(&self.metrics, partition),
+                metrics: CuDFLoadMetrics::new(&self.metrics, partition),
             },
         };
 
@@ -125,7 +126,7 @@ struct CuDFRecordBatchReceiverStreamBuilder {
 #[derive(Clone)]
 struct CuDFRecordBatchReceiverStreamBuilderCtx {
     schema: SchemaRef,
-    metrics: CuDFBaselineMetrics,
+    metrics: CuDFLoadMetrics,
 }
 
 impl CuDFRecordBatchReceiverStreamBuilder {
@@ -133,31 +134,61 @@ impl CuDFRecordBatchReceiverStreamBuilder {
         let ctx = self.ctx.clone();
         let output = self.inner.tx();
         self.inner.spawn(async move {
-            while let Some(batch_or_err) = host_stream.next().await {
+            loop {
                 let ctx = ctx.clone();
-                let _timer_guard = ctx.metrics.elapsed_compute().timer();
+                let input_wait_timer = ctx.metrics.input_wait_time.timer();
+                let batch_or_err = host_stream.next().await;
+                input_wait_timer.done();
+
+                let Some(batch_or_err) = batch_or_err else {
+                    break;
+                };
+
+                let compute_timer = ctx.metrics.baseline.elapsed_compute().timer();
                 let batch = match batch_or_err {
-                    Ok(batch) => cast_to_target_schema(batch, Arc::clone(&ctx.schema))?,
+                    Ok(batch) => {
+                        let cast_timer = ctx.metrics.cast_time.timer();
+                        let batch = cast_to_target_schema(batch, Arc::clone(&ctx.schema))?;
+                        cast_timer.done();
+                        batch
+                    }
                     Err(err) => return Err(err),
                 };
 
                 if batch.columns().iter().any(|c| is_cudf_array(c)) {
                     return exec_err!("Cannot move RecordBatch from host to CuDF: a column is already a CuDF array");
                 }
+                ctx.metrics.record_input(&batch);
                 let schema = batch.schema();
+
+                let pin_timer = ctx.metrics.pin_time.timer();
                 let pinned_batch = pin_record_batch(batch).map_err(cudf_to_df)?;
+                pin_timer.done();
+
+                let import_timer = ctx.metrics.import_time.timer();
                 let table = CuDFTable::from_arrow_host(pinned_batch).map_err(cudf_to_df)?;
+                import_timer.done();
+
+                let sync_timer = ctx.metrics.sync_time.timer();
                 synchronize_default_stream().map_err(cudf_to_df)?;
+                sync_timer.done();
+
+                let output_batch_timer = ctx.metrics.output_batch_time.timer();
                 let num_rows = table.num_rows();
                 let cudf_cols: Vec<Arc<dyn Array>> = table
                     .into_columns()
                     .into_iter()
                     .map(|c| Arc::new(c.into_view()) as Arc<dyn Array>)
                     .collect();
-                let batch =
-                    libcudf_rs::record_batch_with_schema(cudf_cols, &schema, num_rows)?;
-                ctx.metrics.record_output(&batch);
+                let batch = libcudf_rs::record_batch_with_schema(cudf_cols, &schema, num_rows)?;
+                output_batch_timer.done();
+
+                ctx.metrics.baseline.record_output(&batch);
+                compute_timer.done();
+
+                let send_timer = ctx.metrics.output_send_time.timer();
                 let send_result = output.send(Ok(batch)).await;
+                send_timer.done();
                 if send_result.is_err() {
                     break;
                 }
@@ -169,6 +200,100 @@ impl CuDFRecordBatchReceiverStreamBuilder {
 
     fn build(self) -> SendableRecordBatchStream {
         self.inner.build()
+    }
+}
+
+#[derive(Clone)]
+struct CuDFLoadMetrics {
+    baseline: CuDFBaselineMetrics,
+    input_wait_time: Time,
+    cast_time: Time,
+    pin_time: Time,
+    import_time: Time,
+    sync_time: Time,
+    output_batch_time: Time,
+    output_send_time: Time,
+    input_batches: Count,
+    input_rows: Count,
+    input_bytes: Count,
+    input_columns: Count,
+    bool_columns: Count,
+    numeric_columns: Count,
+    decimal_columns: Count,
+    string_columns: Count,
+    temporal_columns: Count,
+    other_columns: Count,
+}
+
+impl CuDFLoadMetrics {
+    fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
+        Self {
+            baseline: CuDFBaselineMetrics::new(metrics, partition),
+            input_wait_time: MetricBuilder::new(metrics).subset_time("input_wait_time", partition),
+            cast_time: MetricBuilder::new(metrics).subset_time("cast_time", partition),
+            pin_time: MetricBuilder::new(metrics).subset_time("pin_time", partition),
+            import_time: MetricBuilder::new(metrics).subset_time("import_time", partition),
+            sync_time: MetricBuilder::new(metrics).subset_time("sync_time", partition),
+            output_batch_time: MetricBuilder::new(metrics)
+                .subset_time("output_batch_time", partition),
+            output_send_time: MetricBuilder::new(metrics)
+                .subset_time("output_send_time", partition),
+            input_batches: MetricBuilder::new(metrics).counter("input_batches", partition),
+            input_rows: MetricBuilder::new(metrics).counter("input_rows", partition),
+            input_bytes: MetricBuilder::new(metrics).counter("input_bytes", partition),
+            input_columns: MetricBuilder::new(metrics).counter("input_columns", partition),
+            bool_columns: MetricBuilder::new(metrics).counter("bool_columns", partition),
+            numeric_columns: MetricBuilder::new(metrics).counter("numeric_columns", partition),
+            decimal_columns: MetricBuilder::new(metrics).counter("decimal_columns", partition),
+            string_columns: MetricBuilder::new(metrics).counter("string_columns", partition),
+            temporal_columns: MetricBuilder::new(metrics).counter("temporal_columns", partition),
+            other_columns: MetricBuilder::new(metrics).counter("other_columns", partition),
+        }
+    }
+
+    fn record_input(&self, batch: &RecordBatch) {
+        self.input_batches.add(1);
+        self.input_rows.add(batch.num_rows());
+        self.input_columns.add(batch.num_columns());
+        self.input_bytes.add(
+            batch
+                .columns()
+                .iter()
+                .map(|col| col.get_array_memory_size())
+                .sum::<usize>(),
+        );
+
+        for field in batch.schema().fields() {
+            match field.data_type() {
+                DataType::Boolean => self.bool_columns.add(1),
+                DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64
+                | DataType::Float16
+                | DataType::Float32
+                | DataType::Float64 => self.numeric_columns.add(1),
+                DataType::Decimal32(_, _)
+                | DataType::Decimal64(_, _)
+                | DataType::Decimal128(_, _)
+                | DataType::Decimal256(_, _) => self.decimal_columns.add(1),
+                DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
+                    self.string_columns.add(1)
+                }
+                DataType::Date32
+                | DataType::Date64
+                | DataType::Time32(_)
+                | DataType::Time64(_)
+                | DataType::Timestamp(_, _)
+                | DataType::Duration(_)
+                | DataType::Interval(_) => self.temporal_columns.add(1),
+                _ => self.other_columns.add(1),
+            }
+        }
     }
 }
 
