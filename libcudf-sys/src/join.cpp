@@ -112,6 +112,10 @@ std::unique_ptr<JoinIndices> filter_join_indices(
     const AstExpressionTree& predicate,
     int32_t join_kind)
 {
+    if (predicate.inner.size() == 0) {
+        throw std::runtime_error("Cannot filter join indices with an empty AST predicate");
+    }
+
     auto [filtered_left, filtered_right] = cudf::filter_join_indices(
         *left.inner,
         *right.inner,

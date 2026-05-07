@@ -13,6 +13,33 @@ use std::sync::Arc;
 
 const NULL_GATHER_INDEX: i32 = i32::MIN;
 
+/// Arguments for probing a reusable hash join with an AST predicate.
+///
+/// The output columns are gathered from `build_payload` and `probe_payload`.
+/// AST `Left` references read from `build_conditional`; AST `Right` references
+/// read from `probe_conditional`.
+#[derive(Clone, Copy)]
+pub struct CuDFFilteredHashJoinArgs<'a> {
+    /// Probe-side table used for equality matching.
+    pub probe: &'a CuDFTableView,
+    /// Probe-side equality key columns.
+    pub probe_on: &'a [usize],
+    /// Build-side table referenced by AST `Left` columns.
+    pub build_conditional: &'a CuDFTableView,
+    /// Probe-side table referenced by AST `Right` columns.
+    pub probe_conditional: &'a CuDFTableView,
+    /// Predicate evaluated on equality-match pairs.
+    pub predicate: &'a CuDFAstExpression,
+    /// Build-side table gathered into the output.
+    pub build_payload: &'a CuDFTableView,
+    /// Probe-side table gathered into the output.
+    pub probe_payload: &'a CuDFTableView,
+    /// Optional build payload columns to gather.
+    pub build_out_cols: Option<&'a [usize]>,
+    /// Optional probe payload columns to gather.
+    pub probe_out_cols: Option<&'a [usize]>,
+}
+
 fn select_cols(view: &CuDFTableView, cols: &[usize]) -> cxx::UniquePtr<ffi::TableView> {
     let indices: Vec<i32> = cols.iter().map(|&i| i as i32).collect();
     view.inner().select(&indices)
@@ -84,16 +111,20 @@ fn gather_hash_join_indices(
     Ok((result, build_indices))
 }
 
-fn gather_filtered_hash_join_indices(
-    mut indices: UniquePtr<ffi::HashJoinIndices>,
-    build_conditional: &ffi::TableView,
-    probe_conditional: &ffi::TableView,
-    predicate: &CuDFAstExpression,
+struct FilteredHashJoinIndicesArgs<'a> {
+    build_conditional: &'a ffi::TableView,
+    probe_conditional: &'a ffi::TableView,
+    predicate: &'a CuDFAstExpression,
     join_kind: JoinKind,
-    build_payload: &ffi::TableView,
-    probe_payload: &ffi::TableView,
+    build_payload: &'a ffi::TableView,
+    probe_payload: &'a ffi::TableView,
     build_policy: OutOfBoundsPolicy,
     probe_policy: OutOfBoundsPolicy,
+}
+
+fn gather_filtered_hash_join_indices(
+    mut indices: UniquePtr<ffi::HashJoinIndices>,
+    args: FilteredHashJoinIndicesArgs<'_>,
 ) -> Result<(CuDFTable, Arc<CuDFColumn>, Arc<CuDFColumn>), CuDFError> {
     // Hash join returns probe/build maps. cuDF filter_join_indices expects
     // left/right maps, so pass build as left and probe as right to preserve
@@ -103,12 +134,12 @@ fn gather_filtered_hash_join_indices(
     let probe_indices_view = probe_indices.view();
     let build_indices_view = build_indices.view();
     let mut filtered_indices = ffi::filter_join_indices(
-        build_conditional,
-        probe_conditional,
+        args.build_conditional,
+        args.probe_conditional,
         &build_indices_view,
         &probe_indices_view,
-        predicate.inner(),
-        join_kind as i32,
+        args.predicate.inner(),
+        args.join_kind as i32,
     )?;
     let filtered_build_indices =
         Arc::new(CuDFColumn::new(filtered_indices.pin_mut().release_left()));
@@ -117,12 +148,12 @@ fn gather_filtered_hash_join_indices(
     let filtered_build_indices_view = Arc::clone(&filtered_build_indices).view();
     let filtered_probe_indices_view = Arc::clone(&filtered_probe_indices).view();
     let result = gather_join_output(
-        build_payload,
-        probe_payload,
+        args.build_payload,
+        args.probe_payload,
         filtered_build_indices_view.inner(),
         filtered_probe_indices_view.inner(),
-        build_policy,
-        probe_policy,
+        args.build_policy,
+        args.probe_policy,
     )?;
     Ok((result, filtered_build_indices, filtered_probe_indices))
 }
@@ -357,34 +388,32 @@ impl CuDFHashJoin {
     /// fails in cuDF.
     pub fn inner_join_filtered(
         &self,
-        probe: &CuDFTableView,
-        probe_on: &[usize],
-        build_conditional: &CuDFTableView,
-        probe_conditional: &CuDFTableView,
-        predicate: &CuDFAstExpression,
-        build_payload: &CuDFTableView,
-        probe_payload: &CuDFTableView,
-        build_out_cols: Option<&[usize]>,
-        probe_out_cols: Option<&[usize]>,
+        args: CuDFFilteredHashJoinArgs<'_>,
     ) -> Result<CuDFTable, CuDFError> {
-        let probe_keys = select_cols(probe, probe_on);
-        let selected_build_payload = build_out_cols.map(|c| select_cols(build_payload, c));
-        let selected_probe_payload = probe_out_cols.map(|c| select_cols(probe_payload, c));
+        let probe_keys = select_cols(args.probe, args.probe_on);
+        let selected_build_payload = args
+            .build_out_cols
+            .map(|c| select_cols(args.build_payload, c));
+        let selected_probe_payload = args
+            .probe_out_cols
+            .map(|c| select_cols(args.probe_payload, c));
         let indices = ffi::hash_join_inner_join_indices(&self.inner, &probe_keys)?;
         let (result, _, _) = gather_filtered_hash_join_indices(
             indices,
-            build_conditional.inner(),
-            probe_conditional.inner(),
-            predicate,
-            JoinKind::Inner,
-            selected_build_payload
-                .as_ref()
-                .unwrap_or_else(|| build_payload.inner()),
-            selected_probe_payload
-                .as_ref()
-                .unwrap_or_else(|| probe_payload.inner()),
-            OutOfBoundsPolicy::DontCheck,
-            OutOfBoundsPolicy::DontCheck,
+            FilteredHashJoinIndicesArgs {
+                build_conditional: args.build_conditional.inner(),
+                probe_conditional: args.probe_conditional.inner(),
+                predicate: args.predicate,
+                join_kind: JoinKind::Inner,
+                build_payload: selected_build_payload
+                    .as_ref()
+                    .unwrap_or_else(|| args.build_payload.inner()),
+                probe_payload: selected_probe_payload
+                    .as_ref()
+                    .unwrap_or_else(|| args.probe_payload.inner()),
+                build_policy: OutOfBoundsPolicy::DontCheck,
+                probe_policy: OutOfBoundsPolicy::DontCheck,
+            },
         )?;
         Ok(result)
     }
@@ -401,34 +430,32 @@ impl CuDFHashJoin {
     /// match-mask updates fail in cuDF.
     pub fn inner_join_filtered_and_record_matches(
         &mut self,
-        probe: &CuDFTableView,
-        probe_on: &[usize],
-        build_conditional: &CuDFTableView,
-        probe_conditional: &CuDFTableView,
-        predicate: &CuDFAstExpression,
-        build_payload: &CuDFTableView,
-        probe_payload: &CuDFTableView,
-        build_out_cols: Option<&[usize]>,
-        probe_out_cols: Option<&[usize]>,
+        args: CuDFFilteredHashJoinArgs<'_>,
     ) -> Result<CuDFTable, CuDFError> {
-        let probe_keys = select_cols(probe, probe_on);
-        let selected_build_payload = build_out_cols.map(|c| select_cols(build_payload, c));
-        let selected_probe_payload = probe_out_cols.map(|c| select_cols(probe_payload, c));
+        let probe_keys = select_cols(args.probe, args.probe_on);
+        let selected_build_payload = args
+            .build_out_cols
+            .map(|c| select_cols(args.build_payload, c));
+        let selected_probe_payload = args
+            .probe_out_cols
+            .map(|c| select_cols(args.probe_payload, c));
         let indices = ffi::hash_join_inner_join_indices(&self.inner, &probe_keys)?;
         let (result, build_indices, _) = gather_filtered_hash_join_indices(
             indices,
-            build_conditional.inner(),
-            probe_conditional.inner(),
-            predicate,
-            JoinKind::Inner,
-            selected_build_payload
-                .as_ref()
-                .unwrap_or_else(|| build_payload.inner()),
-            selected_probe_payload
-                .as_ref()
-                .unwrap_or_else(|| probe_payload.inner()),
-            OutOfBoundsPolicy::DontCheck,
-            OutOfBoundsPolicy::DontCheck,
+            FilteredHashJoinIndicesArgs {
+                build_conditional: args.build_conditional.inner(),
+                probe_conditional: args.probe_conditional.inner(),
+                predicate: args.predicate,
+                join_kind: JoinKind::Inner,
+                build_payload: selected_build_payload
+                    .as_ref()
+                    .unwrap_or_else(|| args.build_payload.inner()),
+                probe_payload: selected_probe_payload
+                    .as_ref()
+                    .unwrap_or_else(|| args.probe_payload.inner()),
+                build_policy: OutOfBoundsPolicy::DontCheck,
+                probe_policy: OutOfBoundsPolicy::DontCheck,
+            },
         )?;
         self.record_matched_build_indices(build_indices)?;
         Ok(result)
@@ -507,41 +534,39 @@ impl CuDFHashJoin {
     /// match-mask updates fail in cuDF.
     pub fn probe_left_join_filtered_and_record_matches(
         &mut self,
-        probe: &CuDFTableView,
-        probe_on: &[usize],
-        build_conditional: &CuDFTableView,
-        probe_conditional: &CuDFTableView,
-        predicate: &CuDFAstExpression,
-        build_payload: &CuDFTableView,
-        probe_payload: &CuDFTableView,
-        build_out_cols: Option<&[usize]>,
-        probe_out_cols: Option<&[usize]>,
+        args: CuDFFilteredHashJoinArgs<'_>,
     ) -> Result<CuDFTable, CuDFError> {
-        let probe_keys = select_cols(probe, probe_on);
-        let selected_build_payload = build_out_cols.map(|c| select_cols(build_payload, c));
-        let selected_probe_payload = probe_out_cols.map(|c| select_cols(probe_payload, c));
+        let probe_keys = select_cols(args.probe, args.probe_on);
+        let selected_build_payload = args
+            .build_out_cols
+            .map(|c| select_cols(args.build_payload, c));
+        let selected_probe_payload = args
+            .probe_out_cols
+            .map(|c| select_cols(args.probe_payload, c));
         let build_payload = selected_build_payload
             .as_ref()
-            .unwrap_or_else(|| build_payload.inner());
+            .unwrap_or_else(|| args.build_payload.inner());
         let probe_payload = selected_probe_payload
             .as_ref()
-            .unwrap_or_else(|| probe_payload.inner());
+            .unwrap_or_else(|| args.probe_payload.inner());
         let indices = ffi::hash_join_inner_join_indices(&self.inner, &probe_keys)?;
         let (matched, build_indices, probe_indices) = gather_filtered_hash_join_indices(
             indices,
-            build_conditional.inner(),
-            probe_conditional.inner(),
-            predicate,
-            JoinKind::Inner,
-            build_payload,
-            probe_payload,
-            OutOfBoundsPolicy::DontCheck,
-            OutOfBoundsPolicy::DontCheck,
+            FilteredHashJoinIndicesArgs {
+                build_conditional: args.build_conditional.inner(),
+                probe_conditional: args.probe_conditional.inner(),
+                predicate: args.predicate,
+                join_kind: JoinKind::Inner,
+                build_payload,
+                probe_payload,
+                build_policy: OutOfBoundsPolicy::DontCheck,
+                probe_policy: OutOfBoundsPolicy::DontCheck,
+            },
         )?;
         self.record_matched_build_indices(build_indices)?;
 
         let unmatched_probe_indices =
-            unmatched_indices_from_matches(probe.num_rows(), probe_indices)?;
+            unmatched_indices_from_matches(args.probe.num_rows(), probe_indices)?;
         let null_build_indices =
             join_index_sequence(unmatched_probe_indices.len(), NULL_GATHER_INDEX, 0)?;
         let null_build_indices_view = Arc::clone(&null_build_indices).view();
@@ -848,6 +873,24 @@ mod tests {
         Ok(predicate)
     }
 
+    fn filtered_join_args<'a>(
+        probe_view: &'a CuDFTableView,
+        predicate: &'a CuDFAstExpression,
+        build_view: &'a CuDFTableView,
+    ) -> CuDFFilteredHashJoinArgs<'a> {
+        CuDFFilteredHashJoinArgs {
+            probe: probe_view,
+            probe_on: &[0],
+            build_conditional: build_view,
+            probe_conditional: probe_view,
+            predicate,
+            build_payload: build_view,
+            probe_payload: probe_view,
+            build_out_cols: Some(&[1]),
+            probe_out_cols: Some(&[1]),
+        }
+    }
+
     #[test]
     fn test_inner_join() -> Result<(), Box<dyn std::error::Error>> {
         let left = make_table(vec![1, 2, 3, 4], vec![10, 20, 30, 40]);
@@ -1063,17 +1106,17 @@ mod tests {
         let probe_values = select_cols(&probe_view, &[1]);
         let build_values_view = CuDFTableView::new_with_ref(build_values, build_view._ref.clone());
         let probe_values_view = CuDFTableView::new_with_ref(probe_values, probe_view._ref.clone());
-        let result = join.inner_join_filtered(
-            &probe_view,
-            &[0],
-            &build_values_view,
-            &probe_values_view,
-            &predicate,
-            &build_view,
-            &probe_view,
-            Some(&[1]),
-            Some(&[1]),
-        )?;
+        let result = join.inner_join_filtered(CuDFFilteredHashJoinArgs {
+            probe: &probe_view,
+            probe_on: &[0],
+            build_conditional: &build_values_view,
+            probe_conditional: &probe_values_view,
+            predicate: &predicate,
+            build_payload: &build_view,
+            probe_payload: &probe_view,
+            build_out_cols: Some(&[1]),
+            probe_out_cols: Some(&[1]),
+        })?;
 
         let batch = result.into_view().to_arrow_host()?;
         let left_vals = batch
@@ -1095,6 +1138,25 @@ mod tests {
     }
 
     #[test]
+    fn test_hash_join_filtered_empty_predicate_returns_error(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let build = Arc::new(make_table(vec![2], vec![20]));
+        let build_view = Arc::clone(&build).view();
+        let join = CuDFHashJoin::try_new(&build_view, &[0], CuDFNullEquality::Unequal)?;
+
+        let probe = make_table(vec![2], vec![25]);
+        let probe_view = probe.into_view();
+        let predicate = CuDFAstExpression::new();
+        let result =
+            join.inner_join_filtered(filtered_join_args(&probe_view, &predicate, &build_view));
+
+        assert!(result
+            .err()
+            .is_some_and(|err| err.to_string().contains("empty AST predicate")));
+        Ok(())
+    }
+
+    #[test]
     fn test_hash_join_filtered_records_only_passing_build_rows(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let build = Arc::new(make_table(vec![1, 2, 3], vec![10, 20, 30]));
@@ -1104,17 +1166,11 @@ mod tests {
         let probe = make_table(vec![2, 3], vec![25, 25]);
         let probe_view = probe.into_view();
         let predicate = value_less_predicate()?;
-        let matched = join.inner_join_filtered_and_record_matches(
-            &probe_view,
-            &[0],
-            &build_view,
+        let matched = join.inner_join_filtered_and_record_matches(filtered_join_args(
             &probe_view,
             &predicate,
             &build_view,
-            &probe_view,
-            Some(&[1]),
-            Some(&[1]),
-        )?;
+        ))?;
 
         let matched_batch = matched.into_view().to_arrow_host()?;
         assert_eq!(int32_values(&matched_batch, 0), vec![20]);
@@ -1143,17 +1199,11 @@ mod tests {
         let probe = make_table(vec![2, 2], vec![15, 25]);
         let probe_view = probe.into_view();
         let predicate = value_less_predicate()?;
-        let matched = join.inner_join_filtered_and_record_matches(
-            &probe_view,
-            &[0],
-            &build_view,
+        let matched = join.inner_join_filtered_and_record_matches(filtered_join_args(
             &probe_view,
             &predicate,
             &build_view,
-            &probe_view,
-            Some(&[1]),
-            Some(&[1]),
-        )?;
+        ))?;
         assert_eq!(matched.num_rows(), 1);
 
         let unmatched =
@@ -1172,17 +1222,11 @@ mod tests {
         let probe = make_table(vec![1, 2], vec![5, 15]);
         let probe_view = probe.into_view();
         let predicate = value_less_predicate()?;
-        let matched = join.inner_join_filtered_and_record_matches(
-            &probe_view,
-            &[0],
-            &build_view,
+        let matched = join.inner_join_filtered_and_record_matches(filtered_join_args(
             &probe_view,
             &predicate,
             &build_view,
-            &probe_view,
-            Some(&[1]),
-            Some(&[1]),
-        )?;
+        ))?;
         assert_eq!(matched.num_rows(), 0);
 
         let unmatched =
@@ -1208,17 +1252,11 @@ mod tests {
         let probe = make_table(vec![2, 2, 4], vec![25, 35, 400]);
         let probe_view = probe.into_view();
         let predicate = value_less_predicate()?;
-        let result = join.probe_left_join_filtered_and_record_matches(
-            &probe_view,
-            &[0],
-            &build_view,
+        let result = join.probe_left_join_filtered_and_record_matches(filtered_join_args(
             &probe_view,
             &predicate,
             &build_view,
-            &probe_view,
-            Some(&[1]),
-            Some(&[1]),
-        )?;
+        ))?;
 
         let batch = result.into_view().to_arrow_host()?;
         let mut pairs: Vec<_> = int32_options(&batch, 0)

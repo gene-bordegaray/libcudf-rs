@@ -20,7 +20,10 @@ use datafusion_physical_plan::{
     ExecutionPlanProperties, PhysicalExpr, PlanProperties,
 };
 use futures::{StreamExt, TryStreamExt};
-use libcudf_rs::{CuDFAstExpression, CuDFHashJoin, CuDFNullEquality, CuDFTable, CuDFTableView};
+use libcudf_rs::{
+    CuDFAstExpression, CuDFFilteredHashJoinArgs, CuDFHashJoin, CuDFNullEquality, CuDFTable,
+    CuDFTableView,
+};
 use std::any::Any;
 use std::fmt::Formatter;
 use std::future::Future;
@@ -515,73 +518,78 @@ impl StreamingJoinState {
         let right_view = right.view();
         let _timer = self.metrics.join_time.timer();
 
-        let result = match (self.plan.join_type, build.filter.as_ref()) {
-            (JoinType::Inner, Some(predicate)) => build.join.inner_join_filtered(
-                &right_view,
-                &self.plan.right_on,
-                &left_view,
-                &right_view,
-                predicate,
-                &left_view,
-                &right_view,
-                build.left_out.as_deref(),
-                build.right_out.as_deref(),
-            ),
-            (JoinType::Inner, None) => build.join.inner_join(
-                &right_view,
-                &self.plan.right_on,
-                &left_view,
-                &right_view,
-                build.left_out.as_deref(),
-                build.right_out.as_deref(),
-            ),
-            (JoinType::Left, Some(predicate)) => build.join.inner_join_filtered_and_record_matches(
-                &right_view,
-                &self.plan.right_on,
-                &left_view,
-                &right_view,
-                predicate,
-                &left_view,
-                &right_view,
-                build.left_out.as_deref(),
-                build.right_out.as_deref(),
-            ),
-            (JoinType::Left, None) => build.join.inner_join_and_record_matches(
-                &right_view,
-                &self.plan.right_on,
-                &left_view,
-                &right_view,
-                build.left_out.as_deref(),
-                build.right_out.as_deref(),
-            ),
-            (JoinType::Full, Some(predicate)) => {
-                build.join.probe_left_join_filtered_and_record_matches(
+        let result =
+            match (self.plan.join_type, build.filter.as_ref()) {
+                (JoinType::Inner, Some(predicate)) => {
+                    build.join.inner_join_filtered(CuDFFilteredHashJoinArgs {
+                        probe: &right_view,
+                        probe_on: &self.plan.right_on,
+                        build_conditional: &left_view,
+                        probe_conditional: &right_view,
+                        predicate,
+                        build_payload: &left_view,
+                        probe_payload: &right_view,
+                        build_out_cols: build.left_out.as_deref(),
+                        probe_out_cols: build.right_out.as_deref(),
+                    })
+                }
+                (JoinType::Inner, None) => build.join.inner_join(
                     &right_view,
                     &self.plan.right_on,
                     &left_view,
                     &right_view,
-                    predicate,
+                    build.left_out.as_deref(),
+                    build.right_out.as_deref(),
+                ),
+                (JoinType::Left, Some(predicate)) => build
+                    .join
+                    .inner_join_filtered_and_record_matches(CuDFFilteredHashJoinArgs {
+                        probe: &right_view,
+                        probe_on: &self.plan.right_on,
+                        build_conditional: &left_view,
+                        probe_conditional: &right_view,
+                        predicate,
+                        build_payload: &left_view,
+                        probe_payload: &right_view,
+                        build_out_cols: build.left_out.as_deref(),
+                        probe_out_cols: build.right_out.as_deref(),
+                    }),
+                (JoinType::Left, None) => build.join.inner_join_and_record_matches(
+                    &right_view,
+                    &self.plan.right_on,
                     &left_view,
                     &right_view,
                     build.left_out.as_deref(),
                     build.right_out.as_deref(),
-                )
-            }
-            (JoinType::Full, None) => build.join.probe_left_join_and_record_matches(
-                &right_view,
-                &self.plan.right_on,
-                &left_view,
-                &right_view,
-                build.left_out.as_deref(),
-                build.right_out.as_deref(),
-            ),
-            other => {
-                return Err(DataFusionError::NotImplemented(format!(
-                    "CuDFHashJoinExec: unsupported streaming join type {:?}",
-                    other.0
-                )))
-            }
-        };
+                ),
+                (JoinType::Full, Some(predicate)) => build
+                    .join
+                    .probe_left_join_filtered_and_record_matches(CuDFFilteredHashJoinArgs {
+                        probe: &right_view,
+                        probe_on: &self.plan.right_on,
+                        build_conditional: &left_view,
+                        probe_conditional: &right_view,
+                        predicate,
+                        build_payload: &left_view,
+                        probe_payload: &right_view,
+                        build_out_cols: build.left_out.as_deref(),
+                        probe_out_cols: build.right_out.as_deref(),
+                    }),
+                (JoinType::Full, None) => build.join.probe_left_join_and_record_matches(
+                    &right_view,
+                    &self.plan.right_on,
+                    &left_view,
+                    &right_view,
+                    build.left_out.as_deref(),
+                    build.right_out.as_deref(),
+                ),
+                other => {
+                    return Err(DataFusionError::NotImplemented(format!(
+                        "CuDFHashJoinExec: unsupported streaming join type {:?}",
+                        other.0
+                    )))
+                }
+            };
 
         result.map_err(cudf_to_df)
     }
