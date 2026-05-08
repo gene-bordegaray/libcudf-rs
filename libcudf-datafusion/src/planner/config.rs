@@ -7,6 +7,10 @@ extensions_options! {
         pub enable: bool, default = true
         /// Target input bytes accumulated by each cuDF aggregate chunk before flushing.
         pub aggregate_chunk_target_bytes: usize, default = 256 * 1024 * 1024
+        /// Enables replacing local Parquet file scans with cuDF-backed scans.
+        pub parquet_scan: bool, default = true
+        /// Maximum number of files included in each cuDF Parquet read.
+        pub parquet_scan_files_per_batch: usize, default = 8
     }
 }
 

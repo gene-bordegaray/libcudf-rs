@@ -4,7 +4,7 @@ mod tests {
     use datafusion::prelude::{SessionConfig, SessionContext};
     use datafusion_physical_plan::displayable;
     use libcudf_datafusion::aggregate::{avg, count, max, min, sum};
-    use libcudf_datafusion::{assert_snapshot, SessionStateBuilderExt};
+    use libcudf_datafusion::{assert_snapshot, CuDFConfig, SessionStateBuilderExt};
     use libcudf_datafusion_benchmarks::datasets::{register_tables, tpch};
     use std::error::Error;
     use std::fs;
@@ -18,6 +18,8 @@ mod tests {
     #[tokio::test]
     async fn test_tpch_1() -> Result<(), Box<dyn Error>> {
         let plan = test_tpch_query("q1").await?;
+        assert!(plan.contains("CuDFParquetScanExec"));
+        assert!(!plan.contains("CuDFLoadExec"));
         assert_snapshot!(plan, @r"
         CuDFUnloadExec
           CuDFSortExec: expr=[l_returnflag@0 ASC NULLS LAST, l_linestatus@1 ASC NULLS LAST], preserve_partitioning=[false]
@@ -25,9 +27,21 @@ mod tests {
               CuDFAggregateExec: mode=Single, group_by=[l_returnflag@l_returnflag@5, l_linestatus@l_linestatus@6], aggr_expr=[sum(lineitem.l_quantity), sum(lineitem.l_extendedprice), sum(lineitem.l_extendedprice * Int64(1) - lineitem.l_discount), sum(lineitem.l_extendedprice * Int64(1) - lineitem.l_discount * Int64(1) + lineitem.l_tax), avg(lineitem.l_quantity), avg(lineitem.l_extendedprice), avg(lineitem.l_discount), count(Int64(1))]
                 CuDFProjectionExec: expr=[l_extendedprice@1 * (Some(1),20,0 - l_discount@2) as __common_expr_1, l_quantity@0 as l_quantity, l_extendedprice@1 as l_extendedprice, l_discount@2 as l_discount, l_tax@3 as l_tax, l_returnflag@4 as l_returnflag, l_linestatus@5 as l_linestatus]
                   CuDFFilterExec: l_shipdate@6 <= 1998-09-02, projection=[l_quantity@0, l_extendedprice@1, l_discount@2, l_tax@3, l_returnflag@4, l_linestatus@5]
-                    CuDFLoadExec
-                      DataSourceExec: file_groups={1 group: [[/data/tpch/plan_sf0.02/lineitem/1.parquet, /data/tpch/plan_sf0.02/lineitem/10.parquet, /data/tpch/plan_sf0.02/lineitem/11.parquet, /data/tpch/plan_sf0.02/lineitem/12.parquet, /data/tpch/plan_sf0.02/lineitem/13.parquet, /data/tpch/plan_sf0.02/lineitem/14.parquet, /data/tpch/plan_sf0.02/lineitem/15.parquet, /data/tpch/plan_sf0.02/lineitem/16.parquet, /data/tpch/plan_sf0.02/lineitem/2.parquet, /data/tpch/plan_sf0.02/lineitem/3.parquet, /data/tpch/plan_sf0.02/lineitem/4.parquet, /data/tpch/plan_sf0.02/lineitem/5.parquet, /data/tpch/plan_sf0.02/lineitem/6.parquet, /data/tpch/plan_sf0.02/lineitem/7.parquet, /data/tpch/plan_sf0.02/lineitem/8.parquet, /data/tpch/plan_sf0.02/lineitem/9.parquet]]}, projection=[l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate], file_type=parquet, predicate=l_shipdate@10 <= 1998-09-02, pruning_predicate=l_shipdate_null_count@1 != row_count@2 AND l_shipdate_min@0 <= 1998-09-02, required_guarantees=[]
+                    CuDFParquetScanExec: files=16, batches=2, files_per_batch=8, projected_columns=7
         ");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_tpch_1_parquet_scan_disabled_uses_load() -> Result<(), Box<dyn Error>> {
+        let mut cudf_config = CuDFConfig::default();
+        cudf_config.parquet_scan = false;
+
+        let plan = test_tpch_query_with_config("q1", cudf_config).await?;
+
+        assert!(plan.contains("CuDFLoadExec"));
+        assert!(plan.contains("DataSourceExec"));
+        assert!(!plan.contains("CuDFParquetScanExec"));
         Ok(())
     }
 
@@ -628,10 +642,21 @@ mod tests {
     }
 
     async fn test_tpch_query(query_id: &str) -> Result<String, Box<dyn Error>> {
+        test_tpch_query_with_config(query_id, CuDFConfig::default()).await
+    }
+
+    async fn test_tpch_query_with_config(
+        query_id: &str,
+        cudf_config: CuDFConfig,
+    ) -> Result<String, Box<dyn Error>> {
         let ctx = SessionContext::from(
             SessionStateBuilder::new()
                 .with_default_features()
-                .with_config(SessionConfig::new().with_target_partitions(PARTITIONS))
+                .with_config(
+                    SessionConfig::new()
+                        .with_target_partitions(PARTITIONS)
+                        .with_option_extension(cudf_config),
+                )
                 .with_cudf_planner()
                 .build(),
         );

@@ -21,7 +21,7 @@ impl SessionStateBuilderExt for SessionStateBuilder {
         // Assume only one GPU present, and therefore, force target_partitions == 1.
         cfg.options_mut().execution.target_partitions = 1;
 
-        self.with_physical_optimizer_rule(Arc::new(RescaleLeafsRule(target_partitions)))
-            .with_physical_optimizer_rule(Arc::new(HostToCuDFRule))
+        self.with_physical_optimizer_rule(Arc::new(HostToCuDFRule))
+            .with_physical_optimizer_rule(Arc::new(RescaleLeafsRule(target_partitions)))
     }
 }

@@ -65,6 +65,14 @@ pub struct RunOpt {
     #[structopt(long = "cudf-aggregate-chunk-target-bytes")]
     aggregate_chunk_target_bytes: Option<usize>,
 
+    /// Disable the cuDF-backed Parquet scan and use the CPU scan plus CuDF load path.
+    #[structopt(long = "disable-cudf-parquet-scan")]
+    disable_cudf_parquet_scan: bool,
+
+    /// Maximum number of files included in each cuDF Parquet read.
+    #[structopt(long = "cudf-parquet-scan-files-per-batch")]
+    cudf_parquet_scan_files_per_batch: Option<usize>,
+
     /// Activate debug mode to see more details
     #[structopt(short, long)]
     debug: bool,
@@ -125,6 +133,10 @@ impl RunOpt {
             cudf_config.enable = true;
             if let Some(bytes) = self.aggregate_chunk_target_bytes {
                 cudf_config.aggregate_chunk_target_bytes = bytes;
+            }
+            cudf_config.parquet_scan = !self.disable_cudf_parquet_scan;
+            if let Some(files_per_batch) = self.cudf_parquet_scan_files_per_batch {
+                cudf_config.parquet_scan_files_per_batch = files_per_batch;
             }
             config = config.with_option_extension(cudf_config);
         }

@@ -13,7 +13,7 @@ use datafusion_physical_plan::stream::RecordBatchReceiverStream;
 use datafusion_physical_plan::{
     project_schema, DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
 };
-use libcudf_rs::{synchronize_default_stream, CuDFTable};
+use libcudf_rs::{cast, synchronize_default_stream, CuDFTable};
 use std::any::Any;
 use std::fmt::Formatter;
 use std::path::PathBuf;
@@ -251,13 +251,25 @@ impl ExecutionPlan for CuDFParquetScanExec {
                 synchronize_default_stream().map_err(cudf_to_df)?;
                 sync_timer.done();
 
-                let output_batch_timer = metrics.output_batch_time.timer();
+                let cast_timer = metrics.cast_time.timer();
                 let num_rows = table.num_rows();
-                let cudf_cols: Vec<Arc<dyn Array>> = table
-                    .into_columns()
-                    .into_iter()
-                    .map(|c| Arc::new(c.into_view()) as Arc<dyn Array>)
-                    .collect();
+                let mut cudf_cols: Vec<Arc<dyn Array>> = Vec::with_capacity(table.num_columns());
+                for (column, field) in table.into_columns().into_iter().zip(schema.fields()) {
+                    let view = column.into_view();
+                    let column: Arc<dyn Array> = if view.data_type() == field.data_type() {
+                        Arc::new(view)
+                    } else {
+                        Arc::new(
+                            cast(&view, field.data_type())
+                                .map_err(cudf_to_df)?
+                                .into_view(),
+                        )
+                    };
+                    cudf_cols.push(column);
+                }
+                cast_timer.done();
+
+                let output_batch_timer = metrics.output_batch_time.timer();
                 let batch = libcudf_rs::record_batch_with_schema(cudf_cols, &schema, num_rows)?;
                 output_batch_timer.done();
 
@@ -286,6 +298,7 @@ impl ExecutionPlan for CuDFParquetScanExec {
 struct CuDFParquetScanMetrics {
     baseline: CuDFBaselineMetrics,
     read_time: Time,
+    cast_time: Time,
     sync_time: Time,
     output_batch_time: Time,
     output_send_time: Time,
@@ -298,6 +311,7 @@ impl CuDFParquetScanMetrics {
         Self {
             baseline: CuDFBaselineMetrics::new(metrics, partition),
             read_time: MetricBuilder::new(metrics).subset_time("read_time", partition),
+            cast_time: MetricBuilder::new(metrics).subset_time("cast_time", partition),
             sync_time: MetricBuilder::new(metrics).subset_time("sync_time", partition),
             output_batch_time: MetricBuilder::new(metrics)
                 .subset_time("output_batch_time", partition),
@@ -317,14 +331,19 @@ impl CuDFParquetScanMetrics {
 #[cfg(test)]
 mod tests {
     use super::{CuDFParquetScanConfig, CuDFParquetScanExec};
+    use arrow::array::Decimal128Array;
+    use arrow::record_batch::RecordBatch;
+    use arrow_schema::{DataType, Field, Schema};
     use datafusion::execution::TaskContext;
     use datafusion_physical_plan::{execute_stream, ExecutionPlan};
     use futures_util::TryStreamExt;
     use libcudf_rs::is_cudf_array;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-    use std::fs::File;
+    use parquet::arrow::ArrowWriter;
+    use std::fs::{remove_file, File};
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[tokio::test]
     async fn reads_parquet_as_cudf_batches() -> Result<(), Box<dyn std::error::Error>> {
@@ -411,7 +430,60 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn aligns_decimal_output_to_file_schema() -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_parquet_file("decimal-schema");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(15, 2),
+            false,
+        )]));
+        let amounts = Decimal128Array::from_iter_values([12345_i128, 67890_i128])
+            .with_precision_and_scale(15, 2)?;
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(amounts)])?;
+        write_parquet(&path, &batch)?;
+
+        let config = CuDFParquetScanConfig::new(vec![path.clone()], Arc::clone(&schema));
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(CuDFParquetScanExec::try_new(config)?);
+        let batches = execute_stream(plan, Arc::new(TaskContext::default()))?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        remove_file(path).ok();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].schema().as_ref(), schema.as_ref());
+        assert_eq!(
+            batches[0].column(0).data_type(),
+            &DataType::Decimal128(15, 2)
+        );
+        assert!(is_cudf_array(batches[0].column(0).as_ref()));
+
+        Ok(())
+    }
+
     fn weather_file(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("../testdata/weather/{name}"))
+    }
+
+    fn temp_parquet_file(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after Unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "libcudf-datafusion-{name}-{}-{nanos}.parquet",
+            std::process::id()
+        ))
+    }
+
+    fn write_parquet(
+        path: &PathBuf,
+        batch: &RecordBatch,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let file = File::create(path)?;
+        let mut writer = ArrowWriter::try_new(file, batch.schema(), None)?;
+        writer.write(batch)?;
+        writer.close()?;
+        Ok(())
     }
 }
