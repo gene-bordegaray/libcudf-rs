@@ -1,4 +1,6 @@
 use crate::cudf_reference::CuDFRef;
+use crate::device_resource::resource_ref;
+use crate::stream::stream_ref;
 use crate::{CuDFColumnView, CuDFError};
 use arrow::array::{Array, ArrayRef, RecordBatch, RecordBatchOptions, StructArray};
 use arrow::ffi::{from_ffi, FFI_ArrowArray};
@@ -164,8 +166,13 @@ impl CuDFTableView {
         unsafe {
             self.inner
                 .to_arrow_schema(&mut ffi_schema as *mut FFI_ArrowSchema as *mut u8);
-            self.inner
-                .to_arrow_array(&mut ffi_array as *mut FFI_ArrowArray as *mut u8);
+            let stream = ffi::get_default_stream();
+            let mr = ffi::get_current_device_resource_ref();
+            self.inner.to_arrow_array(
+                &mut ffi_array as *mut FFI_ArrowArray as *mut u8,
+                stream_ref(&stream)?,
+                resource_ref(&mr)?,
+            );
         }
 
         let schema = Arc::new(Schema::try_from(&ffi_schema)?);

@@ -1,6 +1,7 @@
 use cxx::UniquePtr;
 
-use crate::Result;
+use crate::{CuDFError, Result};
+use libcudf_sys::ffi;
 
 /// Stream creation flags for CUDA stream-backed cuDF execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,6 +21,9 @@ impl From<CuDFStreamFlags> for u32 {
 
 /// Owning Rust wrapper for a CUDA stream used by cuDF operations.
 ///
+/// For the default stream, use [`ffi::get_default_stream`] to get the default stream
+/// view instead.
+///
 /// This type owns an opaque C++ `rmm::cuda_stream`. Dropping `CuDFStream`
 /// destroys that underlying stream.
 ///
@@ -29,7 +33,6 @@ impl From<CuDFStreamFlags> for u32 {
 pub struct CuDFStream {
     // Kept alive so the underlying C++ `rmm::cuda_stream` is destroyed on
     // drop. Accessed via `inner()` from within the crate.
-    #[allow(dead_code)]
     inner: UniquePtr<libcudf_sys::ffi::CudaStream>,
 }
 
@@ -64,11 +67,27 @@ impl CuDFStream {
         Ok(())
     }
 
+    /// Returns an owned [ffi::CudaStreamView] for this stream.
+    #[allow(dead_code)]
+    pub(crate) fn view(&self) -> UniquePtr<ffi::CudaStreamView> {
+        ffi::cuda_stream_view(self.inner())
+    }
+
     /// Get a reference to the underlying FFI stream handle.
     #[allow(dead_code)]
     pub(crate) fn inner(&self) -> &libcudf_sys::ffi::CudaStream {
         self.inner.as_ref().expect("CudaStream should not be null")
     }
+}
+
+/// Return a non-null CUDA stream view reference from a cuDF FFI handle.
+///
+/// cuDF should always return a valid stream view; this surfaces a Rust error if
+/// the FFI handle is unexpectedly null.
+pub(crate) fn stream_ref(stream: &UniquePtr<ffi::CudaStreamView>) -> Result<&ffi::CudaStreamView> {
+    stream
+        .as_ref()
+        .ok_or(CuDFError::NullHandle("CUDA stream view"))
 }
 
 impl Default for CuDFStream {

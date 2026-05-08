@@ -1,3 +1,5 @@
+use crate::device_resource::resource_ref;
+use crate::stream::stream_ref;
 use crate::{CuDFColumn, CuDFError, CuDFTable, CuDFTableView};
 use libcudf_sys::{ffi, NullOrder, Order};
 
@@ -105,12 +107,16 @@ pub fn sort(
     let column_order_i32: Vec<i32> = sort_orders.iter().map(|&o| o.order() as i32).collect();
     let null_precedence_i32: Vec<i32> =
         sort_orders.iter().map(|&o| o.null_order() as i32).collect();
+    let stream = ffi::get_default_stream();
+    let mr = ffi::get_current_device_resource_ref();
 
     let inner = ffi::stable_sort_by_key(
         table.inner(),
         keys_view.inner(),
         &column_order_i32,
         &null_precedence_i32,
+        stream_ref(&stream)?,
+        resource_ref(&mr)?,
     )?;
     Ok(CuDFTable::from_inner(inner))
 }
@@ -151,8 +157,16 @@ pub fn sort_by_all(
     let column_order_i32: Vec<i32> = sort_orders.iter().map(|&o| o.order() as i32).collect();
     let null_precedence_i32: Vec<i32> =
         sort_orders.iter().map(|&o| o.null_order() as i32).collect();
+    let stream = ffi::get_default_stream();
+    let mr = ffi::get_current_device_resource_ref();
 
-    let inner = ffi::stable_sort_table(table.inner(), &column_order_i32, &null_precedence_i32)?;
+    let inner = ffi::stable_sort_table(
+        table.inner(),
+        &column_order_i32,
+        &null_precedence_i32,
+        stream_ref(&stream)?,
+        resource_ref(&mr)?,
+    )?;
     Ok(CuDFTable::from_inner(inner))
 }
 
@@ -189,8 +203,16 @@ pub fn stable_sorted_order(
     let column_order_i32: Vec<i32> = sort_orders.iter().map(|&o| o.order() as i32).collect();
     let null_precedence_i32: Vec<i32> =
         sort_orders.iter().map(|&o| o.null_order() as i32).collect();
+    let stream = ffi::get_default_stream();
+    let mr = ffi::get_current_device_resource_ref();
 
-    let inner = ffi::stable_sorted_order(table.inner(), &column_order_i32, &null_precedence_i32)?;
+    let inner = ffi::stable_sorted_order(
+        table.inner(),
+        &column_order_i32,
+        &null_precedence_i32,
+        stream_ref(&stream)?,
+        resource_ref(&mr)?,
+    )?;
     Ok(CuDFColumn::new(inner))
 }
 
