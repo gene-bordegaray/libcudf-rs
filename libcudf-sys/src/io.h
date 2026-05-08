@@ -1,17 +1,117 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
-#include "rust/cxx.h"
-#include "table.h"
-#include "stream.h"
+#include <vector>
+
 #include "memory_resource.h"
+#include "rust/cxx.h"
+#include "stream.h"
+#include "table.h"
+
+#include <cudf/io/parquet.hpp>
 
 namespace libcudf_bridge {
+    // Opaque wrapper for cudf::io::source_info.
+    struct SourceInfo {
+        cudf::io::source_info inner;
 
-    // Parquet I/O
-    std::unique_ptr<Table> read_parquet(
-        rust::Str filename,
-        const CudaStreamView &stream,
-        const DeviceAsyncResourceRef &mr);
-    void write_parquet(const TableView &table, rust::Str filename, const CudaStreamView &stream);
+        SourceInfo();
+
+        explicit SourceInfo(cudf::io::source_info source);
+
+        ~SourceInfo();
+
+        [[nodiscard]] size_t num_sources() const;
+    };
+
+    // Opaque wrapper for cudf::io::sink_info.
+    struct SinkInfo {
+        cudf::io::sink_info inner;
+
+        SinkInfo();
+
+        explicit SinkInfo(cudf::io::sink_info sink);
+
+        ~SinkInfo();
+
+        [[nodiscard]] size_t num_sinks() const;
+    };
+
+    // Opaque wrapper for cudf::io::parquet_reader_options.
+    struct ParquetReaderOptions {
+        cudf::io::parquet_reader_options inner;
+
+        ParquetReaderOptions();
+
+        explicit ParquetReaderOptions(cudf::io::parquet_reader_options options);
+
+        ~ParquetReaderOptions();
+
+        void set_source(const SourceInfo& source);
+
+        void set_columns(rust::Vec<rust::String> col_names);
+    };
+
+    // Opaque wrapper for cudf::io::parquet_writer_options.
+    struct ParquetWriterOptions {
+        cudf::io::parquet_writer_options inner;
+
+        ParquetWriterOptions();
+
+        explicit ParquetWriterOptions(cudf::io::parquet_writer_options options);
+
+        ~ParquetWriterOptions();
+    };
+
+    // Opaque wrapper for cudf::io::table_with_metadata.
+    struct TableWithMetadata {
+        cudf::io::table_with_metadata inner;
+
+        explicit TableWithMetadata(cudf::io::table_with_metadata result);
+
+        ~TableWithMetadata();
+
+        std::unique_ptr<Table> release_table();
+
+        [[nodiscard]] size_t num_rows_per_source_count() const;
+
+        [[nodiscard]] size_t num_rows_per_source(size_t index) const;
+
+        [[nodiscard]] int32_t num_input_row_groups() const;
+    };
+
+    // Opaque owning wrapper for the file metadata byte vector returned by write_parquet.
+    struct HostByteVector {
+        std::unique_ptr<std::vector<uint8_t>> inner;
+
+        explicit HostByteVector(std::unique_ptr<std::vector<uint8_t>> bytes);
+
+        ~HostByteVector();
+
+        [[nodiscard]] size_t size() const;
+    };
+
+    std::unique_ptr<SourceInfo> source_info_from_file_path(rust::Str file_path);
+
+    std::unique_ptr<SourceInfo> source_info_from_file_paths(rust::Vec<rust::String> file_paths);
+
+    std::unique_ptr<SinkInfo> sink_info_from_file_path(rust::Str file_path);
+
+    std::unique_ptr<SinkInfo> sink_info_from_file_paths(rust::Vec<rust::String> file_paths);
+
+    std::unique_ptr<ParquetReaderOptions> parquet_reader_options_create(const SourceInfo& source);
+
+    std::unique_ptr<ParquetWriterOptions> parquet_writer_options_create(
+        const SinkInfo& sink,
+        const TableView& table);
+
+    std::unique_ptr<TableWithMetadata> read_parquet(
+        const ParquetReaderOptions& options,
+        const CudaStreamView& stream,
+        const DeviceAsyncResourceRef& mr);
+
+    std::unique_ptr<HostByteVector> write_parquet(
+        const ParquetWriterOptions& options,
+        const CudaStreamView& stream);
 } // namespace libcudf_bridge

@@ -77,14 +77,65 @@ impl CuDFTable {
     /// # Ok::<(), libcudf_rs::CuDFError>(())
     /// ```
     pub fn from_parquet<P: AsRef<Path>>(path: P) -> Result<Self, CuDFError> {
+        Self::from_parquet_files(std::slice::from_ref(&path))
+    }
+
+    /// Read a table from one or more Parquet files.
+    pub fn from_parquet_files<P: AsRef<Path>>(paths: &[P]) -> Result<Self, CuDFError> {
+        Self::from_parquet_files_with_columns(paths, Option::<&[String]>::None)
+    }
+
+    /// Read selected columns from one or more Parquet files.
+    pub fn from_parquet_files_with_columns<P, S>(
+        paths: &[P],
+        columns: Option<&[S]>,
+    ) -> Result<Self, CuDFError>
+    where
+        P: AsRef<Path>,
+        S: AsRef<str>,
+    {
         crate::config::ensure_pools_configured();
-        let path_str = path.as_ref().to_str().ok_or_else(|| {
-            ArrowError::InvalidArgumentError("Path contains invalid UTF-8".to_string())
-        })?;
+        if paths.is_empty() {
+            return Err(ArrowError::InvalidArgumentError(
+                "at least one Parquet file is required".to_string(),
+            )
+            .into());
+        }
+
+        let path_strings = paths
+            .iter()
+            .map(|path| {
+                path.as_ref()
+                    .to_str()
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(|| {
+                        ArrowError::InvalidArgumentError("Path contains invalid UTF-8".to_string())
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let source = ffi::source_info_from_file_paths(path_strings);
+        let source = source.as_ref().expect("source_info should not be null");
+        let mut options = ffi::parquet_reader_options_create(source);
+        if let Some(columns) = columns {
+            options.pin_mut().set_columns(
+                columns
+                    .iter()
+                    .map(|column| column.as_ref().to_string())
+                    .collect(),
+            );
+        }
 
         let stream = ffi::get_default_stream();
         let mr = ffi::get_current_device_resource_ref();
-        let inner = ffi::read_parquet(path_str, stream_ref(&stream)?, resource_ref(&mr)?)?;
+        let mut result = ffi::read_parquet(
+            options
+                .as_ref()
+                .expect("parquet_reader_options should not be null"),
+            stream.as_ref().expect("default stream should not be null"),
+            mr.as_ref().expect("device resource should not be null"),
+        )?;
+        let inner = result.pin_mut().release_table();
         Ok(Self { inner })
     }
 
@@ -115,8 +166,18 @@ impl CuDFTable {
         })?;
 
         let view = self.inner.view();
+        let sink = ffi::sink_info_from_file_path(path_str);
+        let options = ffi::parquet_writer_options_create(
+            sink.as_ref().expect("sink_info should not be null"),
+            &view,
+        );
         let stream = ffi::get_default_stream();
-        ffi::write_parquet(&view, path_str, stream_ref(&stream)?)?;
+        let _metadata = ffi::write_parquet(
+            options
+                .as_ref()
+                .expect("parquet_writer_options should not be null"),
+            stream_ref(&stream)?,
+        )?;
         Ok(())
     }
 
@@ -458,6 +519,30 @@ mod tests {
     }
 
     #[test]
+    fn test_parquet_file_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
+        let table = CuDFTable::from_parquet("testdata/weather/result-000000.parquet")?;
+        let output = std::env::temp_dir().join(format!(
+            "libcudf-rs-roundtrip-{}-{}.parquet",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+
+        let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            table.to_parquet(&output)?;
+            let roundtrip = CuDFTable::from_parquet(&output)?;
+
+            assert_eq!(roundtrip.num_rows(), table.num_rows());
+            assert_eq!(roundtrip.num_columns(), table.num_columns());
+            Ok(())
+        })();
+
+        let _ = std::fs::remove_file(output);
+        result
+    }
+
+    #[test]
     fn test_read_all_weather_files() {
         for i in 0..3 {
             let filename = format!("testdata/weather/result-{:06}.parquet", i);
@@ -467,5 +552,21 @@ mod tests {
             assert!(table.num_rows() > 0);
             assert!(table.num_columns() > 0);
         }
+    }
+
+    #[test]
+    fn test_read_multiple_parquet_files_with_columns() -> Result<(), Box<dyn std::error::Error>> {
+        let files = [
+            "testdata/weather/result-000000.parquet",
+            "testdata/weather/result-000001.parquet",
+        ];
+        let columns = vec!["MinTemp".to_string(), "MaxTemp".to_string()];
+
+        let projected = CuDFTable::from_parquet_files_with_columns(&files, Some(&columns))?;
+
+        assert!(projected.num_rows() > 0);
+        assert_eq!(projected.num_columns(), columns.len());
+
+        Ok(())
     }
 }

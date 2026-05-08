@@ -75,6 +75,24 @@ pub mod ffi {
         /// Owning cuDF AST expression tree.
         type AstExpressionTree;
 
+        /// cuDF source information for IO readers.
+        type SourceInfo;
+
+        /// cuDF sink information for IO writers.
+        type SinkInfo;
+
+        /// cuDF Parquet reader options.
+        type ParquetReaderOptions;
+
+        /// cuDF Parquet writer options.
+        type ParquetWriterOptions;
+
+        /// cuDF table and metadata returned by I/O readers.
+        type TableWithMetadata;
+
+        /// Host byte vector returned by Parquet writers for file metadata.
+        type HostByteVector;
+
         /// Aggregation operation accepted by cuDF reductions.
         type ReduceAggregation;
 
@@ -321,11 +339,11 @@ pub mod ffi {
         /// Get a view of this column
         fn view(self: &Column) -> UniquePtr<ColumnView>;
 
-        /// Get the column view data as an FFI ArrowArray
+        /// Get the column view data as an FFI ArrowDeviceArray
         ///
         /// # Safety
         ///
-        /// `out_array_ptr` must point to a valid `ArrowArray`. Caller must release it.
+        /// `out_array_ptr` must point to a valid `ArrowDeviceArray`. Caller must release it.
         unsafe fn to_arrow_array(
             self: &ColumnView,
             out_array_ptr: *mut u8,
@@ -369,11 +387,11 @@ pub mod ffi {
         fn scale(self: &DataType) -> i32;
 
         // Scalar methods
-        /// Get the scalar data as an FFI ArrowArray
+        /// Get the scalar data as an FFI ArrowDeviceArray
         ///
         /// # Safety
         ///
-        /// `out_array_ptr` must point to a valid `ArrowArray`. Caller must release it.
+        /// `out_array_ptr` must point to a valid `ArrowDeviceArray`. Caller must release it.
         unsafe fn to_arrow_array(
             self: &Scalar,
             out_array_ptr: *mut u8,
@@ -447,15 +465,66 @@ pub mod ffi {
 
         // Parquet I/O
 
-        /// Read a Parquet file into a table
+        /// Construct `cudf::io::source_info` from one file path.
+        fn source_info_from_file_path(file_path: &str) -> UniquePtr<SourceInfo>;
+
+        /// Construct `cudf::io::source_info` from multiple file paths.
+        fn source_info_from_file_paths(file_paths: Vec<String>) -> UniquePtr<SourceInfo>;
+
+        /// Return the number of sources in this `source_info`.
+        fn num_sources(self: &SourceInfo) -> usize;
+
+        /// Construct `cudf::io::sink_info` from one file path.
+        fn sink_info_from_file_path(file_path: &str) -> UniquePtr<SinkInfo>;
+
+        /// Construct `cudf::io::sink_info` from multiple file paths.
+        fn sink_info_from_file_paths(file_paths: Vec<String>) -> UniquePtr<SinkInfo>;
+
+        /// Return the number of sinks in this `sink_info`.
+        fn num_sinks(self: &SinkInfo) -> usize;
+
+        /// Build `cudf::io::parquet_reader_options` from `source_info`.
+        fn parquet_reader_options_create(source: &SourceInfo) -> UniquePtr<ParquetReaderOptions>;
+
+        /// Build `cudf::io::parquet_writer_options` from `sink_info` and a table view.
+        fn parquet_writer_options_create(
+            sink: &SinkInfo,
+            table: &TableView,
+        ) -> UniquePtr<ParquetWriterOptions>;
+
+        /// Set the source on `cudf::io::parquet_reader_options`.
+        fn set_source(self: Pin<&mut ParquetReaderOptions>, source: &SourceInfo);
+
+        /// Set projected columns on `cudf::io::parquet_reader_options`.
+        fn set_columns(self: Pin<&mut ParquetReaderOptions>, col_names: Vec<String>);
+
+        /// Take ownership of the table from `cudf::io::table_with_metadata`.
+        fn release_table(self: Pin<&mut TableWithMetadata>) -> UniquePtr<Table>;
+
+        /// Return the number of per-source row counts in the metadata.
+        fn num_rows_per_source_count(self: &TableWithMetadata) -> usize;
+
+        /// Return the row count for one input source.
+        fn num_rows_per_source(self: &TableWithMetadata, index: usize) -> usize;
+
+        /// Return the total number of input row groups.
+        fn num_input_row_groups(self: &TableWithMetadata) -> i32;
+
+        /// Read Parquet using explicit reader options, CUDA stream, and device resource.
         fn read_parquet(
-            filename: &str,
+            options: &ParquetReaderOptions,
             stream: &CudaStreamView,
             mr: &DeviceAsyncResourceRef,
-        ) -> Result<UniquePtr<Table>>;
+        ) -> Result<UniquePtr<TableWithMetadata>>;
 
-        /// Write a table to a Parquet file
-        fn write_parquet(table: &TableView, filename: &str, stream: &CudaStreamView) -> Result<()>;
+        /// Return the size of the returned host byte vector.
+        fn size(self: &HostByteVector) -> usize;
+
+        /// Write Parquet using explicit writer options and CUDA stream.
+        fn write_parquet(
+            options: &ParquetWriterOptions,
+            stream: &CudaStreamView,
+        ) -> Result<UniquePtr<HostByteVector>>;
 
         // Direct cuDF operations
 
@@ -699,6 +768,7 @@ pub mod ffi {
         ) -> Result<UniquePtr<JoinIndices>>;
 
         /// Filter join index maps with a cuDF AST predicate.
+        #[allow(clippy::too_many_arguments)]
         fn filter_join_indices(
             left: &TableView,
             right: &TableView,
@@ -1649,12 +1719,67 @@ mod tests {
         )
     }
 
+    #[test]
+    fn test_source_info_file_path_count() {
+        let single = ffi::source_info_from_file_path("../testdata/weather/result-000000.parquet");
+        assert_eq!(single.num_sources(), 1);
+
+        let multiple = ffi::source_info_from_file_paths(vec![
+            "../testdata/weather/result-000000.parquet".to_string(),
+            "../testdata/weather/result-000001.parquet".to_string(),
+        ]);
+        assert_eq!(multiple.num_sources(), 2);
+    }
+
+    #[test]
+    fn test_sink_info_file_path_count() {
+        let single = ffi::sink_info_from_file_path("../testdata/weather/result-000000.parquet");
+        assert_eq!(single.num_sinks(), 1);
+
+        let multiple = ffi::sink_info_from_file_paths(vec![
+            "../testdata/weather/result-000000.parquet".to_string(),
+            "../testdata/weather/result-000001.parquet".to_string(),
+        ]);
+        assert_eq!(multiple.num_sinks(), 2);
+    }
+
+    #[test]
+    fn test_read_parquet_with_options_metadata() -> Result<(), Box<dyn std::error::Error>> {
+        let source = ffi::source_info_from_file_paths(vec![
+            "../testdata/weather/result-000000.parquet".to_string(),
+            "../testdata/weather/result-000001.parquet".to_string(),
+        ]);
+        let options = ffi::parquet_reader_options_create(
+            source.as_ref().expect("source_info should not be null"),
+        );
+        let stream = ffi::get_default_stream();
+        let mr = ffi::get_current_device_resource_ref();
+
+        let mut result = ffi::read_parquet(
+            options
+                .as_ref()
+                .expect("parquet_reader_options should not be null"),
+            stream.as_ref().expect("default stream should not be null"),
+            mr.as_ref().expect("device resource should not be null"),
+        )?;
+
+        assert_eq!(result.num_rows_per_source_count(), 2);
+        assert!(result.num_rows_per_source(0) > 0);
+        assert!(result.num_rows_per_source(1) > 0);
+        assert!(result.num_input_row_groups() > 0);
+
+        let table = result.pin_mut().release_table();
+        assert!(table.num_rows() > 0);
+
+        Ok(())
+    }
+
     // Sorting tests
     #[test]
     fn test_sort_table_ascending() -> Result<(), Box<dyn std::error::Error>> {
         let (stream, resource) = default_stream_and_resource();
         let (stream_view, resource_ref) = expect_stream_and_resource(&stream, &resource);
-        let table = ffi::read_parquet(
+        let table = read_parquet_table(
             "../testdata/weather/result-000000.parquet",
             stream_view,
             resource_ref,
@@ -1684,7 +1809,7 @@ mod tests {
     fn test_sort_table_descending() -> Result<(), Box<dyn std::error::Error>> {
         let (stream, resource) = default_stream_and_resource();
         let (stream_view, resource_ref) = expect_stream_and_resource(&stream, &resource);
-        let table = ffi::read_parquet(
+        let table = read_parquet_table(
             "../testdata/weather/result-000000.parquet",
             stream_view,
             resource_ref,
@@ -1714,7 +1839,7 @@ mod tests {
     fn test_stable_sort_table() -> Result<(), Box<dyn std::error::Error>> {
         let (stream, resource) = default_stream_and_resource();
         let (stream_view, resource_ref) = expect_stream_and_resource(&stream, &resource);
-        let table = ffi::read_parquet(
+        let table = read_parquet_table(
             "../testdata/weather/result-000000.parquet",
             stream_view,
             resource_ref,
@@ -1744,7 +1869,7 @@ mod tests {
     fn test_sorted_order() -> Result<(), Box<dyn std::error::Error>> {
         let (stream, resource) = default_stream_and_resource();
         let (stream_view, resource_ref) = expect_stream_and_resource(&stream, &resource);
-        let table = ffi::read_parquet(
+        let table = read_parquet_table(
             "../testdata/weather/result-000000.parquet",
             stream_view,
             resource_ref,
@@ -1773,7 +1898,7 @@ mod tests {
     fn test_is_sorted() -> Result<(), Box<dyn std::error::Error>> {
         let (stream, resource) = default_stream_and_resource();
         let (stream_view, resource_ref) = expect_stream_and_resource(&stream, &resource);
-        let table = ffi::read_parquet(
+        let table = read_parquet_table(
             "../testdata/weather/result-000000.parquet",
             stream_view,
             resource_ref,
@@ -1803,7 +1928,7 @@ mod tests {
     fn test_sort_by_key() -> Result<(), Box<dyn std::error::Error>> {
         let (stream, resource) = default_stream_and_resource();
         let (stream_view, resource_ref) = expect_stream_and_resource(&stream, &resource);
-        let table = ffi::read_parquet(
+        let table = read_parquet_table(
             "../testdata/weather/result-000000.parquet",
             stream_view,
             resource_ref,
@@ -1835,7 +1960,7 @@ mod tests {
     fn test_stable_sort_by_key() -> Result<(), Box<dyn std::error::Error>> {
         let (stream, resource) = default_stream_and_resource();
         let (stream_view, resource_ref) = expect_stream_and_resource(&stream, &resource);
-        let table = ffi::read_parquet(
+        let table = read_parquet_table(
             "../testdata/weather/result-000000.parquet",
             stream_view,
             resource_ref,
@@ -1868,7 +1993,7 @@ mod tests {
     fn test_binary_op_col_col_add() -> Result<(), Box<dyn std::error::Error>> {
         let (stream, resource) = default_stream_and_resource();
         let (stream_view, resource_ref) = expect_stream_and_resource(&stream, &resource);
-        let table = ffi::read_parquet(
+        let table = read_parquet_table(
             "../testdata/weather/result-000000.parquet",
             stream_view,
             resource_ref,
@@ -1899,7 +2024,7 @@ mod tests {
     fn test_binary_op_col_col_multiply() -> Result<(), Box<dyn std::error::Error>> {
         let (stream, resource) = default_stream_and_resource();
         let (stream_view, resource_ref) = expect_stream_and_resource(&stream, &resource);
-        let table = ffi::read_parquet(
+        let table = read_parquet_table(
             "../testdata/weather/result-000000.parquet",
             stream_view,
             resource_ref,
@@ -2170,7 +2295,7 @@ mod tests {
     fn test_apply_boolean_mask() -> Result<(), Box<dyn std::error::Error>> {
         let (stream, resource) = default_stream_and_resource();
         let (stream_view, resource_ref) = expect_stream_and_resource(&stream, &resource);
-        let table = ffi::read_parquet(
+        let table = read_parquet_table(
             "../testdata/weather/result-000000.parquet",
             stream_view,
             resource_ref,
@@ -2190,8 +2315,9 @@ mod tests {
             resource_ref,
         )?;
 
+        let boolean_mask_view = boolean_mask.view();
         let filtered_table =
-            ffi::apply_boolean_mask(&table_view, &boolean_mask.view(), stream_view, resource_ref)?;
+            ffi::apply_boolean_mask(&table_view, &boolean_mask_view, stream_view, resource_ref)?;
 
         assert!(filtered_table.num_rows() < table.num_rows());
         assert_eq!(filtered_table.num_columns(), table.num_columns());
@@ -2208,7 +2334,7 @@ mod tests {
     fn test_groupby_sum() -> Result<(), Box<dyn std::error::Error>> {
         let (stream, resource) = default_stream_and_resource();
         let (stream_view, resource_ref) = expect_stream_and_resource(&stream, &resource);
-        let table = ffi::read_parquet(
+        let table = read_parquet_table(
             "../testdata/weather/result-000000.parquet",
             stream_view,
             resource_ref,
@@ -2249,7 +2375,7 @@ mod tests {
     fn test_groupby_multiple_aggregations() -> Result<(), Box<dyn std::error::Error>> {
         let (stream, resource) = default_stream_and_resource();
         let (stream_view, resource_ref) = expect_stream_and_resource(&stream, &resource);
-        let table = ffi::read_parquet(
+        let table = read_parquet_table(
             "../testdata/weather/result-000001.parquet",
             stream_view,
             resource_ref,
@@ -2306,7 +2432,7 @@ mod tests {
     fn test_slice_column_basic() -> Result<(), Box<dyn std::error::Error>> {
         let (stream, resource) = default_stream_and_resource();
         let (stream_view, resource_ref) = expect_stream_and_resource(&stream, &resource);
-        let table = ffi::read_parquet(
+        let table = read_parquet_table(
             "../testdata/weather/result-000000.parquet",
             stream_view,
             resource_ref,
@@ -2344,7 +2470,7 @@ mod tests {
     fn test_slice_column_from_start() -> Result<(), Box<dyn std::error::Error>> {
         let (stream, resource) = default_stream_and_resource();
         let (stream_view, resource_ref) = expect_stream_and_resource(&stream, &resource);
-        let table = ffi::read_parquet(
+        let table = read_parquet_table(
             "../testdata/weather/result-000000.parquet",
             stream_view,
             resource_ref,
@@ -2417,7 +2543,7 @@ mod tests {
         let stream = ffi::get_default_stream();
         let resource = get_current_device_resource_ref();
         let (stream_view, resource_ref) = expect_stream_and_resource(&stream, &resource);
-        let table = ffi::read_parquet(
+        let table = read_parquet_table(
             "../testdata/weather/result-000000.parquet",
             stream_view,
             resource_ref,
@@ -2522,6 +2648,25 @@ mod tests {
         }?)
     }
 
+    fn read_parquet_table(
+        file_path: &str,
+        stream: &ffi::CudaStreamView,
+        mr: &ffi::DeviceAsyncResourceRef,
+    ) -> Result<cxx::UniquePtr<ffi::Table>, Box<dyn std::error::Error>> {
+        let source = ffi::source_info_from_file_path(file_path);
+        let options = ffi::parquet_reader_options_create(
+            source.as_ref().expect("source_info should not be null"),
+        );
+        let mut result = ffi::read_parquet(
+            options
+                .as_ref()
+                .expect("parquet_reader_options should not be null"),
+            stream,
+            mr,
+        )?;
+        Ok(result.pin_mut().release_table())
+    }
+
     fn pretty_table(table_view: &ffi::TableView) -> Result<impl Display + use<>, ArrowError> {
         let mut array = FFI_ArrowArray::empty();
         let mut schema = FFI_ArrowSchema::empty();
@@ -2549,19 +2694,16 @@ mod tests {
         column_view: &ColumnView,
         data_type: DataType,
     ) -> Result<impl Display + use<>, ArrowError> {
-        let mut array = FFI_ArrowArray::empty();
+        let mut device_array = ArrowDeviceArray::new_cpu();
         let stream = ffi::get_default_stream();
         let resource = ffi::get_current_device_resource_ref();
         let (stream_view, resource_ref) = expect_stream_and_resource(&stream, &resource);
 
         let data = unsafe {
-            column_view.to_arrow_array(
-                &mut array as *mut FFI_ArrowArray as *mut u8,
-                stream_view,
-                resource_ref,
-            );
+            let device_array_ptr = &mut device_array as *mut ArrowDeviceArray as *mut u8;
+            column_view.to_arrow_array(device_array_ptr, stream_view, resource_ref);
 
-            from_ffi_and_data_type(array, data_type).expect("ffi data should be valid")
+            from_ffi_and_data_type(device_array.array, data_type).expect("ffi data should be valid")
         };
 
         let array = make_array(data);

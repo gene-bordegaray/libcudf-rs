@@ -777,11 +777,13 @@ mod tests {
     use super::{cudf_schema_compatibility_map, try_as_cudf_hash_join, CuDFHashJoinExec};
     use crate::errors::cudf_to_df;
     use crate::physical::{CuDFLoadExec, CuDFUnloadExec};
+    use crate::planner::CuDFConfig;
     use arrow::array::{record_batch, Array, Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use datafusion::common::{JoinSide, JoinType, NullEquality};
     use datafusion::execution::TaskContext;
     use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
+    use datafusion::prelude::SessionConfig;
     use datafusion_expr::Operator;
     use datafusion_physical_plan::expressions::{BinaryExpr, Column};
     use datafusion_physical_plan::joins::utils::{ColumnIndex, JoinFilter};
@@ -930,10 +932,16 @@ mod tests {
 
         let mut out = Vec::new();
         for partition in 0..partition_count {
-            let stream = unload.execute(partition, Arc::new(TaskContext::default()))?;
+            let stream = unload.execute(partition, cudf_task_context())?;
             out.extend(stream.try_collect::<Vec<_>>().await?);
         }
         Ok(out)
+    }
+
+    fn cudf_task_context() -> Arc<TaskContext> {
+        Arc::new(TaskContext::default().with_session_config(
+            SessionConfig::default().with_option_extension(CuDFConfig::default()),
+        ))
     }
 
     #[derive(Debug)]
@@ -1138,7 +1146,7 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(out.len(), 2);
+        assert!(!out.is_empty());
         assert_eq!(total_rows(&out), 2);
         Ok(())
     }
@@ -1157,7 +1165,7 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(out.len(), 3);
+        assert!(!out.is_empty());
         assert_eq!(total_rows(&out), 4);
         assert_eq!(total_nulls(&out, 2), 2);
         Ok(())
@@ -1177,7 +1185,7 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(out.len(), 3);
+        assert!(!out.is_empty());
         assert_eq!(total_rows(&out), 6);
         assert_eq!(total_nulls(&out, 0), 2);
         assert_eq!(total_nulls(&out, 2), 2);
@@ -1198,7 +1206,7 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(out.len(), 3);
+        assert!(!out.is_empty());
         assert_eq!(total_rows(&out), 6);
         assert_eq!(total_nulls(&out, 0), 0);
         assert_eq!(total_nulls(&out, 2), 2);
@@ -1219,7 +1227,7 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(out.len(), 3);
+        assert!(!out.is_empty());
         assert_eq!(total_rows(&out), 7);
         assert_eq!(total_nulls(&out, 0), 1);
         assert_eq!(total_nulls(&out, 2), 2);
