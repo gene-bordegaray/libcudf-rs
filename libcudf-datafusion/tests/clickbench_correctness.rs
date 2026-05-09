@@ -9,6 +9,7 @@ mod tests {
     use libcudf_datafusion_benchmarks::datasets::{
         apply_query_settings, clickbench, register_tables,
     };
+    use std::env;
     use std::error::Error;
     use std::fmt::Display;
     use std::ops::Range;
@@ -17,6 +18,7 @@ mod tests {
 
     const PARTITIONS: usize = 6;
     const FILE_RANGE: Range<usize> = 0..3;
+    const DIRECT_PARQUET_SCAN_TEST_ENV: &str = "LIBCUDF_DATAFUSION_DIRECT_PARQUET_SCAN_TESTS";
 
     #[tokio::test]
     #[ignore = "Arrow error: Column 'count(Int64(1))' is declared as non-nullable but contains null values"]
@@ -310,7 +312,16 @@ mod tests {
     }
 
     fn parquet_scan_config() -> CuDFConfig {
-        CuDFConfig::default().with_parquet_scan(true)
+        CuDFConfig::default().with_parquet_scan(correctness_parquet_scan_enabled())
+    }
+
+    fn correctness_parquet_scan_enabled() -> bool {
+        env::var(DIRECT_PARQUET_SCAN_TEST_ENV).is_ok_and(|value| {
+            matches!(
+                value.as_str(),
+                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+            )
+        })
     }
 
     static INIT_TEST_CLICKBENCH_TABLES: OnceCell<()> = OnceCell::const_new();

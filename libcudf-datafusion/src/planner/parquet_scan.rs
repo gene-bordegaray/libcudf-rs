@@ -158,6 +158,14 @@ impl<'a> ParquetScanCandidate<'a> {
         if file_count == 0 {
             Err(UnsupportedReason::EmptyFiles)
         } else {
+            // TODO: DataFusion may split one local Parquet file into multiple
+            // byte-range PartitionedFiles. cuDF reads by path plus row-group
+            // selection, so preserving those split sources can reopen/register
+            // the same file repeatedly. Compacting sources by path is tempting,
+            // but it changes scan partitioning and can violate downstream
+            // distribution assumptions (for example CollectLeft hash joins).
+            // Fix this with a partitioning-aware compaction strategy or by
+            // re-enforcing distribution after direct scan replacement.
             Ok(file_groups)
         }
     }
@@ -309,15 +317,45 @@ pub(crate) fn try_as_cudf_parquet_scan(
 
 #[cfg(test)]
 mod tests {
-    use super::supported_parquet_options;
-    use datafusion::common::config::TableParquetOptions;
+    use super::try_as_cudf_parquet_scan;
+    use crate::planner::CuDFConfig;
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::datasource::listing::PartitionedFile;
+    use datafusion::datasource::object_store::ObjectStoreUrl;
+    use datafusion::datasource::physical_plan::{FileScanConfigBuilder, ParquetSource};
+    use datafusion::datasource::source::DataSourceExec;
+    use datafusion_physical_plan::{displayable, ExecutionPlan};
+    use std::path::PathBuf;
+    use std::sync::Arc;
 
     #[test]
-    fn parquet_options_allow_reader_only_schema_flags() -> Result<(), Box<dyn std::error::Error>> {
-        let mut options = TableParquetOptions::default();
-        options.global.binary_as_string = true;
+    fn direct_parquet_scan_replaces_local_datasource() -> Result<(), Box<dyn std::error::Error>> {
+        let file = weather_file("result-000000.parquet");
+        let size = std::fs::metadata(&file)?.len();
+        let source = Arc::new(ParquetSource::new(Arc::new(Schema::new(vec![Field::new(
+            "station",
+            DataType::Utf8,
+            true,
+        )]))));
+        let scan = FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), source)
+            .with_file(PartitionedFile::new(file.to_string_lossy(), size))
+            .build();
+        let plan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(scan);
 
-        assert!(supported_parquet_options(&options));
+        let replaced =
+            try_as_cudf_parquet_scan(&plan, &CuDFConfig::default().with_parquet_scan(true))?
+                .expect("local Parquet DataSourceExec should become a cuDF scan");
+        let display = displayable(replaced.as_ref()).indent(true).to_string();
+
+        assert!(display.contains("CuDFParquetScanExec"), "{display}");
+        assert!(!display.contains("DataSourceExec"), "{display}");
         Ok(())
+    }
+
+    fn weather_file(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("../testdata/weather/{name}"))
+            .canonicalize()
+            .expect("weather test file should exist")
     }
 }

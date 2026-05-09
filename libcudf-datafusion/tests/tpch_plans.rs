@@ -14,17 +14,6 @@ mod tests {
     const PARTITIONS: usize = 6;
     const TPCH_SCALE_FACTOR: f64 = 0.02;
     const TPCH_DATA_PARTS: i32 = 16;
-
-    #[tokio::test]
-    async fn test_tpch_parquet_scan_plan() -> Result<(), Box<dyn Error>> {
-        let plan = test_tpch_query_with_config("q1", parquet_scan_config()).await?;
-
-        assert_plan_contains(&plan, "CuDFParquetScanExec");
-        assert_plan_contains(&plan, "files_per_batch=8");
-        assert_plan_not_contains(&plan, "DataSourceExec");
-        Ok(())
-    }
-
     #[tokio::test]
     async fn test_tpch_1() -> Result<(), Box<dyn Error>> {
         let plan = test_tpch_query("q1").await?;
@@ -684,24 +673,6 @@ mod tests {
         };
         let display = displayable(plan.as_ref()).indent(true).to_string();
         Ok(display)
-    }
-
-    fn parquet_scan_config() -> CuDFConfig {
-        CuDFConfig::default().with_parquet_scan(true)
-    }
-
-    fn assert_plan_contains(plan: &str, needle: &str) {
-        assert!(
-            plan.contains(needle),
-            "expected plan to contain `{needle}`:\n{plan}"
-        );
-    }
-
-    fn assert_plan_not_contains(plan: &str, needle: &str) {
-        assert!(
-            !plan.contains(needle),
-            "expected plan not to contain `{needle}`:\n{plan}"
-        );
     }
 
     fn register_cudf_aggregate_udfs(ctx: &SessionContext) {

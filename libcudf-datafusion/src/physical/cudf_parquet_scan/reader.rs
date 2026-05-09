@@ -6,9 +6,11 @@ use arrow_schema::SchemaRef;
 use datafusion::common::{plan_err, DataFusionError};
 use datafusion::scalar::ScalarValue;
 use libcudf_rs::{
-    CuDFAstExpression, CuDFColumn, CuDFParquetReadOptions, CuDFParquetReadResult, CuDFScalar,
+    CuDFAstExpression, CuDFColumn, CuDFError, CuDFParquetReadOptions, CuDFParquetReadResult,
+    CuDFScalar,
 };
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 /// Reads cuDF Parquet batches and aligns them to the scan output schema.
@@ -24,6 +26,11 @@ pub(super) struct ParquetBatchReader {
 pub(super) struct ReadBatch {
     pub(super) columns: Vec<CuDFColumn>,
     pub(super) num_rows: usize,
+}
+
+enum ChunkReadOutcome {
+    Finished { emitted: bool, continued: bool },
+    CudfErrorBeforeEmit(CuDFError),
 }
 
 impl ParquetBatchReader {
@@ -84,6 +91,59 @@ impl ParquetBatchReader {
     }
 }
 
+fn read_parquet_chunks<P>(
+    paths: &[P],
+    row_groups: Option<&[Vec<i32>]>,
+    read_columns: Option<&[String]>,
+    filter: Option<&CuDFAstExpression>,
+    chunk_read_limit: usize,
+    pass_read_limit: usize,
+    schema: &SchemaRef,
+    emit: &mut impl FnMut(ReadBatch) -> datafusion::common::Result<bool>,
+) -> datafusion::common::Result<ChunkReadOutcome>
+where
+    P: AsRef<Path>,
+{
+    let mut emitted = false;
+    let mut continued = true;
+    let mut callback_error = None;
+    let read_result = libcudf_rs::CuDFTable::for_each_parquet_chunk(
+        CuDFParquetReadOptions {
+            paths,
+            columns: read_columns,
+            row_groups,
+            filter,
+            allow_mismatched_pq_schemas: read_columns.is_some(),
+            ignore_missing_columns: true,
+        },
+        chunk_read_limit,
+        pass_read_limit,
+        |read| {
+            emitted = true;
+            match align_parquet_read(read, schema).and_then(&mut *emit) {
+                Ok(keep_reading) => {
+                    continued = keep_reading;
+                    Ok(keep_reading)
+                }
+                Err(err) => {
+                    continued = false;
+                    callback_error = Some(err);
+                    Ok(false)
+                }
+            }
+        },
+    );
+
+    if let Some(err) = callback_error {
+        return Err(err);
+    }
+    match read_result {
+        Ok(()) => Ok(ChunkReadOutcome::Finished { emitted, continued }),
+        Err(err) if !emitted => Ok(ChunkReadOutcome::CudfErrorBeforeEmit(err)),
+        Err(err) => Err(cudf_to_df(err)),
+    }
+}
+
 fn read_parquet_sources_together(
     batch: &FileBatch,
     read_columns: Option<&[String]>,
@@ -109,43 +169,29 @@ fn read_parquet_sources_together(
         .iter()
         .map(|source| &source.path)
         .collect::<Vec<_>>();
-    let row_groups = parquet_batch_row_groups(batch)?;
-    let mut emitted = false;
-    let mut continued = true;
-    let mut callback_error = None;
-    let read_result = libcudf_rs::CuDFTable::for_each_parquet_chunk(
-        CuDFParquetReadOptions {
-            paths: &files,
-            columns: read_columns,
-            row_groups: row_groups.as_deref(),
-            filter,
-            allow_mismatched_pq_schemas: read_columns.is_some(),
-            ignore_missing_columns: true,
-        },
+    let row_groups = explicit_row_groups_for_batch(batch)?;
+
+    match read_parquet_chunks(
+        &files,
+        row_groups.as_deref(),
+        read_columns,
+        filter,
         chunk_read_limit,
         pass_read_limit,
-        |read| {
-            emitted = true;
-            match align_parquet_read(read, schema).and_then(&mut *emit) {
-                Ok(keep_reading) => {
-                    continued = keep_reading;
-                    Ok(keep_reading)
-                }
-                Err(err) => {
-                    continued = false;
-                    callback_error = Some(err);
-                    Ok(false)
-                }
+        schema,
+        emit,
+    )? {
+        ChunkReadOutcome::Finished { emitted, continued } => {
+            if !emitted {
+                return emit(empty_read_batch(schema)?);
             }
-        },
-    );
-    if let Some(err) = callback_error {
-        return Err(err);
-    }
-    match read_result {
-        Ok(()) => {}
-        Err(err) if !emitted => {
-            return read_parquet_sources_individually(
+            Ok(continued)
+        }
+        ChunkReadOutcome::CudfErrorBeforeEmit(_) => {
+            // Multi-file cuDF reads can fail when files have schema differences
+            // that are still valid under DataFusion's schema adaptation rules.
+            // Retry per source so missing columns can be null-filled independently.
+            read_parquet_sources_individually(
                 batch,
                 read_columns,
                 filter,
@@ -153,19 +199,17 @@ fn read_parquet_sources_together(
                 chunk_read_limit,
                 pass_read_limit,
                 emit,
-            );
+            )
         }
-        Err(err) => return Err(cudf_to_df(err)),
     }
-    if !emitted {
-        return emit(empty_read_batch(schema)?);
-    }
-    Ok(continued)
 }
 
-fn parquet_batch_row_groups(
+fn explicit_row_groups_for_batch(
     batch: &FileBatch,
 ) -> datafusion::common::Result<Option<Vec<Vec<i32>>>> {
+    // cuDF expects either no row-group argument for all row groups in every file,
+    // or one explicit row-group vector per file. If any source is pruned, expand
+    // unpruned sources to explicit indices so mixed batches stay aligned.
     if !batch
         .sources()
         .iter()
@@ -177,19 +221,21 @@ fn parquet_batch_row_groups(
     batch
         .sources()
         .iter()
-        .map(cudf_row_groups_for_source)
+        .map(explicit_row_groups_for_source)
         .collect::<datafusion::common::Result<Vec<_>>>()
         .map(Some)
 }
 
-fn cudf_row_groups_for_source(source: &CuDFParquetSource) -> datafusion::common::Result<Vec<i32>> {
+fn explicit_row_groups_for_source(
+    source: &CuDFParquetSource,
+) -> datafusion::common::Result<Vec<i32>> {
     match source.row_group_selection() {
-        RowGroupSelection::All => all_source_row_groups(source),
+        RowGroupSelection::All => all_row_group_indices(source),
         RowGroupSelection::Indices(indices) => Ok(indices.clone()),
     }
 }
 
-fn all_source_row_groups(source: &CuDFParquetSource) -> datafusion::common::Result<Vec<i32>> {
+fn all_row_group_indices(source: &CuDFParquetSource) -> datafusion::common::Result<Vec<i32>> {
     let metadata = source.metadata()?;
     (0..metadata.num_row_groups())
         .map(|index| {
@@ -270,43 +316,24 @@ fn read_parquet_source(
         .row_group_selection()
         .indices()
         .map(|indices| vec![indices.to_vec()]);
-    let mut emitted = false;
-    let mut continued = true;
-    let mut callback_error = None;
-    let read_result = libcudf_rs::CuDFTable::for_each_parquet_chunk(
-        CuDFParquetReadOptions {
-            paths: std::slice::from_ref(&source.path),
-            columns: read_columns,
-            row_groups: row_groups.as_deref(),
-            filter,
-            allow_mismatched_pq_schemas: read_columns.is_some(),
-            ignore_missing_columns: true,
-        },
+    match read_parquet_chunks(
+        std::slice::from_ref(&source.path),
+        row_groups.as_deref(),
+        read_columns,
+        filter,
         chunk_read_limit,
         pass_read_limit,
-        |read| {
-            emitted = true;
-            match align_parquet_read(read, schema).and_then(&mut *emit) {
-                Ok(keep_reading) => {
-                    continued = keep_reading;
-                    Ok(keep_reading)
-                }
-                Err(err) => {
-                    continued = false;
-                    callback_error = Some(err);
-                    Ok(false)
-                }
+        schema,
+        emit,
+    )? {
+        ChunkReadOutcome::Finished { emitted, continued } => {
+            if !emitted {
+                return emit(empty_read_batch(schema)?);
             }
-        },
-    );
-    if let Some(err) = callback_error {
-        return Err(err);
+            Ok(continued)
+        }
+        ChunkReadOutcome::CudfErrorBeforeEmit(err) => Err(cudf_to_df(err)),
     }
-    read_result.map_err(cudf_to_df)?;
-    if !emitted {
-        return emit(empty_read_batch(schema)?);
-    }
-    Ok(continued)
 }
 
 fn read_parquet_sources_individually(

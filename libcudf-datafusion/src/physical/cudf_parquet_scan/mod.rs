@@ -115,6 +115,11 @@ impl CuDFParquetScanExec {
                 "CuDFParquetScanExec chunk_read_limit must be greater than zero; cuDF treats zero as an unbounded read"
             );
         }
+        if config.pass_read_limit == 0 {
+            return plan_err!(
+                "CuDFParquetScanExec pass_read_limit must be greater than zero; cuDF treats zero as an unbounded read"
+            );
+        }
         let output_schema = project_schema(&config.file_schema, config.projection.as_ref())?;
         let read_columns = parquet_read_columns(&config)?;
         let properties = Arc::new(PlanProperties::new(
@@ -382,6 +387,7 @@ mod tests {
     use parquet::file::properties::WriterProperties;
     use std::fs::{remove_file, File};
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -463,6 +469,54 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn mixed_schema_missing_projected_column_is_null_filled(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let full_path = temp_parquet_file();
+        let missing_path = temp_parquet_file();
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Int32, true),
+        ]));
+        let full_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Int32, true),
+        ]));
+        let missing_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let full_batch = RecordBatch::try_new(
+            full_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![Some(10), Some(20)])),
+            ],
+        )?;
+        let missing_batch =
+            RecordBatch::try_new(missing_schema, vec![Arc::new(Int32Array::from(vec![3, 4]))])?;
+        write_parquet(&full_path, &full_batch)?;
+        write_parquet(&missing_path, &missing_batch)?;
+
+        let batches = execute_scan(
+            scan_config_for_paths(
+                &[full_path.clone(), missing_path.clone()],
+                Arc::clone(&output_schema),
+            )?
+            .with_projection(Some(vec![0, 1])),
+        )
+        .await?;
+
+        remove_file(full_path).ok();
+        remove_file(missing_path).ok();
+        assert_eq!(
+            i32_values_from_batches(&batches, 0)?,
+            vec![Some(1), Some(2), Some(3), Some(4)]
+        );
+        assert_eq!(
+            i32_values_from_batches(&batches, 1)?,
+            vec![Some(10), Some(20), None, None]
+        );
+        Ok(())
+    }
+
     async fn execute_scan(
         config: CuDFParquetScanConfig,
     ) -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> {
@@ -476,14 +530,26 @@ mod tests {
         path: PathBuf,
         schema: Arc<Schema>,
     ) -> Result<CuDFParquetScanConfig, Box<dyn std::error::Error>> {
-        let size = std::fs::metadata(&path)?.len();
-        let file = PartitionedFile::new(path.to_string_lossy(), size);
+        scan_config_for_paths(std::slice::from_ref(&path), schema)
+    }
+
+    fn scan_config_for_paths(
+        paths: &[PathBuf],
+        schema: Arc<Schema>,
+    ) -> Result<CuDFParquetScanConfig, Box<dyn std::error::Error>> {
         let mut builder = CuDFParquetSourceBuilder::default();
-        let source = builder
-            .try_from_partitioned_file(&file)
-            .map_err(|err| std::io::Error::other(format!("{err:?}")))?;
+        let sources = paths
+            .iter()
+            .map(|path| {
+                let size = std::fs::metadata(path)?.len();
+                let file = PartitionedFile::new(path.to_string_lossy(), size);
+                builder
+                    .try_from_partitioned_file(&file)
+                    .map_err(|err| std::io::Error::other(format!("{err:?}")).into())
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
         Ok(CuDFParquetScanConfig::from_source_groups(
-            vec![vec![source]],
+            vec![sources],
             schema,
         ))
     }
@@ -551,13 +617,29 @@ mod tests {
             .collect())
     }
 
+    fn i32_values_from_batches(
+        batches: &[RecordBatch],
+        column: usize,
+    ) -> Result<Vec<Option<i32>>, Box<dyn std::error::Error>> {
+        Ok(batches
+            .iter()
+            .map(|batch| cudf_i32_values(batch.column(column)))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect())
+    }
+
     fn temp_parquet_file() -> PathBuf {
+        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time should be after Unix epoch")
             .as_nanos();
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "libcudf-datafusion-scan-{}-{nanos}.parquet",
+            "libcudf-datafusion-scan-{}-{nanos}-{id}.parquet",
             std::process::id()
         ))
     }

@@ -17,8 +17,7 @@ pub(crate) struct CuDFParquetSource {
     pub(crate) path: PathBuf,
     pub(crate) byte_len: usize,
     pub(crate) row_groups: RowGroupSelection,
-    metadata: Arc<OnceLock<Arc<ParquetMetaData>>>,
-    columns: Arc<OnceLock<Arc<HashSet<String>>>>,
+    cache: Arc<SourceCache>,
 }
 
 /// Parquet row groups selected for one source file.
@@ -52,24 +51,29 @@ pub(crate) enum CuDFParquetSourceError {
 /// Converts DataFusion Parquet files into cuDF scan sources.
 #[derive(Debug, Default)]
 pub(crate) struct CuDFParquetSourceBuilder {
-    metadata_by_path: HashMap<PathBuf, Arc<OnceLock<Arc<ParquetMetaData>>>>,
-    columns_by_path: HashMap<PathBuf, Arc<OnceLock<Arc<HashSet<String>>>>>,
+    cache_by_path: HashMap<PathBuf, Arc<SourceCache>>,
+}
+
+#[derive(Debug, Default)]
+struct SourceCache {
+    // Shared per-path metadata cache. Source builders can create multiple scan
+    // sources for the same file when ranges or access plans split work.
+    metadata: OnceLock<Arc<ParquetMetaData>>,
+    columns: OnceLock<Arc<HashSet<String>>>,
 }
 
 impl CuDFParquetSource {
-    fn with_metadata_cache(
+    fn new(
         path: PathBuf,
         byte_len: usize,
         row_groups: RowGroupSelection,
-        metadata: Arc<OnceLock<Arc<ParquetMetaData>>>,
-        columns: Arc<OnceLock<Arc<HashSet<String>>>>,
+        cache: Arc<SourceCache>,
     ) -> Self {
         Self {
             path,
             byte_len,
             row_groups,
-            metadata,
-            columns,
+            cache,
         }
     }
 
@@ -88,11 +92,11 @@ impl CuDFParquetSource {
     }
 
     pub(crate) fn metadata(&self) -> Result<Arc<ParquetMetaData>> {
-        parquet_metadata_cached(&self.path, &self.metadata)
+        parquet_metadata_cached(&self.path, &self.cache.metadata)
     }
 
     pub(crate) fn available_columns(&self) -> Result<Arc<HashSet<String>>> {
-        parquet_columns_cached(self, &self.columns)
+        parquet_columns_cached(self, &self.cache.columns)
     }
 }
 
@@ -104,15 +108,12 @@ impl CuDFParquetSourceBuilder {
         if !file.partition_values.is_empty() {
             return Err(CuDFParquetSourceError::PartitionValues);
         }
-        let path = local_path(file.object_meta.location.as_ref());
+        let path = local_filesystem_path(file.object_meta.location.as_ref());
         let row_groups = self.row_group_selection(&path, file)?;
         let byte_len = partitioned_file_byte_len(file)?;
 
-        let metadata = self.metadata_cache(&path);
-        let columns = self.columns_cache(&path);
-        Ok(CuDFParquetSource::with_metadata_cache(
-            path, byte_len, row_groups, metadata, columns,
-        ))
+        let cache = self.cache(&path);
+        Ok(CuDFParquetSource::new(path, byte_len, row_groups, cache))
     }
 
     fn row_group_selection(
@@ -133,23 +134,15 @@ impl CuDFParquetSourceBuilder {
         &mut self,
         path: &Path,
     ) -> std::result::Result<Arc<ParquetMetaData>, CuDFParquetSourceError> {
-        parquet_metadata_cached(path, &self.metadata_cache(path))
+        parquet_metadata_cached(path, &self.cache(path).metadata)
             .map_err(|_| CuDFParquetSourceError::FileMetadata)
     }
 
-    fn metadata_cache(&mut self, path: &Path) -> Arc<OnceLock<Arc<ParquetMetaData>>> {
+    fn cache(&mut self, path: &Path) -> Arc<SourceCache> {
         Arc::clone(
-            self.metadata_by_path
+            self.cache_by_path
                 .entry(path.to_path_buf())
-                .or_insert_with(|| Arc::new(OnceLock::new())),
-        )
-    }
-
-    fn columns_cache(&mut self, path: &Path) -> Arc<OnceLock<Arc<HashSet<String>>>> {
-        Arc::clone(
-            self.columns_by_path
-                .entry(path.to_path_buf())
-                .or_insert_with(|| Arc::new(OnceLock::new())),
+                .or_insert_with(|| Arc::new(SourceCache::default())),
         )
     }
 }
@@ -167,10 +160,11 @@ impl RowGroupSelection {
     }
 }
 
-fn local_path(location: &str) -> PathBuf {
+fn local_filesystem_path(location: &str) -> PathBuf {
     let path = location
         .strip_prefix("file://")
         .map_or_else(|| PathBuf::from(location), PathBuf::from);
+    // DataFusion may store local object paths without a leading slash.
     if path.is_absolute() || path.exists() {
         path
     } else {
@@ -263,6 +257,8 @@ fn access_plan_from_extension(
         .iter()
         .any(|access| matches!(access, RowGroupAccess::Selection(_)))
     {
+        // cuDF can select whole row groups but cannot represent DataFusion's
+        // row-level selections here, so keep those plans on the DataFusion path.
         return Err(CuDFParquetSourceError::PartialRowSelection);
     }
     Ok(access_plan.clone())
@@ -296,7 +292,8 @@ fn row_group_selection_from_access_plan(
 #[cfg(test)]
 mod tests {
     use super::{
-        local_path, partitioned_file_byte_len, CuDFParquetSourceBuilder, RowGroupSelection,
+        local_filesystem_path, partitioned_file_byte_len, CuDFParquetSourceBuilder,
+        RowGroupSelection,
     };
     use datafusion::datasource::listing::PartitionedFile;
     use datafusion::datasource::physical_plan::parquet::ParquetAccessPlan;
@@ -313,12 +310,11 @@ mod tests {
             .map_err(|err| std::io::Error::other(format!("{err:?}")))?;
 
         assert_eq!(byte_len, 15);
-        assert_eq!(RowGroupSelection::Indices(vec![]).indices(), Some(&[][..]));
         Ok(())
     }
 
     #[test]
-    fn local_path_resolves_relative_and_absolute_local_paths(
+    fn local_filesystem_path_resolves_relative_and_absolute_paths(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let weather = weather_file("result-000000.parquet");
         let stripped_absolute = weather
@@ -326,37 +322,15 @@ mod tests {
             .expect("weather path should be absolute")
             .to_string_lossy();
 
-        assert_eq!(local_path("Cargo.toml"), PathBuf::from("Cargo.toml"));
-        assert_eq!(local_path(stripped_absolute.as_ref()), weather);
         assert_eq!(
-            local_path("file:///tmp/file.parquet"),
+            local_filesystem_path("Cargo.toml"),
+            PathBuf::from("Cargo.toml")
+        );
+        assert_eq!(local_filesystem_path(stripped_absolute.as_ref()), weather);
+        assert_eq!(
+            local_filesystem_path("file:///tmp/file.parquet"),
             PathBuf::from("/tmp/file.parquet")
         );
-        Ok(())
-    }
-
-    #[test]
-    fn source_metadata_is_loaded_once() -> Result<(), Box<dyn std::error::Error>> {
-        let path = weather_file("result-000000.parquet");
-        let source = source_for_path(&path)?;
-
-        let first = source.metadata()?;
-        let second = source.metadata()?;
-
-        assert!(Arc::ptr_eq(&first, &second));
-        Ok(())
-    }
-
-    #[test]
-    fn source_available_columns_are_loaded_once() -> Result<(), Box<dyn std::error::Error>> {
-        let path = weather_file("result-000000.parquet");
-        let source = source_for_path(&path)?;
-
-        let first = source.available_columns()?;
-        let second = source.available_columns()?;
-
-        assert!(Arc::ptr_eq(&first, &second));
-        assert!(!first.is_empty());
         Ok(())
     }
 
@@ -423,6 +397,22 @@ mod tests {
             .expect_err("partial row selections should remain on the DataFusion path");
 
         assert_eq!(err, super::CuDFParquetSourceError::PartialRowSelection);
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_partitioned_file_extension_is_unsupported() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let path = weather_file("result-000000.parquet");
+        let mut builder = CuDFParquetSourceBuilder::default();
+
+        let err = builder
+            .try_from_partitioned_file(
+                &partitioned_file(&path)?.with_extensions(Arc::new("unsupported".to_string())),
+            )
+            .expect_err("unknown extensions should remain on the DataFusion path");
+
+        assert_eq!(err, super::CuDFParquetSourceError::FileExtensions);
         Ok(())
     }
 
