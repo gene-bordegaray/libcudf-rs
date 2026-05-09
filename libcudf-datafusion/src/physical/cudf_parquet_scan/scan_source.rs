@@ -1,6 +1,8 @@
 use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::listing::{FileRange, PartitionedFile};
-use datafusion::datasource::physical_plan::parquet::{ParquetAccessPlan, RowGroupAccessPlanFilter};
+use datafusion::datasource::physical_plan::parquet::{
+    ParquetAccessPlan, RowGroupAccess, RowGroupAccessPlanFilter,
+};
 use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use datafusion::parquet::file::metadata::ParquetMetaData;
 use std::collections::HashMap;
@@ -32,8 +34,10 @@ pub(crate) enum RowGroupSelection {
 pub(crate) enum CuDFParquetSourceError {
     /// Partition columns would need host-side value materialization.
     PartitionValues,
-    /// File extensions may carry access plans that v1 does not map to cuDF.
+    /// File extensions carry unsupported reader-specific behavior.
     FileExtensions,
+    /// Parquet access plan contains row selections that cuDF cannot represent.
+    PartialRowSelection,
     /// File size does not fit this platform's `usize`.
     FileSizeOverflow,
     /// Parquet metadata could not be read.
@@ -92,18 +96,8 @@ impl CuDFParquetSourceBuilder {
         if !file.partition_values.is_empty() {
             return Err(CuDFParquetSourceError::PartitionValues);
         }
-        if file.extensions.is_some() {
-            return Err(CuDFParquetSourceError::FileExtensions);
-        }
-
         let path = local_path(file.object_meta.location.as_ref());
-        let row_groups = file
-            .range
-            .as_ref()
-            .map(|range| self.row_groups_in_range(&path, range))
-            .transpose()?
-            .map(RowGroupSelection::Indices)
-            .unwrap_or(RowGroupSelection::All);
+        let row_groups = self.row_group_selection(&path, file)?;
         let byte_len = partitioned_file_byte_len(file)?;
 
         let metadata = self.metadata_cache(&path);
@@ -112,13 +106,18 @@ impl CuDFParquetSourceBuilder {
         ))
     }
 
-    fn row_groups_in_range(
+    fn row_group_selection(
         &mut self,
         path: &Path,
-        range: &FileRange,
-    ) -> std::result::Result<Vec<i32>, CuDFParquetSourceError> {
+        file: &PartitionedFile,
+    ) -> std::result::Result<RowGroupSelection, CuDFParquetSourceError> {
+        if file.extensions.is_none() && file.range.is_none() {
+            return Ok(RowGroupSelection::All);
+        }
+
         let metadata = self.metadata(path)?;
-        row_groups_in_range(&metadata, range)
+        let access_plan = access_plan_from_extension(file, metadata.num_row_groups())?;
+        row_group_selection_from_access_plan(&metadata, file.range.as_ref(), access_plan)
     }
 
     fn metadata(
@@ -202,28 +201,60 @@ fn partitioned_file_byte_len(
     }
 }
 
-fn row_groups_in_range(
-    metadata: &ParquetMetaData,
-    range: &FileRange,
-) -> std::result::Result<Vec<i32>, CuDFParquetSourceError> {
-    let access_plan = ParquetAccessPlan::new_all(metadata.num_row_groups());
-    let mut filter = RowGroupAccessPlanFilter::new(access_plan);
-    filter.prune_by_range(metadata.row_groups(), range);
+fn access_plan_from_extension(
+    file: &PartitionedFile,
+    row_group_count: usize,
+) -> std::result::Result<ParquetAccessPlan, CuDFParquetSourceError> {
+    let Some(extensions) = &file.extensions else {
+        return Ok(ParquetAccessPlan::new_all(row_group_count));
+    };
+    let Some(access_plan) = extensions.downcast_ref::<ParquetAccessPlan>() else {
+        return Err(CuDFParquetSourceError::FileExtensions);
+    };
+    if access_plan.len() != row_group_count {
+        return Err(CuDFParquetSourceError::FileExtensions);
+    }
+    if access_plan
+        .inner()
+        .iter()
+        .any(|access| matches!(access, RowGroupAccess::Selection(_)))
+    {
+        return Err(CuDFParquetSourceError::PartialRowSelection);
+    }
+    Ok(access_plan.clone())
+}
 
-    filter
-        .build()
+fn row_group_selection_from_access_plan(
+    metadata: &ParquetMetaData,
+    range: Option<&FileRange>,
+    access_plan: ParquetAccessPlan,
+) -> std::result::Result<RowGroupSelection, CuDFParquetSourceError> {
+    let mut filter = RowGroupAccessPlanFilter::new(access_plan);
+    if let Some(range) = range {
+        filter.prune_by_range(metadata.row_groups(), range);
+    }
+
+    let access_plan = filter.build();
+    if access_plan.row_group_indexes().len() == metadata.num_row_groups() {
+        return Ok(RowGroupSelection::All);
+    }
+
+    access_plan
         .row_group_indexes()
         .into_iter()
         .map(|index| {
             i32::try_from(index).map_err(|_| CuDFParquetSourceError::RowGroupIndexOverflow)
         })
-        .collect()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map(RowGroupSelection::Indices)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{partitioned_file_byte_len, CuDFParquetSourceBuilder, RowGroupSelection};
     use datafusion::datasource::listing::PartitionedFile;
+    use datafusion::datasource::physical_plan::parquet::ParquetAccessPlan;
+    use datafusion::parquet::arrow::arrow_reader::{RowSelection, RowSelector};
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -265,6 +296,52 @@ mod tests {
             .map_err(|err| std::io::Error::other(format!("{err:?}")))?;
 
         assert!(Arc::ptr_eq(&first.metadata()?, &second.metadata()?));
+        Ok(())
+    }
+
+    #[test]
+    fn parquet_access_plan_selects_whole_row_groups() -> Result<(), Box<dyn std::error::Error>> {
+        let path = weather_file("result-000000.parquet");
+        let mut builder = CuDFParquetSourceBuilder::default();
+        let row_group_count = source_for_path(&path)?.metadata()?.num_row_groups();
+        let mut access_plan = ParquetAccessPlan::new_all(row_group_count);
+        access_plan.skip(0);
+
+        let source = builder
+            .try_from_partitioned_file(
+                &partitioned_file(&path)?.with_extensions(Arc::new(access_plan)),
+            )
+            .map_err(|err| std::io::Error::other(format!("{err:?}")))?;
+
+        let expected = (1..row_group_count)
+            .map(i32::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            source.row_group_selection(),
+            &RowGroupSelection::Indices(expected)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parquet_access_plan_with_row_selection_is_unsupported(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let path = weather_file("result-000000.parquet");
+        let mut builder = CuDFParquetSourceBuilder::default();
+        let row_group_count = source_for_path(&path)?.metadata()?.num_row_groups();
+        let mut access_plan = ParquetAccessPlan::new_all(row_group_count);
+        access_plan.scan_selection(
+            0,
+            RowSelection::from(vec![RowSelector::select(1), RowSelector::skip(1)]),
+        );
+
+        let err = builder
+            .try_from_partitioned_file(
+                &partitioned_file(&path)?.with_extensions(Arc::new(access_plan)),
+            )
+            .expect_err("partial row selections should remain on the DataFusion path");
+
+        assert_eq!(err, super::CuDFParquetSourceError::PartialRowSelection);
         Ok(())
     }
 

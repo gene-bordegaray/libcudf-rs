@@ -270,6 +270,7 @@ enum UnsupportedReason {
     NonLocalObjectStore,
     PartitionValues,
     FileExtensions,
+    PartialRowSelection,
     FileSizeOverflow,
     FileRangeOverflow,
     FileMetadata,
@@ -284,6 +285,7 @@ impl From<CuDFParquetSourceError> for UnsupportedReason {
         match error {
             CuDFParquetSourceError::PartitionValues => Self::PartitionValues,
             CuDFParquetSourceError::FileExtensions => Self::FileExtensions,
+            CuDFParquetSourceError::PartialRowSelection => Self::PartialRowSelection,
             CuDFParquetSourceError::FileSizeOverflow => Self::FileSizeOverflow,
             CuDFParquetSourceError::FileMetadata => Self::FileMetadata,
             CuDFParquetSourceError::RowGroupIndexOverflow => Self::RowGroupIndexOverflow,
