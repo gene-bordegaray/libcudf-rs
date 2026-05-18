@@ -4,14 +4,100 @@ Rust bindings for [libcudf](https://docs.rapids.ai/api/libcudf/stable/), the GPU
 
 ## Overview
 
-This project provides safe, idiomatic Rust bindings to cuDF using the [cxx](https://cxx.rs/) library for seamless C++/Rust interoperability. cuDF enables GPU-accelerated operations on DataFrames, offering significant performance improvements for data processing tasks.
+This project provides safe, idiomatic Rust bindings to cuDF using the [cxx](https://cxx.rs/) library for seamless 
+C++/Rust interoperability. cuDF enables GPU-accelerated operations on DataFrames, offering significant performance 
+improvements for data processing tasks.
+
+## Executing SQL workloads on GPU
+
+For SQL execution, this project uses [Apache DataFusion](https://github.com/apache/datafusion) with a physical
+optimizer rule that replaces vanilla DataFusion nodes with GPU variants.
+
+Taking the following query from the TPCH benchmark:
+
+```sql
+select
+    l_returnflag,
+    l_linestatus,
+    sum(l_quantity) as sum_qty,
+    sum(l_extendedprice) as sum_base_price,
+    sum(l_extendedprice * (1 - l_discount)) as sum_disc_price,
+    sum(l_extendedprice * (1 - l_discount) * (1 + l_tax)) as sum_charge,
+    avg(l_quantity) as avg_qty,
+    avg(l_extendedprice) as avg_price,
+    avg(l_discount) as avg_disc,
+    count(*) as count_order
+from
+    lineitem
+where
+        l_shipdate <= date '1998-09-02'
+group by
+    l_returnflag,
+    l_linestatus
+order by
+    l_returnflag,
+    l_linestatus;
+```
+
+DataFusion will produce the following executable plan:
+
+```dart
+SortPreservingMergeExec: [...]
+  SortExec: expr=[...], preserve_partitioning=[...]
+    ProjectionExec: expr=[...]
+      AggregateExec: mode=FinalPartitioned, gby=[...], aggr=[...]
+        RepartitionExec: partitioning=Hash([...], 4), input_partitions=4
+          AggregateExec: mode=Partial, gby=[...], aggr=[...]
+            ProjectionExec: expr=[...]
+              FilterExec: <expr>, projection=[...]
+                DataSourceExec: file_groups={4 groups: [...]}, projection=[...]
+```
+
+This project inspects the plan and replaces nodes with their cuDF (GPU)-based variants,
+producing a different executable plan that looks like this:
+
+```dart
+CuDFUnloadExec, metrics=[...]
+  CuDFSortExec: expr=[...], preserve_partitioning=[...]
+    CuDFProjectionExec: expr=[...]
+      CuDFAggregateExec: mode=Single, group_by=[...], aggr_expr=[...]
+        CuDFProjectionExec: expr=[...]
+          CuDFFilterExec: l_shipdate@6 <= 1998-09-02, projection=[...]
+            CuDFLoadExec, metrics=[...]
+              DataSourceExec: file_groups={4 groups: [...]}, projection=[...]
+```
+
+The cuDF-based plan is indeed cheaper and faster to execute than the pure CPU one.
+This was measured by comparing the execution latency in two different machines:
+
+1. **m5.4xlarge | 16vCPU 64Gb RAM | ~$625 monthly | 906 ms TPCH Q1**
+2. **g4dn.xlarge | 4vCPU 16Gb NVIDIA T4 | ~$423 monthly | 813 ms TPCH Q1**
+
+Even if the GPU-based machine is cheaper because of having fewer vCPUs and less RAM, it's
+still capable of executing TPCH Q1, so doing some basic math, the conclusion is
+that, for the same latency, **executing on GPU is 1.65x cheaper** with the current
+state of this project.
+
+## What's next?
+
+This project is the result of a couple of weeks' hackathon, and there are several low-hanging
+fruit to be addressed that could make GPU execution significantly more performant.
+
+Even though the focus of this project is to get TPCH Q1 working faster and cheaper in GPU
+vs CPU, it's capable of running the full TPCH suite on GPU. Rather than implementing
+a wide breadth of features, it focuses on laying the foundations for executing relational
+algebra on GPUs for a wide variety of use cases.
+
+Follow-up work will bring further performance improvements and support for new relational
+algebra operations.
 
 ## Project Structure
 
-The project is organized as a Rust workspace with two crates:
+The project is organized as a Rust workspace with the following crates:
 
 - **libcudf-sys**: Low-level FFI bindings to libcudf using cxx
 - **libcudf-rs**: Safe, high-level Rust API wrapping the FFI bindings
+- **libcudf-datafusion**: Integration with Apache DataFusion
 
 ## Prerequisites
 
@@ -55,157 +141,9 @@ Add this to your `Cargo.toml`:
 libcudf-rs = { path = "path/to/libcudf-rs" }
 ```
 
-### Example
-
-```rust
-use libcudf_rs::Table;
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Read a CSV file into a GPU-accelerated table
-    let table = Table::from_csv("data.csv")?;
-
-    println!("Loaded {} rows and {} columns",
-             table.num_rows(), table.num_columns());
-
-    // Write the table back to CSV
-    table.to_csv("output.csv")?;
-
-    Ok(())
-}
-```
-
-### Running Examples
-
-```bash
-# Run the basic usage example
-cargo run --example basic_usage
-```
-
-### DataFusion GPU Sizing
-
-For cuDF-backed DataFusion workloads, configure batch size through DataFusion's
-existing `execution.batch_size` setting. Start GPU runs at `65_536` rows and
-tune with benchmarks for the target workload and GPU:
-
-```rust
-use datafusion::execution::SessionStateBuilder;
-use datafusion::prelude::SessionConfig;
-use libcudf_datafusion::SessionStateBuilderExt;
-
-let config = SessionConfig::new().with_batch_size(65_536);
-let state = SessionStateBuilder::new()
-    .with_default_features()
-    .with_config(config)
-    .with_cudf_planner()
-    .build();
-```
-
-This is DataFusion's global execution batch size, not a cuDF-only operator
-limit. Some cuDF operators process one incoming `RecordBatch` at a time, while
-joins, full sorts, and aggregate chunks can materialize larger intermediate GPU
-tables.
-
-cuDF aggregate chunks are bounded by input bytes, not row count. The default
-target is derived from the configured device pool cap:
-
-```text
-clamp(cudf.device_pool_max_bytes / 16, 64 MiB, 1 GiB)
-```
-
-With the default 4 GiB device pool cap, this gives a 256 MiB aggregate chunk
-target. Set `cudf.aggregate_chunk_target_bytes` only when you need an explicit
-override for benchmarking or deployment tuning.
-
-## Architecture
-
-This project uses the `cxx` crate to provide safe interoperability between Rust and C++:
-
-1. **C++ Bridge Layer** (`libcudf-sys/src/bridge.{h,cpp}`):
-   - Wraps cuDF C++ APIs in cxx-compatible interfaces
-   - Handles lifetime management and error conversion
-
-2. **Rust FFI Layer** (`libcudf-sys/src/lib.rs`):
-   - Defines the Rust side of the FFI boundary using `#[cxx::bridge]`
-   - Exposes unsafe bindings to C++ functions
-
-3. **Safe Rust API** (`src/lib.rs`):
-   - Provides idiomatic, safe Rust wrappers
-   - Handles error conversion and resource management
-
-## Current Features
-
-- Create empty tables
-- Read CSV files into GPU memory
-- Write tables to CSV files
-- Query table dimensions (rows, columns)
-
-## Extending the Bindings
-
-To add new cuDF functionality:
-
-1. Add C++ wrapper functions in `libcudf-sys/src/bridge.{h,cpp}`
-2. Declare the interface in the `#[cxx::bridge]` macro in `libcudf-sys/src/lib.rs`
-3. Add safe Rust wrappers in `src/lib.rs`
-4. Rebuild with `cargo build`
-
-Example of adding a new function:
-
-```cpp
-// In bridge.h
-size_t count_nulls(const Table& table);
-
-// In bridge.cpp
-size_t count_nulls(const Table& table) {
-    // Implementation using cuDF APIs
-}
-```
-
-```rust
-// In libcudf-sys/src/lib.rs, inside #[cxx::bridge]
-unsafe extern "C++" {
-    fn count_nulls(table: &Table) -> usize;
-}
-
-// In src/lib.rs
-impl Table {
-    pub fn count_nulls(&self) -> usize {
-        ffi::count_nulls(&self.inner)
-    }
-}
-```
-
-## Limitations
-
-This is a foundational scaffold. Current limitations:
-
-- Limited API coverage (only basic CSV I/O and table operations)
-- No column-level operations yet
-- No data type introspection
-- No support for other file formats (Parquet, ORC, etc.)
-- Requires libcudf to be installed system-wide
-
-## Contributing
-
-Contributions are welcome! Areas for improvement:
-
-- Expand API coverage for more cuDF operations
-- Add support for different data types and column operations
-- Implement DataFrame-style operations (filter, join, groupby, etc.)
-- Add benchmarks comparing performance with CPU-based solutions
-- Improve error handling and ergonomics
-
-## License
-
-This project's license should match your requirements. cuDF itself is Apache 2.0 licensed.
-
 ## Resources
 
 - [libcudf Documentation](https://docs.rapids.ai/api/libcudf/stable/)
 - [cxx Documentation](https://cxx.rs/)
 - [RAPIDS cuDF Python API](https://docs.rapids.ai/api/cudf/stable/)
 - [cuDF GitHub Repository](https://github.com/rapidsai/cudf)
-
-## Authors
-
-- notfilippo
-- gabotechs
