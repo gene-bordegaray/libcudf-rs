@@ -1,4 +1,5 @@
 use crate::errors::cudf_to_df;
+use crate::execution::execute_cudf;
 use crate::expr::ast::{is_join_filter_supported_by_cudf_ast, join_filter_to_cudf_ast};
 use crate::metrics::CuDFBaselineMetrics;
 use crate::physical::cudf_load::cudf_schema_compatibility_map;
@@ -279,7 +280,7 @@ impl ExecutionPlan for CuDFHashJoinExec {
                     let _timer = metrics.build_time.timer();
                     let batches: Vec<RecordBatch> = left_stream.try_collect().await?;
                     metrics.record_build_input(&batches);
-                    batches_to_table(&batches).map(Arc::new).map_err(cudf_to_df)
+                    batches_to_table(&batches).map(Arc::new)
                 })
             }
         };
@@ -334,9 +335,7 @@ fn collect_shared(
                 let stream = execute_stream(left_child, ctx).map_err(Arc::new)?;
                 let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(Arc::new)?;
                 metrics.record_build_input(&batches);
-                batches_to_table(&batches)
-                    .map(Arc::new)
-                    .map_err(|e| Arc::new(cudf_to_df(e)))
+                batches_to_table(&batches).map(Arc::new).map_err(Arc::new)
             })
             .await
             .map(Arc::clone)
@@ -455,8 +454,7 @@ impl StreamingJoinState {
                 continue;
             }
 
-            let right =
-                Arc::new(batches_to_table(std::slice::from_ref(&right_batch)).map_err(cudf_to_df)?);
+            let right = Arc::new(batches_to_table(std::slice::from_ref(&right_batch))?);
             let result = self.probe(right)?;
             let batch = result
                 .into_view()
@@ -481,7 +479,11 @@ impl StreamingJoinState {
         let left = self
             .left_fut
             .take()
-            .expect("left future should be present before first streamed join batch")
+            .ok_or_else(|| {
+                DataFusionError::Internal(
+                    "left future should be present before first streamed join batch".to_string(),
+                )
+            })?
             .await?;
         let left_view = Arc::clone(&left).view();
         let (left_out, right_out) =
@@ -510,10 +512,9 @@ impl StreamingJoinState {
 
     /// Probe one right-side batch against the reusable build-side hash table.
     fn probe(&mut self, right: Arc<CuDFTable>) -> Result<CuDFTable, DataFusionError> {
-        let build = self
-            .build
-            .as_mut()
-            .expect("build side should be initialized before probing");
+        let build = self.build.as_mut().ok_or_else(|| {
+            DataFusionError::Internal("build side should be initialized before probing".to_string())
+        })?;
         let left_view = Arc::clone(&build.left).view();
         let right_view = right.view();
         let _timer = self.metrics.join_time.timer();
@@ -596,14 +597,15 @@ impl StreamingJoinState {
 
     /// Emit collected-left rows that never matched any streamed right batch.
     fn unmatched_build_batch(&self) -> Result<Option<RecordBatch>, DataFusionError> {
-        let build = self
-            .build
-            .as_ref()
-            .expect("build side should be initialized before finalizing");
+        let build = self.build.as_ref().ok_or_else(|| {
+            DataFusionError::Internal(
+                "build side should be initialized before finalizing".to_string(),
+            )
+        })?;
         let left_view = Arc::clone(&build.left).view();
-        let empty_right =
-            CuDFTable::from_arrow_host(RecordBatch::new_empty(Arc::clone(&self.plan.right_schema)))
-                .map_err(cudf_to_df)?;
+        let empty_right = execute_cudf(CuDFTable::from_arrow_host(RecordBatch::new_empty(
+            Arc::clone(&self.plan.right_schema),
+        )))?;
         let right_view = empty_right.into_view();
 
         let result = {
@@ -727,12 +729,13 @@ fn split_join_projection(
 /// # Panics
 ///
 /// Panics if any column in any batch is not a GPU-resident `CuDFColumnView`.
-fn batches_to_table(batches: &[RecordBatch]) -> Result<CuDFTable, libcudf_rs::CuDFError> {
+fn batches_to_table(batches: &[RecordBatch]) -> Result<CuDFTable, DataFusionError> {
     let views: Vec<CuDFTableView> = batches
         .iter()
         .map(CuDFTableView::from_record_batch)
-        .collect::<Result<_, _>>()?;
-    CuDFTable::concat(views)
+        .collect::<Result<_, _>>()
+        .map_err(cudf_to_df)?;
+    execute_cudf(CuDFTable::concat(views))
 }
 
 /// Try to convert a `HashJoinExec` to GPU.
@@ -775,7 +778,7 @@ pub fn try_as_cudf_hash_join(
 #[cfg(test)]
 mod tests {
     use super::{cudf_schema_compatibility_map, try_as_cudf_hash_join, CuDFHashJoinExec};
-    use crate::errors::cudf_to_df;
+    use crate::execution::execute_cudf;
     use crate::physical::{CuDFLoadExec, CuDFUnloadExec};
     use crate::planner::CuDFConfig;
     use arrow::array::{record_batch, Array, Int32Array, RecordBatch};
@@ -1032,7 +1035,7 @@ mod tests {
         batch: RecordBatch,
         schema: SchemaRef,
     ) -> datafusion::common::Result<RecordBatch> {
-        let table = CuDFTable::from_arrow_host(batch).map_err(cudf_to_df)?;
+        let table = execute_cudf(CuDFTable::from_arrow_host(batch))?;
         let num_rows = table.num_rows();
         let columns = table
             .into_columns()

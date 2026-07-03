@@ -1,5 +1,5 @@
 use crate::decimal::{decimal_count_type_for, decimal_div, is_supported_decimal};
-use crate::errors::cudf_to_df;
+use crate::execution::execute_cudf;
 use crate::physical::aggregate::op::sum::CuDFSum;
 use crate::physical::aggregate::op::udf::CuDFAggregateUDF;
 use crate::physical::aggregate::{
@@ -15,7 +15,7 @@ use datafusion_expr::AggregateUDF;
 use datafusion_physical_plan::aggregates::AggregateMode;
 use datafusion_physical_plan::PhysicalExpr;
 use libcudf_rs::{
-    cudf_binary_op, AggregationOp, AggregationRequest, CuDFBinaryOp, CuDFColumn, CuDFColumnView,
+    AggregationOp, AggregationRequest, CuDFBinaryOp, CuDFColumn, CuDFColumnView,
     CuDFColumnViewOrScalar,
 };
 use std::sync::Arc;
@@ -104,8 +104,8 @@ impl CuDFAggregationOp for CuDFAvg {
         // count column: cuDF COUNT returns Int32 -> cast to Int64 to match merge_requests output
         let sum = cols.remove(1);
         let count = cols.remove(0);
-        let casted_count =
-            libcudf_rs::cast(&count.into_view(), &DataType::Int64).map_err(cudf_to_df)?;
+        let count = count.into_view();
+        let casted_count = execute_cudf(count.cast(&DataType::Int64))?;
         Ok(vec![casted_count, sum])
     }
 
@@ -150,13 +150,13 @@ fn finalize_avg_state(
         return finalize_decimal_avg(&state_cols[1], &state_cols[0], output_type);
     }
 
-    let result = cudf_binary_op(
-        CuDFColumnViewOrScalar::ColumnView(state_cols[1].clone()),
-        CuDFColumnViewOrScalar::ColumnView(state_cols[0].clone()),
-        CuDFBinaryOp::Div,
-        &DataType::Float64,
-    )
-    .map_err(cudf_to_df)?;
+    let result = execute_cudf(
+        CuDFColumnViewOrScalar::ColumnView(state_cols[1].clone()).binary_op(
+            CuDFColumnViewOrScalar::ColumnView(state_cols[0].clone()),
+            CuDFBinaryOp::Div,
+            &DataType::Float64,
+        ),
+    )?;
 
     match result {
         CuDFColumnViewOrScalar::ColumnView(view) => Ok(view),
@@ -173,9 +173,7 @@ fn finalize_decimal_avg(
 ) -> Result<CuDFColumnView> {
     let sum_type = sum.data_type().clone();
     let count_type = decimal_count_type_for(&sum_type)?;
-    let count = libcudf_rs::cast(count, &count_type)
-        .map_err(cudf_to_df)?
-        .into_view();
+    let count = execute_cudf(count.cast(&count_type))?.into_view();
 
     let result = decimal_div(
         CuDFColumnViewOrScalar::ColumnView(sum.clone()),

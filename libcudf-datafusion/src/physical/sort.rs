@@ -1,4 +1,5 @@
 use crate::errors::cudf_to_df;
+use crate::execution::execute_cudf;
 use arrow::array::RecordBatch;
 use arrow_schema::SchemaRef;
 use datafusion::common::Statistics;
@@ -15,9 +16,7 @@ use datafusion_physical_plan::{
 use delegate::delegate;
 use futures::Stream;
 use futures_util::{ready, StreamExt};
-use libcudf_rs::{
-    gather, slice_column, sort, stable_sorted_order, CuDFTable, CuDFTableView, SortOrder,
-};
+use libcudf_rs::{CuDFTable, CuDFTableView, SortOrder};
 use std::any::Any;
 use std::fmt::Formatter;
 use std::pin::Pin;
@@ -142,11 +141,11 @@ impl Stream for CuDFSortStream {
                 }
 
                 let views = self.views.drain(..).collect();
-                let concatenated = CuDFTable::concat(views).map_err(cudf_to_df)?;
+                let concatenated = execute_cudf(CuDFTable::concat(views))?;
                 let table_view = concatenated.into_view();
 
                 let (key_columns, sort_orders) = extract_sort_params(&self.ordering);
-                let sorted = sort(&table_view, &key_columns, &sort_orders).map_err(cudf_to_df)?;
+                let sorted = execute_cudf(table_view.sort_by(&key_columns, &sort_orders))?;
 
                 let result = sorted
                     .into_view()
@@ -191,7 +190,7 @@ impl Stream for CuDFTopKStream {
 
                 let merged_table = if let Some(existing) = self.result.take() {
                     let views = vec![existing, new_table];
-                    CuDFTable::concat(views).map_err(cudf_to_df)?.into_view()
+                    execute_cudf(CuDFTable::concat(views))?.into_view()
                 } else {
                     new_table
                 };
@@ -201,23 +200,20 @@ impl Stream for CuDFTopKStream {
                     let (key_columns, sort_orders) = extract_sort_params(&self.ordering);
                     let key_views = key_columns
                         .iter()
-                        .map(|&i| merged_table.column(i as i32))
-                        .collect();
+                        .map(|&i| merged_table.column(i).map_err(cudf_to_df))
+                        .collect::<Result<Vec<_>, _>>()?;
                     let keys_view =
                         CuDFTableView::from_column_views(key_views).map_err(cudf_to_df)?;
 
                     // Get sorted indices
-                    let indices =
-                        stable_sorted_order(&keys_view, &sort_orders).map_err(cudf_to_df)?;
+                    let indices = execute_cudf(keys_view.stable_sorted_order(&sort_orders))?;
 
                     // Slice to keep only top K indices
                     let indices_view = Arc::new(indices).view();
-                    let topk_indices_view =
-                        slice_column(&indices_view, 0, self.limit).map_err(cudf_to_df)?;
+                    let topk_indices_view = execute_cudf(indices_view.slice_view(0, self.limit))?;
 
                     // Gather the top K rows
-                    let topk_table =
-                        gather(&merged_table, &topk_indices_view).map_err(cudf_to_df)?;
+                    let topk_table = execute_cudf(merged_table.gather(&topk_indices_view))?;
                     self.result = Some(topk_table.into_view());
                 } else {
                     self.result = Some(merged_table);
@@ -236,8 +232,7 @@ impl Stream for CuDFTopKStream {
                 // At this point we have <= K rows accumulated from all batches
                 // Just sort them to get the final top K result
                 let (key_columns, sort_orders) = extract_sort_params(&self.ordering);
-                let sorted_result =
-                    sort(&result, &key_columns, &sort_orders).map_err(cudf_to_df)?;
+                let sorted_result = execute_cudf(result.sort_by(&key_columns, &sort_orders))?;
 
                 let batch = sorted_result
                     .into_view()

@@ -1,9 +1,9 @@
 use crate::data_type::arrow_type_to_cudf_data_type;
-use crate::device_resource::resource_ref;
+use crate::execution_context::resource_ref;
 use crate::stream::stream_ref;
 use crate::{
-    CuDFAstExpression, CuDFColumn, CuDFColumnView, CuDFError, CuDFRef, CuDFScalar, CuDFTable,
-    CuDFTableView,
+    CuDFAstExpression, CuDFColumn, CuDFColumnView, CuDFError, CuDFExecutionContext, CuDFScalar,
+    CuDFTable, CuDFTableView, CuDFViewStorage,
 };
 use arrow::array::{BooleanArray, Int32Array, Scalar};
 use arrow_schema::DataType;
@@ -54,19 +54,18 @@ impl JoinIndexVector {
         self.inner.size()
     }
 
-    fn as_sys(&self) -> &ffi::DeviceIndexVector {
+    fn as_sys(&self) -> Result<&ffi::DeviceIndexVector, CuDFError> {
         self.inner
             .as_ref()
-            .expect("device index vector should not be null")
+            .ok_or(CuDFError::NullHandle("device index vector"))
     }
 
     fn view(self: Arc<Self>) -> CuDFColumnView {
         let view = self.inner.view();
-        CuDFColumnView::new_with_ref(view, Some(self))
+        let storage: CuDFViewStorage = self;
+        CuDFColumnView::from_view(view, Some(storage), None)
     }
 }
-
-impl CuDFRef for JoinIndexVector {}
 
 fn null_gather_index() -> i32 {
     ffi::join_no_match()
@@ -131,7 +130,7 @@ fn gather_join_output(
     )?);
     let mut columns = left.into_columns();
     columns.extend(right.into_columns());
-    Ok(CuDFTable::from_columns(columns))
+    Ok(CuDFTable::from_owned_columns(columns))
 }
 
 fn gather_join_indices(
@@ -202,8 +201,8 @@ fn gather_filtered_hash_join_indices(
     let mut filtered_indices = ffi::filter_join_indices(
         args.build_conditional,
         args.probe_conditional,
-        build_indices.as_sys(),
-        probe_indices.as_sys(),
+        build_indices.as_sys()?,
+        probe_indices.as_sys()?,
         args.predicate.inner(),
         args.join_kind as i32,
         stream_ref(&stream)?,
@@ -235,7 +234,10 @@ fn concat_join_outputs(first: CuDFTable, second: CuDFTable) -> Result<CuDFTable,
     if second.num_rows() == 0 {
         return Ok(first);
     }
-    CuDFTable::concat(vec![first.into_view(), second.into_view()])
+    CuDFExecutionContext::try_new_non_blocking()?.execute(CuDFTable::concat(vec![
+        first.into_view(),
+        second.into_view(),
+    ]))
 }
 
 fn distinct_valid_indices(indices: CuDFColumnView) -> Result<Option<Arc<CuDFColumn>>, CuDFError> {
@@ -246,11 +248,12 @@ fn distinct_valid_indices(indices: CuDFColumnView) -> Result<Option<Arc<CuDFColu
     let stream = ffi::get_default_stream();
     let resource = ffi::get_current_device_resource_ref();
     let zero = int32_scalar(0)?;
-    let valid_mask = Arc::new(CuDFColumn::new(ffi::binary_operation_col_scalar(
+    let bool_type = bool_data_type()?;
+    let valid_mask = Arc::new(CuDFColumn::from_inner(ffi::binary_operation_col_scalar(
         indices.inner(),
         zero.inner(),
         BinaryOperator::GreaterEqual as i32,
-        &bool_data_type(),
+        &bool_type,
         stream_ref(&stream)?,
         resource_ref(&resource)?,
     )?));
@@ -279,13 +282,10 @@ fn distinct_valid_indices(indices: CuDFColumnView) -> Result<Option<Arc<CuDFColu
         return Ok(None);
     }
 
-    Ok(Some(Arc::new(
-        distinct_indices
-            .into_columns()
-            .into_iter()
-            .next()
-            .expect("distinct indices has one column"),
-    )))
+    Ok(Some(Arc::new(first_column(
+        distinct_indices,
+        "distinct indices",
+    )?)))
 }
 
 fn matched_row_mask(
@@ -295,7 +295,7 @@ fn matched_row_mask(
     let stream = ffi::get_default_stream();
     let resource = ffi::get_current_device_resource_ref();
     let false_scalar = bool_scalar(false)?;
-    let mask = Arc::new(CuDFColumn::new(ffi::make_column_from_scalar(
+    let mask = Arc::new(CuDFColumn::from_inner(ffi::make_column_from_scalar(
         false_scalar.inner(),
         row_count,
         stream_ref(&stream)?,
@@ -317,13 +317,7 @@ fn matched_row_mask(
         stream_ref(&stream)?,
         resource_ref(&resource)?,
     )?);
-    Ok(Arc::new(
-        updated
-            .into_columns()
-            .into_iter()
-            .next()
-            .expect("updated matched row mask has one column"),
-    ))
+    Ok(Arc::new(first_column(updated, "updated matched row mask")?))
 }
 
 fn unmatched_indices_from_matches(
@@ -335,11 +329,12 @@ fn unmatched_indices_from_matches(
     let all_indices = join_index_sequence(row_count, 0, 1)?;
     let matched_mask = matched_row_mask(row_count, matched_indices)?;
     let false_scalar = bool_scalar(false)?;
-    let unmatched_mask = Arc::new(CuDFColumn::new(ffi::binary_operation_col_scalar(
+    let bool_type = bool_data_type()?;
+    let unmatched_mask = Arc::new(CuDFColumn::from_inner(ffi::binary_operation_col_scalar(
         Arc::clone(&matched_mask).view().inner(),
         false_scalar.inner(),
         BinaryOperator::Equal as i32,
-        &bool_data_type(),
+        &bool_type,
         stream_ref(&stream)?,
         resource_ref(&resource)?,
     )?));
@@ -351,13 +346,10 @@ fn unmatched_indices_from_matches(
         stream_ref(&stream)?,
         resource_ref(&resource)?,
     )?);
-    Ok(Arc::new(
-        unmatched_table
-            .into_columns()
-            .into_iter()
-            .next()
-            .expect("unmatched indices has one column"),
-    ))
+    Ok(Arc::new(first_column(
+        unmatched_table,
+        "unmatched indices",
+    )?))
 }
 
 fn join_index_sequence(size: usize, init: i32, step: i32) -> Result<Arc<CuDFColumn>, CuDFError> {
@@ -365,9 +357,10 @@ fn join_index_sequence(size: usize, init: i32, step: i32) -> Result<Arc<CuDFColu
     let resource = ffi::get_current_device_resource_ref();
     let init_array = Int32Array::from(vec![init]);
     let step_array = Int32Array::from(vec![step]);
-    let init_scalar = CuDFScalar::from_arrow_host(Scalar::new(&init_array))?;
-    let step_scalar = CuDFScalar::from_arrow_host(Scalar::new(&step_array))?;
-    Ok(Arc::new(CuDFColumn::new(ffi::sequence(
+    let ctx = CuDFExecutionContext::try_new_non_blocking()?;
+    let init_scalar = ctx.execute(CuDFScalar::from_arrow_host(Scalar::new(&init_array)))?;
+    let step_scalar = ctx.execute(CuDFScalar::from_arrow_host(Scalar::new(&step_array)))?;
+    Ok(Arc::new(CuDFColumn::from_inner(ffi::sequence(
         size,
         init_scalar.inner(),
         step_scalar.inner(),
@@ -378,16 +371,22 @@ fn join_index_sequence(size: usize, init: i32, step: i32) -> Result<Arc<CuDFColu
 
 fn int32_scalar(value: i32) -> Result<CuDFScalar, CuDFError> {
     let array = Int32Array::from(vec![value]);
-    CuDFScalar::from_arrow_host(Scalar::new(&array))
+    CuDFExecutionContext::try_new_non_blocking()?
+        .execute(CuDFScalar::from_arrow_host(Scalar::new(&array)))
 }
 
 fn bool_scalar(value: bool) -> Result<CuDFScalar, CuDFError> {
     let array = BooleanArray::from(vec![value]);
-    CuDFScalar::from_arrow_host(Scalar::new(&array))
+    CuDFExecutionContext::try_new_non_blocking()?
+        .execute(CuDFScalar::from_arrow_host(Scalar::new(&array)))
 }
 
-fn bool_data_type() -> cxx::UniquePtr<ffi::DataType> {
-    arrow_type_to_cudf_data_type(&DataType::Boolean).expect("Boolean is supported by cuDF")
+fn bool_data_type() -> Result<cxx::UniquePtr<ffi::DataType>, CuDFError> {
+    arrow_type_to_cudf_data_type(&DataType::Boolean).ok_or_else(|| {
+        CuDFError::ArrowError(arrow::error::ArrowError::InvalidArgumentError(
+            "Boolean is not supported by cuDF".to_string(),
+        ))
+    })
 }
 
 /// Reusable hash join built from a fixed build-side key table.
@@ -397,7 +396,7 @@ pub struct CuDFHashJoin {
     inner: UniquePtr<ffi::HashJoin>,
     build_rows: usize,
     matched_build_mask: Option<Arc<CuDFColumn>>,
-    _build_ref: Option<Arc<dyn CuDFRef>>,
+    _build_storage: Option<CuDFViewStorage>,
 }
 
 /// Controls whether null join-key values compare equal.
@@ -436,7 +435,7 @@ impl CuDFHashJoin {
             inner,
             build_rows: build.num_rows(),
             matched_build_mask: None,
-            _build_ref: build._ref.clone(),
+            _build_storage: build.storage(),
         })
     }
 
@@ -732,7 +731,7 @@ impl CuDFHashJoin {
             Some(mask) => Arc::clone(mask),
             None => {
                 let false_scalar = bool_scalar(false)?;
-                let mask = Arc::new(CuDFColumn::new(ffi::make_column_from_scalar(
+                let mask = Arc::new(CuDFColumn::from_inner(ffi::make_column_from_scalar(
                     false_scalar.inner(),
                     self.build_rows,
                     stream_ref(&stream)?,
@@ -754,13 +753,10 @@ impl CuDFHashJoin {
             stream_ref(&stream)?,
             resource_ref(&resource)?,
         )?);
-        self.matched_build_mask = Some(Arc::new(
-            updated
-                .into_columns()
-                .into_iter()
-                .next()
-                .expect("updated matched build mask has one column"),
-        ));
+        self.matched_build_mask = Some(Arc::new(first_column(
+            updated,
+            "updated matched build mask",
+        )?));
         Ok(())
     }
 
@@ -773,11 +769,12 @@ impl CuDFHashJoin {
         let stream = ffi::get_default_stream();
         let resource = ffi::get_current_device_resource_ref();
         let false_scalar = bool_scalar(false)?;
-        let unmatched_mask = Arc::new(CuDFColumn::new(ffi::binary_operation_col_scalar(
+        let bool_type = bool_data_type()?;
+        let unmatched_mask = Arc::new(CuDFColumn::from_inner(ffi::binary_operation_col_scalar(
             Arc::clone(matched_build_mask).view().inner(),
             false_scalar.inner(),
             BinaryOperator::Equal as i32,
-            &bool_data_type(),
+            &bool_type,
             stream_ref(&stream)?,
             resource_ref(&resource)?,
         )?));
@@ -789,14 +786,19 @@ impl CuDFHashJoin {
             stream_ref(&stream)?,
             resource_ref(&resource)?,
         )?);
-        Ok(Arc::new(
-            unmatched_table
-                .into_columns()
-                .into_iter()
-                .next()
-                .expect("unmatched build indices has one column"),
-        ))
+        Ok(Arc::new(first_column(
+            unmatched_table,
+            "unmatched build indices",
+        )?))
     }
+}
+
+fn first_column(table: CuDFTable, label: &'static str) -> Result<CuDFColumn, CuDFError> {
+    table.into_columns().into_iter().next().ok_or_else(|| {
+        CuDFError::ArrowError(arrow::error::ArrowError::InvalidArgumentError(format!(
+            "{label} should have one column"
+        )))
+    })
 }
 
 /// Perform an inner join on two tables using the specified key columns.
@@ -989,6 +991,7 @@ pub fn cross_join(left: &CuDFTableView, right: &CuDFTableView) -> Result<CuDFTab
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stream_readiness::CuDFTableReadiness;
     use crate::{CuDFAstOperator, CuDFAstTableReference};
     use arrow::array::{Array, Int32Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -1007,7 +1010,7 @@ mod tests {
             ],
         )
         .unwrap();
-        CuDFTable::from_arrow_host(batch).unwrap()
+        crate::execute_cudf(CuDFTable::from_arrow_host(batch)).unwrap()
     }
 
     fn int32_values(batch: &RecordBatch, column: usize) -> Vec<i32> {
@@ -1037,11 +1040,11 @@ mod tests {
     }
 
     fn value_less_predicate() -> Result<CuDFAstExpression, CuDFError> {
-        let mut predicate = CuDFAstExpression::new();
+        let mut predicate = CuDFAstExpression::builder();
         let build_value = predicate.column_reference(1, CuDFAstTableReference::Left)?;
         let probe_value = predicate.column_reference(1, CuDFAstTableReference::Right)?;
         predicate.binary_operation(CuDFAstOperator::Less, build_value, probe_value)?;
-        Ok(predicate)
+        Ok(predicate.finish())
     }
 
     fn filtered_join_args<'a>(
@@ -1133,7 +1136,7 @@ mod tests {
         assert_eq!(result.num_rows(), 3);
         assert_eq!(result.num_columns(), 2);
 
-        let batch = result.into_view().to_arrow_host()?;
+        let batch = crate::execute_cudf(result.into_view().to_arrow_host())?;
         let left_vals = batch
             .column(0)
             .as_any()
@@ -1177,7 +1180,7 @@ mod tests {
         assert_eq!(result.num_rows(), 2);
         assert_eq!(result.num_columns(), 2); // only val from each side
 
-        let batch = result.into_view().to_arrow_host()?;
+        let batch = crate::execute_cudf(result.into_view().to_arrow_host())?;
         let left_vals = batch
             .column(0)
             .as_any()
@@ -1229,8 +1232,8 @@ mod tests {
         assert_eq!(result_a.num_columns(), 2);
         assert_eq!(result_b.num_columns(), 2);
 
-        let batch_a = result_a.into_view().to_arrow_host()?;
-        let batch_b = result_b.into_view().to_arrow_host()?;
+        let batch_a = crate::execute_cudf(result_a.into_view().to_arrow_host())?;
+        let batch_b = crate::execute_cudf(result_b.into_view().to_arrow_host())?;
         let left_a = batch_a
             .column(0)
             .as_any()
@@ -1265,18 +1268,21 @@ mod tests {
         let probe = make_table(vec![2, 2, 3], vec![15, 30, 35]);
         let probe_view = probe.into_view();
 
-        let mut predicate = CuDFAstExpression::new();
+        let mut predicate = CuDFAstExpression::builder();
         let build_value = predicate.column_reference(0, CuDFAstTableReference::Left)?;
         let probe_value = predicate.column_reference(0, CuDFAstTableReference::Right)?;
         let five = predicate.literal(int32_scalar(5)?)?;
         let build_plus_five =
             predicate.binary_operation(CuDFAstOperator::Add, build_value, five)?;
         predicate.binary_operation(CuDFAstOperator::LessEqual, build_plus_five, probe_value)?;
+        let predicate = predicate.finish();
 
         let build_values = select_cols(&build_view, &[1]);
         let probe_values = select_cols(&probe_view, &[1]);
-        let build_values_view = CuDFTableView::new_with_ref(build_values, build_view._ref.clone());
-        let probe_values_view = CuDFTableView::new_with_ref(probe_values, probe_view._ref.clone());
+        let build_values_view =
+            CuDFTableView::from_view(build_values, build_view.storage(), CuDFTableReadiness::None);
+        let probe_values_view =
+            CuDFTableView::from_view(probe_values, probe_view.storage(), CuDFTableReadiness::None);
         let result = join.inner_join_filtered(CuDFFilteredHashJoinArgs {
             probe: &probe_view,
             probe_on: &[0],
@@ -1289,7 +1295,7 @@ mod tests {
             probe_out_cols: Some(&[1]),
         })?;
 
-        let batch = result.into_view().to_arrow_host()?;
+        let batch = crate::execute_cudf(result.into_view().to_arrow_host())?;
         let left_vals = batch
             .column(0)
             .as_any()
@@ -1317,7 +1323,7 @@ mod tests {
 
         let probe = make_table(vec![2], vec![25]);
         let probe_view = probe.into_view();
-        let predicate = CuDFAstExpression::new();
+        let predicate = CuDFAstExpression::builder().finish();
         let result =
             join.inner_join_filtered(filtered_join_args(&probe_view, &predicate, &build_view));
 
@@ -1343,13 +1349,13 @@ mod tests {
             &build_view,
         ))?;
 
-        let matched_batch = matched.into_view().to_arrow_host()?;
+        let matched_batch = crate::execute_cudf(matched.into_view().to_arrow_host())?;
         assert_eq!(int32_values(&matched_batch, 0), vec![20]);
         assert_eq!(int32_values(&matched_batch, 1), vec![25]);
 
         let unmatched =
             join.unmatched_build_rows(&build_view, &probe_view, Some(&[1]), Some(&[1]))?;
-        let unmatched_batch = unmatched.into_view().to_arrow_host()?;
+        let unmatched_batch = crate::execute_cudf(unmatched.into_view().to_arrow_host())?;
         let right_vals = unmatched_batch
             .column(1)
             .as_any()
@@ -1402,7 +1408,7 @@ mod tests {
 
         let unmatched =
             join.unmatched_build_rows(&build_view, &probe_view, Some(&[1]), Some(&[1]))?;
-        let unmatched_batch = unmatched.into_view().to_arrow_host()?;
+        let unmatched_batch = crate::execute_cudf(unmatched.into_view().to_arrow_host())?;
         let right_vals = unmatched_batch
             .column(1)
             .as_any()
@@ -1429,7 +1435,7 @@ mod tests {
             &build_view,
         ))?;
 
-        let batch = result.into_view().to_arrow_host()?;
+        let batch = crate::execute_cudf(result.into_view().to_arrow_host())?;
         let mut pairs: Vec<_> = int32_options(&batch, 0)
             .into_iter()
             .zip(int32_options(&batch, 1))
@@ -1447,7 +1453,7 @@ mod tests {
 
         let unmatched =
             join.unmatched_build_rows(&build_view, &probe_view, Some(&[1]), Some(&[1]))?;
-        let unmatched_batch = unmatched.into_view().to_arrow_host()?;
+        let unmatched_batch = crate::execute_cudf(unmatched.into_view().to_arrow_host())?;
         let right_vals = unmatched_batch
             .column(1)
             .as_any()
@@ -1474,7 +1480,7 @@ mod tests {
             Some(&[1]),
             Some(&[1]),
         )?;
-        let inner_batch = inner.into_view().to_arrow_host()?;
+        let inner_batch = crate::execute_cudf(inner.into_view().to_arrow_host())?;
         assert_eq!(int32_values(&inner_batch, 0), vec![20]);
         assert_eq!(int32_values(&inner_batch, 1), vec![200]);
 
@@ -1491,7 +1497,7 @@ mod tests {
         assert_eq!(probe_left.num_rows(), 2);
         assert_eq!(probe_left.num_columns(), 2);
 
-        let probe_left_batch = probe_left.into_view().to_arrow_host()?;
+        let probe_left_batch = crate::execute_cudf(probe_left.into_view().to_arrow_host())?;
         let build_vals = probe_left_batch
             .column(0)
             .as_any()
@@ -1511,7 +1517,7 @@ mod tests {
         assert_eq!(unmatched.num_rows(), 1);
         assert_eq!(unmatched.num_columns(), 2);
 
-        let unmatched_batch = unmatched.into_view().to_arrow_host()?;
+        let unmatched_batch = crate::execute_cudf(unmatched.into_view().to_arrow_host())?;
         let unmatched_probe_vals = unmatched_batch
             .column(1)
             .as_any()
@@ -1553,7 +1559,7 @@ mod tests {
         )?;
         assert_eq!(probe_left.num_rows(), 4);
 
-        let probe_left_batch = probe_left.into_view().to_arrow_host()?;
+        let probe_left_batch = crate::execute_cudf(probe_left.into_view().to_arrow_host())?;
         let build_vals = probe_left_batch
             .column(0)
             .as_any()
@@ -1566,7 +1572,7 @@ mod tests {
         assert_eq!(unmatched.num_rows(), 2);
         assert_eq!(unmatched.num_columns(), 2);
 
-        let unmatched_batch = unmatched.into_view().to_arrow_host()?;
+        let unmatched_batch = crate::execute_cudf(unmatched.into_view().to_arrow_host())?;
         let unmatched_probe_vals = unmatched_batch
             .column(1)
             .as_any()
@@ -1631,7 +1637,7 @@ mod tests {
         assert_eq!(result.num_rows(), 3); // all left rows preserved
         assert_eq!(result.num_columns(), 3); // left.key, left.val, right.val
 
-        let batch = result.into_view().to_arrow_host()?;
+        let batch = crate::execute_cudf(result.into_view().to_arrow_host())?;
         let right_val_col = batch
             .column(2)
             .as_any()
@@ -1654,7 +1660,7 @@ mod tests {
         assert_eq!(result.num_rows(), 2); // keys 2 and 3 match
         assert_eq!(result.num_columns(), 2); // only left columns
 
-        let batch = result.into_view().to_arrow_host()?;
+        let batch = crate::execute_cudf(result.into_view().to_arrow_host())?;
         let mut keys = int32_values(&batch, 0);
         keys.sort();
         assert_eq!(keys, vec![2, 3]);
@@ -1670,7 +1676,7 @@ mod tests {
         assert_eq!(result.num_rows(), 2); // keys 1 and 4 have no match
         assert_eq!(result.num_columns(), 2); // only left columns
 
-        let batch = result.into_view().to_arrow_host()?;
+        let batch = crate::execute_cudf(result.into_view().to_arrow_host())?;
         let mut keys = int32_values(&batch, 0);
         keys.sort();
         assert_eq!(keys, vec![1, 4]);

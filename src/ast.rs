@@ -3,14 +3,29 @@ use arrow::error::ArrowError;
 use cxx::UniquePtr;
 use libcudf_sys::{ffi, AstOperator, AstTableReference};
 use std::fmt;
+use std::sync::Arc;
 
-/// A node index inside a [`CuDFAstExpression`] tree.
-pub type CuDFAstNode = usize;
-
-/// Table side used by a cuDF AST column reference.
+/// Opaque node handle inside a [`CuDFAstExpression`] tree.
 ///
-/// Join predicates evaluate against two input tables. `Left` and `Right`
-/// select which table a column reference reads from.
+/// Node handles are returned by [`CuDFAstExpression`] builder methods and can
+/// be used as inputs to later operation nodes in the same expression tree.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct CuDFAstNode(usize);
+
+impl CuDFAstNode {
+    fn from_raw(index: usize) -> Self {
+        Self(index)
+    }
+
+    fn into_raw(self) -> usize {
+        self.0
+    }
+}
+
+/// Table referenced by a cuDF AST column node.
+///
+/// Join predicates evaluate against two input tables, while other cuDF AST
+/// consumers can also evaluate expressions against an output table.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CuDFAstTableReference {
     /// Column index in the left table.
@@ -32,6 +47,9 @@ impl CuDFAstTableReference {
 }
 
 /// Operators supported by [`CuDFAstExpression`].
+///
+/// cuDF validates whether an operator is valid for the node arity and input
+/// types when the node is added to an expression tree.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CuDFAstOperator {
     /// Addition.
@@ -106,13 +124,35 @@ impl CuDFAstOperator {
     }
 }
 
-/// Owning cuDF AST expression tree.
+/// Immutable owning cuDF AST expression tree.
 ///
 /// Literal scalars are kept alive by this wrapper because cuDF AST literal
 /// nodes reference scalar objects owned outside the tree.
 ///
-/// The most recently added node is the expression root used by join filtering.
+/// Build expressions with [`CuDFAstExpressionBuilder`]. Finished expressions
+/// are cheap to clone, so they can be retained while stream-ordered work is
+/// still pending.
+///
+/// # Examples
+///
+/// ```no_run
+/// use libcudf_rs::{CuDFAstExpression, CuDFAstOperator, CuDFAstTableReference};
+///
+/// # fn build() -> Result<(), libcudf_rs::CuDFError> {
+/// let mut ast = CuDFAstExpression::builder();
+/// let left = ast.column_reference(0, CuDFAstTableReference::Left)?;
+/// let right = ast.column_reference(0, CuDFAstTableReference::Right)?;
+/// ast.binary_operation(CuDFAstOperator::Equal, left, right)?;
+/// let ast = ast.finish();
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone)]
 pub struct CuDFAstExpression {
+    inner: Arc<CuDFAstExpressionInner>,
+}
+
+pub(crate) struct CuDFAstExpressionInner {
     inner: UniquePtr<ffi::AstExpressionTree>,
     literals: Vec<CuDFScalar>,
 }
@@ -124,11 +164,46 @@ impl fmt::Debug for CuDFAstExpression {
 }
 
 impl CuDFAstExpression {
-    /// Create an empty cuDF AST expression tree.
-    pub fn new() -> Self {
+    /// Create a mutable builder for a cuDF AST expression tree.
+    pub fn builder() -> CuDFAstExpressionBuilder {
+        CuDFAstExpressionBuilder::new()
+    }
+
+    pub(crate) fn inner(&self) -> &UniquePtr<ffi::AstExpressionTree> {
+        &self.inner.inner
+    }
+}
+
+/// Mutable builder for a cuDF AST expression tree.
+///
+/// Each builder method appends a node and returns a [`CuDFAstNode`] that can be
+/// used as input to later nodes. cuDF treats the most recently added node as
+/// the expression root.
+pub struct CuDFAstExpressionBuilder {
+    inner: CuDFAstExpressionInner,
+}
+
+impl fmt::Debug for CuDFAstExpressionBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CuDFAstExpressionBuilder")
+            .finish_non_exhaustive()
+    }
+}
+
+impl CuDFAstExpressionBuilder {
+    fn new() -> Self {
         Self {
-            inner: ffi::ast_expression_tree_create(),
-            literals: Vec::new(),
+            inner: CuDFAstExpressionInner {
+                inner: ffi::ast_expression_tree_create(),
+                literals: Vec::new(),
+            },
+        }
+    }
+
+    /// Finish this builder and return an immutable expression.
+    pub fn finish(self) -> CuDFAstExpression {
+        CuDFAstExpression {
+            inner: Arc::new(self.inner),
         }
     }
 
@@ -141,35 +216,43 @@ impl CuDFAstExpression {
     /// # Errors
     ///
     /// Returns an error if `column_index` cannot be represented as a cuDF
-    /// column index.
+    /// column index or cuDF cannot add the column reference.
     pub fn column_reference(
         &mut self,
         column_index: usize,
         table: CuDFAstTableReference,
     ) -> Result<CuDFAstNode, CuDFError> {
-        Ok(ffi::ast_expression_tree_add_column_reference(
-            self.inner.pin_mut(),
-            column_index.try_into().map_err(|_| {
-                CuDFError::ArrowError(ArrowError::InvalidArgumentError(format!(
-                    "AST column index {column_index} exceeds i32"
-                )))
-            })?,
-            table.into_sys() as i32,
-        )?)
+        Ok(CuDFAstNode::from_raw(
+            ffi::ast_expression_tree_add_column_reference(
+                self.inner.inner.pin_mut(),
+                column_index.try_into().map_err(|_| {
+                    CuDFError::ArrowError(ArrowError::InvalidArgumentError(format!(
+                        "AST column index {column_index} exceeds i32"
+                    )))
+                })?,
+                table.into_sys() as i32,
+            )?,
+        ))
     }
 
     /// Add a column-name reference node.
     ///
     /// cuDF Parquet filters use names so filter columns do not need to be
     /// present in the projected output.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if cuDF cannot add the column-name reference.
     pub fn column_name_reference(
         &mut self,
         column_name: impl AsRef<str>,
     ) -> Result<CuDFAstNode, CuDFError> {
-        Ok(ffi::ast_expression_tree_add_column_name_reference(
-            self.inner.pin_mut(),
-            column_name.as_ref(),
-        )?)
+        Ok(CuDFAstNode::from_raw(
+            ffi::ast_expression_tree_add_column_name_reference(
+                self.inner.inner.pin_mut(),
+                column_name.as_ref(),
+            )?,
+        ))
     }
 
     /// Add a literal node.
@@ -181,15 +264,14 @@ impl CuDFAstExpression {
     ///
     /// Returns an error if cuDF cannot add the scalar as an AST literal.
     pub fn literal(&mut self, scalar: CuDFScalar) -> Result<CuDFAstNode, CuDFError> {
-        self.literals.push(scalar);
-        let scalar = self
-            .literals
-            .last()
-            .expect("literal scalar was just inserted");
-        Ok(ffi::ast_expression_tree_add_literal(
-            self.inner.pin_mut(),
+        self.inner.literals.push(scalar);
+        let scalar = self.inner.literals.last().ok_or_else(|| {
+            ArrowError::InvalidArgumentError("literal scalar insertion failed".to_string())
+        })?;
+        Ok(CuDFAstNode::from_raw(ffi::ast_expression_tree_add_literal(
+            self.inner.inner.pin_mut(),
             scalar.inner(),
-        )?)
+        )?))
     }
 
     /// Add a unary operation node.
@@ -203,11 +285,13 @@ impl CuDFAstExpression {
         op: CuDFAstOperator,
         input: CuDFAstNode,
     ) -> Result<CuDFAstNode, CuDFError> {
-        Ok(ffi::ast_expression_tree_add_unary_operation(
-            self.inner.pin_mut(),
-            op.into_sys() as i32,
-            input,
-        )?)
+        Ok(CuDFAstNode::from_raw(
+            ffi::ast_expression_tree_add_unary_operation(
+                self.inner.inner.pin_mut(),
+                op.into_sys() as i32,
+                input.into_raw(),
+            )?,
+        ))
     }
 
     /// Add a binary operation node.
@@ -222,20 +306,18 @@ impl CuDFAstExpression {
         left: CuDFAstNode,
         right: CuDFAstNode,
     ) -> Result<CuDFAstNode, CuDFError> {
-        Ok(ffi::ast_expression_tree_add_operation(
-            self.inner.pin_mut(),
-            op.into_sys() as i32,
-            left,
-            right,
-        )?)
-    }
-
-    pub(crate) fn inner(&self) -> &UniquePtr<ffi::AstExpressionTree> {
-        &self.inner
+        Ok(CuDFAstNode::from_raw(
+            ffi::ast_expression_tree_add_operation(
+                self.inner.inner.pin_mut(),
+                op.into_sys() as i32,
+                left.into_raw(),
+                right.into_raw(),
+            )?,
+        ))
     }
 }
 
-impl Default for CuDFAstExpression {
+impl Default for CuDFAstExpressionBuilder {
     fn default() -> Self {
         Self::new()
     }

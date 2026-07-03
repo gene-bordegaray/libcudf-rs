@@ -1,8 +1,7 @@
 use crate::data_type::cudf_type_to_arrow;
-use crate::device_resource::resource_ref;
-use crate::stream::stream_ref;
-use crate::{CuDFColumn, CuDFError};
-use arrow::array::{Array, ArrayData, ArrayRef, Scalar};
+use crate::stream_readiness::{CuDFStreamDependency, CuDFStreamReady};
+use crate::{CuDFError, CuDFExecutionContext};
+use arrow::array::{new_empty_array, Array, ArrayData, ArrayRef};
 use arrow::buffer::NullBuffer;
 use arrow_schema::DataType;
 use cxx::UniquePtr;
@@ -11,19 +10,19 @@ use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, RwLock};
 
-/// A single value stored in GPU memory
+/// A single cuDF value stored in GPU memory.
 ///
-/// CuDFScalar wraps a cuDF scalar and implements Arrow's Array trait with length 1.
-/// This allows scalar values to be used in contexts that expect arrays, enabling
-/// seamless integration with operations that work on both scalars and columns.
+/// `CuDFScalar` wraps a cuDF scalar and implements Arrow's [`Array`] trait with
+/// length 1. That lets scalar values participate in APIs that accept either GPU
+/// columns or scalar arrays.
 pub struct CuDFScalar {
     inner: UniquePtr<ffi::Scalar>,
     dt: DataType,
     cached_scalar: RwLock<Option<Arc<ArrayData>>>,
+    stream_readiness: Option<CuDFStreamDependency>,
 }
 
 impl CuDFScalar {
-    /// Create a CuDFScalar from an existing cuDF scalar
     pub(crate) fn new(inner: UniquePtr<ffi::Scalar>) -> Self {
         let cudf_dtype = inner.data_type();
         let dt = cudf_type_to_arrow(&cudf_dtype);
@@ -33,153 +32,28 @@ impl CuDFScalar {
             inner,
             dt,
             cached_scalar,
+            stream_readiness: None,
         }
     }
 
-    /// Get a reference to the underlying cuDF scalar
+    pub(crate) fn with_stream_readiness(mut self, dependency: CuDFStreamDependency) -> Self {
+        self.stream_readiness = Some(dependency);
+        self
+    }
+
     pub(crate) fn inner(&self) -> &UniquePtr<ffi::Scalar> {
         &self.inner
     }
 
-    /// Convert the cuDF scalar to a single-element Arrow array, copying data from GPU to host
-    ///
-    /// This copies the GPU data back to the CPU and creates an Arrow array containing a single
-    /// element.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The cuDF scalar cannot be converted to Arrow format
-    /// - There is an error copying data from GPU to host
-    /// - There is insufficient memory for the conversion
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use arrow::array::{Array, Int32Array, Scalar};
-    /// use libcudf_rs::CuDFScalar;
-    ///
-    /// // Create a cuDF scalar from an Arrow scalar
-    /// let array = Int32Array::from(vec![42]);
-    /// let scalar = Scalar::new(&array);
-    /// let cudf_scalar = CuDFScalar::from_arrow_host(scalar)?;
-    ///
-    /// // Convert back to Arrow (GPU -> CPU)
-    /// let arrow_array = cudf_scalar.to_arrow_host()?;
-    ///
-    /// // Verify the result
-    /// assert_eq!(arrow_array.len(), 1);
-    /// assert_eq!(arrow_array.null_count(), 0);
-    ///
-    /// // Downcast to specific type and get value
-    /// let int32_array = arrow_array
-    ///     .as_any()
-    ///     .downcast_ref::<Int32Array>()
-    ///     .expect("Expected Int32Array");
-    /// assert_eq!(int32_array.value(0), 42);
-    /// # Ok::<(), libcudf_rs::CuDFError>(())
-    /// ```
-    pub fn to_arrow_host(&self) -> Result<ArrayRef, CuDFError> {
-        let mut device_array = libcudf_sys::ArrowDeviceArray::new_cpu();
-
-        // Convert the scalar to Arrow format (copying from GPU to host)
-        // cuDF's to_arrow_array expects an ArrowDeviceArray pointer
-        unsafe {
-            let device_array_ptr =
-                &mut device_array as *mut libcudf_sys::ArrowDeviceArray as *mut u8;
-            let stream = ffi::get_default_stream();
-            let mr = ffi::get_current_device_resource_ref();
-            self.inner
-                .to_arrow_array(device_array_ptr, stream_ref(&stream)?, resource_ref(&mr)?);
-        }
-
-        // Convert from FFI structures to Arrow ArrayData
-        // Extract just the ArrowArray part
-        let array_data =
-            unsafe { arrow::ffi::from_ffi_and_data_type(device_array.array, self.dt.clone())? };
-
-        // Create an ArrayRef from the ArrayData
-        Ok(arrow::array::make_array(array_data))
-    }
-
-    /// Convert an Arrow scalar to a cuDF scalar
-    ///
-    /// This creates a single-element column from the scalar, transfers it to GPU,
-    /// and extracts the scalar from that column.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The Arrow scalar cannot be converted to cuDF format
-    /// - There is insufficient GPU memory
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use arrow::array::{Int32Array, Scalar};
-    /// use libcudf_rs::CuDFScalar;
-    ///
-    /// let array = Int32Array::from(vec![42]);
-    /// let scalar = Scalar::new(&array);
-    /// let cudf_scalar = CuDFScalar::from_arrow_host(scalar)?;
-    /// # Ok::<(), libcudf_rs::CuDFError>(())
-    /// ```
-    pub fn from_arrow_host<T: Array>(scalar: Scalar<T>) -> Result<Self, CuDFError> {
-        // Convert scalar to a single-element array
-        let array = scalar.into_inner();
-
-        // Convert the array to a cuDF column (this copies to GPU)
-        let column = CuDFColumn::from_arrow_host(&array)?.into_view();
-
-        // Extract the scalar from the column at index 0
-        let stream = ffi::get_default_stream();
-        let mr = ffi::get_current_device_resource_ref();
-        let cudf_scalar =
-            ffi::get_element(column.inner(), 0, stream_ref(&stream)?, resource_ref(&mr)?);
-
-        Ok(Self::new(cudf_scalar))
-    }
-
-    /// Get or compute the cached ArrayData for this scalar
-    ///
-    /// This method lazily converts the GPU scalar to CPU ArrayData and caches the results. This
-    /// avoids subsequent calls performing more expensive GPU->CPU transfer by returning the cached
-    /// data.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The scalar cannot be converted to Arrow format
-    /// - There is insufficient memory for the conversion
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use arrow::array::{Int32Array, Scalar};
-    /// use libcudf_rs::CuDFScalar;
-    ///
-    /// let array = Int32Array::from(vec![42]);
-    /// let scalar = Scalar::new(&array);
-    /// let cudf_scalar = CuDFScalar::from_arrow_host(scalar)?;
-    ///
-    /// // First call: converts GPU -> CPU and caches
-    /// let data1 = cudf_scalar.get_scalar_data()?;
-    ///
-    /// // Second call: returns cached data
-    /// let data2 = cudf_scalar.get_scalar_data()?;
-    ///
-    /// assert_eq!(data1.len(), 1);
-    /// assert_eq!(data2.len(), 1);
-    /// # Ok::<(), libcudf_rs::CuDFError>(())
-    /// ```
-    pub fn get_scalar_data(&self) -> Result<Arc<ArrayData>, CuDFError> {
+    fn cached_array_data(&self) -> Result<Arc<ArrayData>, CuDFError> {
         if let Ok(cache) = self.cached_scalar.read() {
             if let Some(cached_data) = cache.as_ref() {
                 return Ok(Arc::clone(cached_data));
             }
         }
 
-        let array_ref = self.to_arrow_host()?;
+        let array_ref =
+            CuDFExecutionContext::try_new_non_blocking()?.execute(self.to_arrow_host())?;
         let array_data = Arc::new(array_ref.to_data());
         if let Ok(mut cache) = self.cached_scalar.write() {
             *cache = Some(Arc::clone(&array_data));
@@ -201,7 +75,17 @@ impl Clone for CuDFScalar {
             inner: self.inner.clone(),
             dt: self.dt.clone(),
             cached_scalar: RwLock::new(None),
+            stream_readiness: self.stream_readiness.clone(),
         }
+    }
+}
+
+impl CuDFStreamReady for CuDFScalar {
+    fn wait_ready_on_stream(&self, stream: &ffi::CudaStreamView) -> Result<(), CuDFError> {
+        if let Some(dependency) = &self.stream_readiness {
+            dependency.wait_on_stream(stream)?;
+        }
+        Ok(())
     }
 }
 
@@ -212,7 +96,11 @@ unsafe impl Array for CuDFScalar {
 
     fn to_data(&self) -> ArrayData {
         // WARNING: This performs a full GPU to CPU data transfer.
-        self.to_arrow_host()
+        //
+        // TODO: Avoid fallible cuDF work in Arrow's infallible Array trait.
+        CuDFExecutionContext::try_new_non_blocking()
+            .expect("failed to create cuDF execution context")
+            .execute(self.to_arrow_host())
             .expect("Failed to convert GPU scalar to host Arrow")
             .to_data()
     }
@@ -227,12 +115,13 @@ unsafe impl Array for CuDFScalar {
 
     fn slice(&self, offset: usize, length: usize) -> ArrayRef {
         if offset >= 1 || length == 0 {
-            arrow::array::new_empty_array(&self.dt)
+            new_empty_array(&self.dt)
         } else {
             Arc::new(Self {
                 inner: self.inner.clone(),
                 dt: self.dt.clone(),
                 cached_scalar: RwLock::new(None),
+                stream_readiness: self.stream_readiness.clone(),
             })
         }
     }
@@ -254,14 +143,13 @@ unsafe impl Array for CuDFScalar {
     }
 
     fn get_buffer_memory_size(&self) -> usize {
-        self.get_scalar_data()
+        self.cached_array_data()
             .map(|data| data.get_buffer_memory_size())
             .unwrap_or(0)
     }
 
     fn get_array_memory_size(&self) -> usize {
-        // Array memory = buffer memory + null bitmap
-        self.get_scalar_data()
+        self.cached_array_data()
             .map(|data| data.get_array_memory_size())
             .unwrap_or(0)
     }
@@ -349,79 +237,8 @@ mod tests {
     }
 
     #[test]
-    fn test_to_arrow_host_int32() -> Result<(), Box<dyn std::error::Error>> {
-        let array = Int32Array::from(vec![42]);
-        let cudf_scalar = CuDFScalar::from_arrow_host(Scalar::new(&array))?;
-        let result = cudf_scalar.to_arrow_host()?;
-
-        assert_eq!(result.len(), 1);
-        assert_eq!(result.data_type(), &DataType::Int32);
-        let result_array = result.as_any().downcast_ref::<Int32Array>().unwrap();
-        assert_eq!(result_array.value(0), 42);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_to_arrow_host_int64() -> Result<(), Box<dyn std::error::Error>> {
-        let array = Int64Array::from(vec![12345_i64]);
-        let cudf_scalar = CuDFScalar::from_arrow_host(Scalar::new(&array))?;
-        let result = cudf_scalar.to_arrow_host()?;
-
-        assert_eq!(result.len(), 1);
-        assert_eq!(result.data_type(), &DataType::Int64);
-        let result_array = result.as_any().downcast_ref::<Int64Array>().unwrap();
-        assert_eq!(result_array.value(0), 12345);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_to_arrow_host_float64() -> Result<(), Box<dyn std::error::Error>> {
-        let array = Float64Array::from(vec![std::f64::consts::PI]);
-        let cudf_scalar = CuDFScalar::from_arrow_host(Scalar::new(&array))?;
-        let result = cudf_scalar.to_arrow_host()?;
-
-        assert_eq!(result.len(), 1);
-        assert_eq!(result.data_type(), &DataType::Float64);
-        let result_array = result.as_any().downcast_ref::<Float64Array>().unwrap();
-        assert_eq!(result_array.value(0), std::f64::consts::PI);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_to_arrow_host_boolean() -> Result<(), Box<dyn std::error::Error>> {
-        let array = BooleanArray::from(vec![true]);
-        let cudf_scalar = CuDFScalar::from_arrow_host(Scalar::new(&array))?;
-        let result = cudf_scalar.to_arrow_host()?;
-
-        assert_eq!(result.len(), 1);
-        assert_eq!(result.data_type(), &DataType::Boolean);
-        let result_array = result.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert!(result_array.value(0));
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_to_arrow_host_string() -> Result<(), Box<dyn std::error::Error>> {
-        let array = StringArray::from(vec!["hello world"]);
-        let cudf_scalar = CuDFScalar::from_arrow_host(Scalar::new(&array))?;
-        let result = cudf_scalar.to_arrow_host()?;
-
-        assert_eq!(result.len(), 1);
-        assert_eq!(result.data_type(), &DataType::Utf8);
-        let result_array = result.as_any().downcast_ref::<StringArray>().unwrap();
-        assert_eq!(result_array.value(0), "hello world");
-
-        Ok(())
-    }
-
-    #[test]
     fn test_array_trait_slice_behavior_int32() -> Result<(), Box<dyn std::error::Error>> {
-        let scalar = CuDFScalar::from_arrow_host(Scalar::new(&Int32Array::from(vec![42])))
-            .expect("Failed to create scalar");
+        let scalar = scalar_from_arrow(Scalar::new(&Int32Array::from(vec![42])));
         assert_slice_behavior(&scalar);
 
         Ok(())
@@ -429,10 +246,8 @@ mod tests {
 
     #[test]
     fn test_array_trait_slice_behavior_float64() -> Result<(), Box<dyn std::error::Error>> {
-        let scalar = CuDFScalar::from_arrow_host(Scalar::new(&Float64Array::from(vec![
-            std::f64::consts::PI,
-        ])))
-        .expect("Failed to create scalar");
+        let scalar =
+            scalar_from_arrow(Scalar::new(&Float64Array::from(vec![std::f64::consts::PI])));
         assert_slice_behavior(&scalar);
 
         Ok(())
@@ -440,8 +255,7 @@ mod tests {
 
     #[test]
     fn test_array_trait_slice_behavior_string() -> Result<(), Box<dyn std::error::Error>> {
-        let scalar = CuDFScalar::from_arrow_host(Scalar::new(&StringArray::from(vec!["test"])))
-            .expect("Failed to create scalar");
+        let scalar = scalar_from_arrow(Scalar::new(&StringArray::from(vec!["test"])));
         assert_slice_behavior(&scalar);
 
         Ok(())
@@ -449,8 +263,7 @@ mod tests {
 
     #[test]
     fn test_array_trait_slice_behavior_null() -> Result<(), Box<dyn std::error::Error>> {
-        let scalar = CuDFScalar::from_arrow_host(Scalar::new(&Int32Array::from(vec![None])))
-            .expect("Failed to create scalar");
+        let scalar = scalar_from_arrow(Scalar::new(&Int32Array::from(vec![None])));
         assert_slice_behavior(&scalar);
 
         Ok(())
@@ -458,8 +271,7 @@ mod tests {
 
     #[test]
     fn test_array_trait_slice_clears_cache() -> Result<(), Box<dyn std::error::Error>> {
-        let scalar = CuDFScalar::from_arrow_host(Scalar::new(&Int64Array::from(vec![999])))
-            .expect("Failed to create scalar");
+        let scalar = scalar_from_arrow(Scalar::new(&Int64Array::from(vec![999])));
         assert_slice_clears_cache(&scalar);
 
         Ok(())
@@ -467,8 +279,7 @@ mod tests {
 
     #[test]
     fn test_array_trait_basics_int32() -> Result<(), Box<dyn std::error::Error>> {
-        let scalar = CuDFScalar::from_arrow_host(Scalar::new(&Int32Array::from(vec![42])))
-            .expect("Failed to create scalar");
+        let scalar = scalar_from_arrow(Scalar::new(&Int32Array::from(vec![42])));
         assert_array_trait_basics(&scalar, &DataType::Int32);
 
         Ok(())
@@ -476,8 +287,7 @@ mod tests {
 
     #[test]
     fn test_array_trait_basics_string() -> Result<(), Box<dyn std::error::Error>> {
-        let scalar = CuDFScalar::from_arrow_host(Scalar::new(&StringArray::from(vec!["test"])))
-            .expect("Failed to create scalar");
+        let scalar = scalar_from_arrow(Scalar::new(&StringArray::from(vec!["test"])));
         assert_array_trait_basics(&scalar, &DataType::Utf8);
 
         Ok(())
@@ -485,8 +295,7 @@ mod tests {
 
     #[test]
     fn test_array_trait_basics_boolean() -> Result<(), Box<dyn std::error::Error>> {
-        let scalar = CuDFScalar::from_arrow_host(Scalar::new(&BooleanArray::from(vec![true])))
-            .expect("Failed to create scalar");
+        let scalar = scalar_from_arrow(Scalar::new(&BooleanArray::from(vec![true])));
         assert_array_trait_basics(&scalar, &DataType::Boolean);
 
         Ok(())
@@ -494,8 +303,7 @@ mod tests {
 
     #[test]
     fn test_array_trait_basics_null() -> Result<(), Box<dyn std::error::Error>> {
-        let scalar = CuDFScalar::from_arrow_host(Scalar::new(&Int32Array::from(vec![None])))
-            .expect("Failed to create scalar");
+        let scalar = scalar_from_arrow(Scalar::new(&Int32Array::from(vec![None])));
         assert_array_trait_basics(&scalar, &DataType::Int32);
 
         Ok(())
@@ -503,8 +311,7 @@ mod tests {
 
     #[test]
     fn test_as_any_downcast() -> Result<(), Box<dyn std::error::Error>> {
-        let scalar = CuDFScalar::from_arrow_host(Scalar::new(&Int32Array::from(vec![42])))
-            .expect("Failed to create scalar");
+        let scalar = scalar_from_arrow(Scalar::new(&Int32Array::from(vec![42])));
         assert!(scalar.as_any().downcast_ref::<CuDFScalar>().is_some());
 
         Ok(())
@@ -512,8 +319,7 @@ mod tests {
 
     #[test]
     fn test_caching_works_int32() -> Result<(), Box<dyn std::error::Error>> {
-        let scalar = CuDFScalar::from_arrow_host(Scalar::new(&Int32Array::from(vec![42])))
-            .expect("Failed to create scalar");
+        let scalar = scalar_from_arrow(Scalar::new(&Int32Array::from(vec![42])));
         let size1 = scalar.get_buffer_memory_size();
         let size2 = scalar.get_buffer_memory_size();
         assert_eq!(size1, size2, "Cached and uncached sizes should match");
@@ -523,8 +329,7 @@ mod tests {
 
     #[test]
     fn test_caching_works_string() -> Result<(), Box<dyn std::error::Error>> {
-        let scalar = CuDFScalar::from_arrow_host(Scalar::new(&StringArray::from(vec!["cached"])))
-            .expect("Failed to create scalar");
+        let scalar = scalar_from_arrow(Scalar::new(&StringArray::from(vec!["cached"])));
         let size1 = scalar.get_buffer_memory_size();
         let size2 = scalar.get_buffer_memory_size();
         assert_eq!(size1, size2, "Cached and uncached sizes should match");
@@ -534,8 +339,7 @@ mod tests {
 
     #[test]
     fn test_caching_memory_sizes() -> Result<(), Box<dyn std::error::Error>> {
-        let scalar = CuDFScalar::from_arrow_host(Scalar::new(&Int64Array::from(vec![12345])))
-            .expect("Failed to create scalar");
+        let scalar = scalar_from_arrow(Scalar::new(&Int64Array::from(vec![12345])));
 
         // Buffer size caching
         let size1 = scalar.get_buffer_memory_size();
@@ -554,8 +358,7 @@ mod tests {
 
     #[test]
     fn test_caching_clone_clears_cache() -> Result<(), Box<dyn std::error::Error>> {
-        let scalar = CuDFScalar::from_arrow_host(Scalar::new(&Int32Array::from(vec![42])))
-            .expect("Failed to create scalar");
+        let scalar = scalar_from_arrow(Scalar::new(&Int32Array::from(vec![42])));
 
         // Populate cache
         let _ = scalar.get_buffer_memory_size();
@@ -571,8 +374,7 @@ mod tests {
 
     #[test]
     fn test_caching_slice_clears_cache() -> Result<(), Box<dyn std::error::Error>> {
-        let scalar = CuDFScalar::from_arrow_host(Scalar::new(&Int32Array::from(vec![42])))
-            .expect("Failed to create scalar");
+        let scalar = scalar_from_arrow(Scalar::new(&Int32Array::from(vec![42])));
 
         // Populate original cache
         let original_size = scalar.get_buffer_memory_size();
@@ -589,22 +391,17 @@ mod tests {
 
     #[test]
     fn test_memory_size() -> Result<(), Box<dyn std::error::Error>> {
-        let int32_scalar = CuDFScalar::from_arrow_host(Scalar::new(&Int32Array::from(vec![42])))
-            .expect("Failed to create scalar");
+        let int32_scalar = scalar_from_arrow(Scalar::new(&Int32Array::from(vec![42])));
         assert_memory_size(&int32_scalar, 4, "Int32");
 
-        let int64_scalar = CuDFScalar::from_arrow_host(Scalar::new(&Int64Array::from(vec![12345])))
-            .expect("Failed to create scalar");
+        let int64_scalar = scalar_from_arrow(Scalar::new(&Int64Array::from(vec![12345])));
         assert_memory_size(&int64_scalar, 8, "Int64");
 
-        let float_scalar = CuDFScalar::from_arrow_host(Scalar::new(&Float64Array::from(vec![
-            std::f64::consts::PI,
-        ])))
-        .expect("Failed to create scalar");
+        let float_scalar =
+            scalar_from_arrow(Scalar::new(&Float64Array::from(vec![std::f64::consts::PI])));
         assert_memory_size(&float_scalar, 8, "Float64");
 
-        let bool_scalar = CuDFScalar::from_arrow_host(Scalar::new(&BooleanArray::from(vec![true])))
-            .expect("Failed to create scalar");
+        let bool_scalar = scalar_from_arrow(Scalar::new(&BooleanArray::from(vec![true])));
         let buffer_size = bool_scalar.get_buffer_memory_size();
         let array_size = bool_scalar.get_array_memory_size();
         assert!(buffer_size > 0, "Boolean buffer size should be positive");
@@ -614,9 +411,7 @@ mod tests {
         );
 
         let test_string = "hello world";
-        let string_scalar =
-            CuDFScalar::from_arrow_host(Scalar::new(&StringArray::from(vec![test_string])))
-                .expect("Failed to create scalar");
+        let string_scalar = scalar_from_arrow(Scalar::new(&StringArray::from(vec![test_string])));
         let buffer_size = string_scalar.get_buffer_memory_size();
         let array_size = string_scalar.get_array_memory_size();
         // For strings, size should be at least the string length
@@ -626,8 +421,7 @@ mod tests {
         );
         assert!(array_size >= buffer_size);
 
-        let scalar = CuDFScalar::from_arrow_host(Scalar::new(&Int32Array::from(vec![None])))
-            .expect("Failed to create scalar");
+        let scalar = scalar_from_arrow(Scalar::new(&Int32Array::from(vec![None])));
         let buffer_size = scalar.get_buffer_memory_size();
         let array_size = scalar.get_array_memory_size();
         // Null scalar should still have some memory overhead
@@ -641,44 +435,24 @@ mod tests {
 
     #[test]
     fn test_null_handling() -> Result<(), Box<dyn std::error::Error>> {
-        let null_scalar = CuDFScalar::from_arrow_host(Scalar::new(&Int32Array::from(vec![None])))
-            .expect("Failed to create scalar");
+        let null_scalar = scalar_from_arrow(Scalar::new(&Int32Array::from(vec![None])));
         assert!(!null_scalar.inner().is_valid(), "Scalar should be null");
 
-        let valid_scalar = CuDFScalar::from_arrow_host(Scalar::new(&Int32Array::from(vec![42])))
-            .expect("Failed to create scalar");
+        let valid_scalar = scalar_from_arrow(Scalar::new(&Int32Array::from(vec![42])));
         assert!(valid_scalar.inner().is_valid(), "Scalar should be valid");
 
         Ok(())
     }
 
     #[test]
-    fn test_null_scalar_to_arrow() -> Result<(), Box<dyn std::error::Error>> {
-        let scalar = CuDFScalar::from_arrow_host(Scalar::new(&Int32Array::from(vec![None])))?;
-        let result = scalar.to_arrow_host()?;
-
-        assert_eq!(result.len(), 1);
-        assert_eq!(result.data_type(), &DataType::Int32);
-        assert_eq!(
-            result.null_count(),
-            1,
-            "Null scalar should have null_count = 1"
-        );
-
-        Ok(())
-    }
-
-    #[test]
     fn test_data_conversions() -> Result<(), Box<dyn std::error::Error>> {
-        let scalar = CuDFScalar::from_arrow_host(Scalar::new(&Int32Array::from(vec![42])))
-            .expect("Failed to create scalar");
+        let scalar = scalar_from_arrow(Scalar::new(&Int32Array::from(vec![42])));
 
         let data = scalar.to_data();
         assert_eq!(data.len(), 1);
         assert_eq!(data.data_type(), &DataType::Int32);
 
-        let scalar2 = CuDFScalar::from_arrow_host(Scalar::new(&Int32Array::from(vec![42])))
-            .expect("Failed to create scalar");
+        let scalar2 = scalar_from_arrow(Scalar::new(&Int32Array::from(vec![42])));
         let data2 = scalar2.into_data();
         assert_eq!(data2.len(), 1);
         assert_eq!(data2.data_type(), &DataType::Int32);
@@ -688,8 +462,7 @@ mod tests {
 
     #[test]
     fn test_data_type_preserved_int32() -> Result<(), Box<dyn std::error::Error>> {
-        let scalar = CuDFScalar::from_arrow_host(Scalar::new(&Int32Array::from(vec![42])))
-            .expect("Failed to create scalar");
+        let scalar = scalar_from_arrow(Scalar::new(&Int32Array::from(vec![42])));
         assert_eq!(scalar.data_type(), &DataType::Int32);
 
         Ok(())
@@ -697,10 +470,8 @@ mod tests {
 
     #[test]
     fn test_data_type_preserved_float64() -> Result<(), Box<dyn std::error::Error>> {
-        let scalar = CuDFScalar::from_arrow_host(Scalar::new(&Float64Array::from(vec![
-            std::f64::consts::PI,
-        ])))
-        .expect("Failed to create scalar");
+        let scalar =
+            scalar_from_arrow(Scalar::new(&Float64Array::from(vec![std::f64::consts::PI])));
         assert_eq!(scalar.data_type(), &DataType::Float64);
 
         Ok(())
@@ -708,69 +479,22 @@ mod tests {
 
     #[test]
     fn test_data_type_preserved_string() -> Result<(), Box<dyn std::error::Error>> {
-        let scalar = CuDFScalar::from_arrow_host(Scalar::new(&StringArray::from(vec!["test"])))
-            .expect("Failed to create scalar");
+        let scalar = scalar_from_arrow(Scalar::new(&StringArray::from(vec!["test"])));
         assert_eq!(scalar.data_type(), &DataType::Utf8);
 
         Ok(())
     }
 
     #[test]
-    fn test_from_arrow_host_int32() -> Result<(), Box<dyn std::error::Error>> {
-        let cudf_scalar = CuDFScalar::from_arrow_host(Scalar::new(&Int32Array::from(vec![42])))
-            .expect("Failed to convert Int32");
-        assert_eq!(cudf_scalar.data_type(), &DataType::Int32);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_from_arrow_host_int64() -> Result<(), Box<dyn std::error::Error>> {
-        let cudf_scalar = CuDFScalar::from_arrow_host(Scalar::new(&Int64Array::from(vec![12345])))
-            .expect("Failed to convert Int64");
-        assert_eq!(cudf_scalar.data_type(), &DataType::Int64);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_from_arrow_host_float64() -> Result<(), Box<dyn std::error::Error>> {
-        let cudf_scalar = CuDFScalar::from_arrow_host(Scalar::new(&Float64Array::from(vec![
-            std::f64::consts::PI,
-        ])))
-        .expect("Failed to convert Float64");
-        assert_eq!(cudf_scalar.data_type(), &DataType::Float64);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_from_arrow_host_string() -> Result<(), Box<dyn std::error::Error>> {
-        let cudf_scalar =
-            CuDFScalar::from_arrow_host(Scalar::new(&StringArray::from(vec!["hello"])))
-                .expect("Failed to convert String");
-        assert_eq!(cudf_scalar.data_type(), &DataType::Utf8);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_from_arrow_host_null() -> Result<(), Box<dyn std::error::Error>> {
-        let cudf_scalar = CuDFScalar::from_arrow_host(Scalar::new(&Int32Array::from(vec![None])))
-            .expect("Failed to convert null");
-        assert_eq!(cudf_scalar.data_type(), &DataType::Int32);
-        assert!(!cudf_scalar.inner().is_valid());
-
-        Ok(())
-    }
-
-    #[test]
     fn test_scalar_clone() -> Result<(), Box<dyn std::error::Error>> {
-        let original = CuDFScalar::from_arrow_host(Scalar::new(&Int32Array::from(vec![999])))
-            .expect("Failed to create scalar");
+        let original = scalar_from_arrow(Scalar::new(&Int32Array::from(vec![999])));
         let cloned = original.clone();
         assert_eq!(cloned.data_type(), original.data_type());
 
         Ok(())
+    }
+
+    fn scalar_from_arrow<T: Array>(scalar: Scalar<T>) -> CuDFScalar {
+        crate::execute_cudf(CuDFScalar::from_arrow_host(scalar)).expect("Failed to create scalar")
     }
 }
