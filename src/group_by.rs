@@ -1,9 +1,8 @@
-use crate::cudf_reference::CuDFRef;
-use crate::device_resource::resource_ref;
-use crate::errors::Result;
-use crate::stream::stream_ref;
+use crate::deferred_operation::deferred;
+use crate::execution_policy;
+use crate::keep_alive::CuDFKeepAlive;
 use crate::table_view::CuDFTableView;
-use crate::{CuDFColumn, CuDFColumnView, CuDFTable};
+use crate::{CuDFColumn, CuDFColumnView, CuDFOperation, CuDFTable};
 use cxx::UniquePtr;
 use libcudf_sys::ffi::{
     self, aggregation_request_create, aggregation_requests_create, make_count_aggregation_groupby,
@@ -19,8 +18,13 @@ use std::sync::Arc;
 /// Groups rows by key columns and computes aggregations on value columns
 /// for each group. Created with key columns and then used to perform
 /// multiple aggregations.
+#[derive(Clone)]
 pub struct CuDFGroupBy {
-    _ref: Option<Arc<dyn CuDFRef>>,
+    inner: Arc<CuDFGroupByInner>,
+}
+
+struct CuDFGroupByInner {
+    keys: CuDFTableView,
     inner: UniquePtr<ffi::GroupBy>,
 }
 
@@ -40,47 +44,58 @@ impl CuDFGroupBy {
             null_precedence,
         );
         Self {
-            _ref: Some(Arc::new(view)),
-            inner,
+            inner: Arc::new(CuDFGroupByInner { keys: view, inner }),
         }
     }
 
-    /// Perform aggregations on the grouped data
+    /// Create a deferred operation that aggregates the grouped data.
     ///
     /// Each request specifies a column to aggregate and the aggregations
-    /// to perform on it. Returns the unique group keys and aggregation
-    /// results for each group.
-    pub fn aggregate<I>(&self, requests: I) -> Result<(CuDFTable, Vec<Vec<CuDFColumn>>)>
+    /// to perform on it. Execution waits for the key table and request columns,
+    /// then returns the unique group keys and aggregation results for each
+    /// group.
+    pub fn aggregate<'a, I>(
+        &'a self,
+        requests: I,
+    ) -> impl CuDFOperation<Output = (CuDFTable, Vec<Vec<CuDFColumn>>)> + 'a
     where
-        I: IntoIterator<Item = AggregationRequest>,
+        I: IntoIterator<Item = AggregationRequest> + 'a,
     {
-        let mut _refs = Vec::new();
-        let mut requests_inner = aggregation_requests_create();
-        for request in requests {
-            _refs.push(request._ref.clone());
-            requests_inner.pin_mut().add(request.inner);
-        }
-
-        let stream = ffi::get_default_stream();
-        let mr = ffi::get_current_device_resource_ref();
-        let mut gby_result =
-            self.inner
-                .aggregate(&requests_inner, stream_ref(&stream)?, resource_ref(&mr)?)?;
-        let keys = gby_result.pin_mut().release_keys();
-        let keys = CuDFTable::from_ptr(keys);
-
-        let mut results = Vec::with_capacity(gby_result.len());
-        for i in 0..gby_result.len() {
-            let mut released_result = gby_result.pin_mut().release_result(i);
-            let mut cols = Vec::with_capacity(released_result.len());
-            for j in 0..released_result.len() {
-                let col = released_result.pin_mut().release(j);
-                cols.push(CuDFColumn::new(col));
+        deferred(move |ctx| {
+            let mut launch = execution_policy::launch(ctx)?;
+            launch.wait_table(&self.inner.keys)?;
+            launch.keep_alive(CuDFKeepAlive::GroupBy {
+                _group_by: CuDFGroupBy::clone(self),
+            });
+            let mut requests_inner = aggregation_requests_create();
+            for request in requests {
+                launch.wait_column(&request.view)?;
+                requests_inner.pin_mut().add(request.inner);
             }
 
-            results.push(cols)
-        }
-        Ok((keys, results))
+            let mut gby_result =
+                self.inner
+                    .inner
+                    .aggregate(&requests_inner, launch.stream()?, launch.resource())?;
+            let keys = gby_result.pin_mut().release_keys();
+            let dependency = launch.into_stream_dependency()?;
+            let keys = CuDFTable::from_inner(keys).with_stream_readiness(dependency.clone());
+
+            let mut results = Vec::with_capacity(gby_result.len());
+            for i in 0..gby_result.len() {
+                let mut released_result = gby_result.pin_mut().release_result(i);
+                let mut cols = Vec::with_capacity(released_result.len());
+                for j in 0..released_result.len() {
+                    let col = released_result.pin_mut().release(j);
+                    cols.push(
+                        CuDFColumn::from_inner(col).with_stream_readiness(dependency.clone()),
+                    );
+                }
+
+                results.push(cols)
+            }
+            Ok((keys, results))
+        })
     }
 }
 
@@ -89,7 +104,7 @@ impl CuDFGroupBy {
 /// Specifies a column of values to aggregate and the aggregations to
 /// perform on it. Multiple aggregations can be added to a single request.
 pub struct AggregationRequest {
-    _ref: Option<Arc<dyn CuDFRef>>,
+    view: CuDFColumnView,
     inner: UniquePtr<ffi::AggregationRequest>,
 }
 
@@ -100,10 +115,7 @@ impl AggregationRequest {
     /// row in the keys used to construct the groupby.
     pub fn from_column_view(view: CuDFColumnView) -> Self {
         let inner = aggregation_request_create(view.inner());
-        Self {
-            _ref: Some(Arc::new(view)),
-            inner,
-        }
+        Self { view, inner }
     }
 
     /// Add an aggregation to this request
@@ -203,6 +215,7 @@ impl AggregationOp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::errors::Result;
     use arrow::array::{make_array, Array, Float64Array, Int32Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
@@ -316,16 +329,16 @@ mod tests {
         let values = Int32Array::from(vec![1, 2, 3, 10, 20]);
         let keys = Int32Array::from(vec![1, 1, 1, 2, 2]);
 
-        let values_col = CuDFColumn::from_arrow_host(&values)?;
+        let values_col = crate::execute_cudf(CuDFColumn::from_arrow_host(&values))?;
         let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int32, false)]));
         let keys_batch = RecordBatch::try_new(schema, vec![Arc::new(keys)])?;
-        let keys_table = CuDFTable::from_arrow_host(keys_batch)?;
+        let keys_table = crate::execute_cudf(CuDFTable::from_arrow_host(keys_batch))?;
         let groupby = CuDFGroupBy::from_table_view(keys_table.into_view());
 
         let mut request = AggregationRequest::from_column_view(values_col.into_view());
         request.add(AggregationOp::SUM.group_by());
 
-        let (result_keys, results) = groupby.aggregate([request])?;
+        let (result_keys, results) = crate::execute_cudf(groupby.aggregate([request]))?;
 
         assert_eq!(result_keys.num_rows(), 2);
 
@@ -336,7 +349,7 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
-        let sum_array = sum_col.into_view().to_arrow_host()?;
+        let sum_array = crate::execute_cudf(sum_col.into_view().to_arrow_host())?;
         let sum_values = sum_array.as_any().downcast_ref::<Int64Array>().unwrap();
 
         // Should have sums [6, 30] in some order
@@ -360,7 +373,7 @@ mod tests {
         )]));
         let keys_data = keys.to_data();
         let batch = RecordBatch::try_new(schema, vec![make_array(keys_data)])?;
-        CuDFTable::from_arrow_host(batch)
+        crate::execute_cudf(CuDFTable::from_arrow_host(batch))
     }
 
     fn run_single_group_agg<T: Array + Clone + 'static>(
@@ -370,14 +383,14 @@ mod tests {
         let n = values.len();
         let keys = Int32Array::from(vec![1; n]);
 
-        let values_col = CuDFColumn::from_arrow_host(values)?;
+        let values_col = crate::execute_cudf(CuDFColumn::from_arrow_host(values))?;
         let keys_table = make_keys_table(&keys)?;
         let groupby = CuDFGroupBy::from_table_view(keys_table.into_view());
 
         let mut request = AggregationRequest::from_column_view(values_col.into_view());
         request.add(agg_op.group_by());
 
-        let (_result_keys, results) = groupby.aggregate([request])?;
+        let (_result_keys, results) = crate::execute_cudf(groupby.aggregate([request]))?;
         let result_col = results
             .into_iter()
             .next()
@@ -385,7 +398,7 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
-        let result_array = result_col.into_view().to_arrow_host()?;
+        let result_array = crate::execute_cudf(result_col.into_view().to_arrow_host())?;
 
         Ok(Arc::new(
             (*result_array.as_any().downcast_ref::<T>().unwrap()).clone(),

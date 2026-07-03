@@ -1,4 +1,4 @@
-use crate::errors::cudf_to_df;
+use crate::execution::execute_cudf;
 use crate::physical::normalize_scalar_for_cudf;
 use arrow::array::RecordBatch;
 use arrow_schema::{DataType, FieldRef, Schema};
@@ -36,7 +36,7 @@ impl CuDFLiteral {
     pub fn from_host(inner: Literal) -> datafusion::common::Result<Self> {
         let value = normalize_scalar_for_cudf(inner.value().clone())?;
         let host_scalar = value.to_scalar()?;
-        let scalar = CuDFScalar::from_arrow_host(host_scalar).map_err(cudf_to_df)?;
+        let scalar = execute_cudf(CuDFScalar::from_arrow_host(host_scalar))?;
         Ok(Self {
             inner,
             scalar: Arc::new(scalar),

@@ -1,5 +1,5 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use libcudf_rs::CuDFTable;
+use libcudf_rs::{CuDFExecutionContext, CuDFTable};
 use std::hint::black_box;
 
 use arrow::array::*;
@@ -16,9 +16,12 @@ fn bench_arrow_roundtrip(c: &mut Criterion) {
 
         group.throughput(Throughput::Bytes((bytes * 2) as u64)); // Both conversions
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &_size| {
+            let ctx = CuDFExecutionContext::try_default_stream().unwrap();
             b.iter(|| {
-                let table = CuDFTable::from_arrow_host(black_box(batch.clone())).unwrap();
-                let result = table.into_view().to_arrow_host().unwrap();
+                let table = ctx
+                    .execute(CuDFTable::from_arrow_host(black_box(batch.clone())))
+                    .unwrap();
+                let result = ctx.execute(table.into_view().to_arrow_host()).unwrap();
                 black_box(result)
             });
         });

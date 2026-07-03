@@ -1,11 +1,11 @@
-use crate::cudf_reference::CuDFRef;
-use crate::device_resource::resource_ref;
-use crate::stream::stream_ref;
-use crate::{CuDFColumnView, CuDFError};
-use arrow::array::{Array, ArrayRef, RecordBatch, RecordBatchOptions, StructArray};
-use arrow::ffi::{from_ffi, FFI_ArrowArray};
-use arrow_schema::ffi::FFI_ArrowSchema;
-use arrow_schema::{ArrowError, Schema, SchemaRef};
+use crate::deferred_operation::deferred;
+use crate::execution_policy;
+use crate::sort;
+use crate::stream_readiness::{CuDFStreamReady, CuDFTableReadiness};
+use crate::{
+    CuDFColumn, CuDFColumnView, CuDFError, CuDFOperation, CuDFTable, CuDFViewStorage, SortOrder,
+};
+use arrow_schema::ArrowError;
 use cxx::UniquePtr;
 use libcudf_sys::ffi;
 use std::sync::Arc;
@@ -15,20 +15,26 @@ use std::sync::Arc;
 /// This is a safe wrapper around cuDF's table_view type.
 /// Views provide a lightweight way to reference table data without ownership.
 pub struct CuDFTableView {
-    // Keep the table alive so view remains valid
-    pub(crate) _ref: Option<Arc<dyn CuDFRef>>,
+    // Keep backing storage alive so the view remains valid.
+    storage: Option<CuDFViewStorage>,
     inner: UniquePtr<ffi::TableView>,
+    stream_readiness: CuDFTableReadiness,
 }
 
 impl CuDFTableView {
-    pub(crate) fn new_with_ref(
+    pub(crate) fn from_view(
         inner: UniquePtr<ffi::TableView>,
-        _ref: Option<Arc<dyn CuDFRef>>,
+        storage: Option<CuDFViewStorage>,
+        stream_readiness: CuDFTableReadiness,
     ) -> Self {
-        Self { _ref, inner }
+        Self {
+            storage,
+            inner,
+            stream_readiness,
+        }
     }
 
-    pub fn inner(&self) -> &UniquePtr<ffi::TableView> {
+    pub(crate) fn inner(&self) -> &UniquePtr<ffi::TableView> {
         &self.inner
     }
 
@@ -36,31 +42,37 @@ impl CuDFTableView {
         self.inner
     }
 
-    /// Create a table view from a slice of column view references
+    pub(crate) fn storage(&self) -> Option<CuDFViewStorage> {
+        self.storage.clone()
+    }
+
+    /// Create a table view from column views.
+    ///
+    /// The returned table view keeps each input column view alive and records
+    /// each column's stream readiness independently.
     ///
     /// # Arguments
     ///
-    /// * `column_views` - A slice of column view references to combine into a table view
+    /// * `column_views` - Column views to combine into a table view.
     ///
     /// # Errors
     ///
-    /// Returns an error if the FFI call fails
+    /// Returns an error if any input column view has a null cuDF handle.
     ///
     /// # Examples
     ///
     /// ```no_run
     /// use arrow::array::{Int32Array, RecordBatch};
     /// use arrow::datatypes::{DataType, Field, Schema};
-    /// use libcudf_rs::{CuDFColumn, CuDFTableView};
+    /// use libcudf_rs::{CuDFColumn, CuDFExecutionContext, CuDFTableView};
     /// use std::sync::Arc;
     ///
-    /// // Create column views
     /// let col1 = Int32Array::from(vec![1, 2, 3]);
     /// let col2 = Int32Array::from(vec![4, 5, 6]);
-    /// let view1 = CuDFColumn::from_arrow_host(&col1)?.into_view();
-    /// let view2 = CuDFColumn::from_arrow_host(&col2)?.into_view();
+    /// let ctx = CuDFExecutionContext::try_new_non_blocking()?;
+    /// let view1 = ctx.execute(CuDFColumn::from_arrow_host(&col1))?.into_view();
+    /// let view2 = ctx.execute(CuDFColumn::from_arrow_host(&col2))?.into_view();
     ///
-    /// // Create a table view from the column views
     /// let table_view = CuDFTableView::from_column_views(vec![view1, view2])?;
     /// assert_eq!(table_view.num_columns(), 2);
     /// assert_eq!(table_view.num_rows(), 3);
@@ -68,16 +80,28 @@ impl CuDFTableView {
     /// ```
     pub fn from_column_views(column_views: Vec<CuDFColumnView>) -> Result<Self, CuDFError> {
         let mut view_ptrs: Vec<*const ffi::ColumnView> = Vec::with_capacity(column_views.len());
-        let mut _refs = Vec::with_capacity(column_views.len());
+        let mut storage = Vec::with_capacity(column_views.len());
+        let dependencies = column_views
+            .iter()
+            .map(|view| view.stream_readiness().cloned())
+            .collect::<Vec<_>>();
         for view in column_views {
-            view_ptrs.push(view.inner().as_ref().unwrap() as _);
-            _refs.push(Arc::new(view) as Arc<dyn CuDFRef>)
+            let inner = view
+                .inner()
+                .as_ref()
+                .ok_or(CuDFError::NullHandle("column view"))?;
+            view_ptrs.push(inner as _);
+            let keepalive: CuDFViewStorage = Arc::new(view);
+            storage.push(keepalive)
         }
 
         let inner = ffi::create_table_view_from_column_views(&view_ptrs);
+        let num_columns = inner.num_columns();
+        let storage: CuDFViewStorage = Arc::new(storage);
         Ok(Self {
-            _ref: Some(Arc::new(_refs)),
+            storage: Some(storage),
             inner,
+            stream_readiness: CuDFTableReadiness::columns(dependencies, num_columns),
         })
     }
 
@@ -85,7 +109,7 @@ impl CuDFTableView {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```no_run
     /// use libcudf_rs::CuDFTable;
     ///
     /// let table = CuDFTable::default();
@@ -100,7 +124,7 @@ impl CuDFTableView {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```no_run
     /// use libcudf_rs::CuDFTable;
     ///
     /// let table = CuDFTable::default();
@@ -115,7 +139,7 @@ impl CuDFTableView {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```no_run
     /// use libcudf_rs::CuDFTable;
     ///
     /// let table = CuDFTable::default();
@@ -126,180 +150,342 @@ impl CuDFTableView {
         self.num_rows() == 0
     }
 
-    /// Get a column view at the specified index
+    /// Get a column view by index.
     ///
-    /// # Arguments
-    ///
-    /// * `index` - The column index (0-based)
-    pub fn column(&self, index: i32) -> CuDFColumnView {
-        let inner = self.inner.column(index);
-        CuDFColumnView::new_with_ref(inner, Some(Arc::new(self.clone())))
-    }
-
-    /// Convert the CuDF table allocated on the GPU to an Arrow RecordBatch allocated on the host.
-    ///
-    /// This allows you to use cuDF for GPU-accelerated operations and then
-    /// return the results to arrow-rs for further processing or output.
+    /// The returned view keeps this table view alive and preserves the selected
+    /// column's stream readiness metadata.
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - The cuDF data cannot be converted to Arrow format
-    /// - There is insufficient memory
+    /// Returns an error if `index` is out of bounds or cannot fit in cuDF's
+    /// column index type.
     ///
     /// # Examples
     ///
     /// ```no_run
-    /// use libcudf_rs::CuDFTable;
+    /// use arrow::array::{Array, Int32Array, RecordBatch};
+    /// use arrow_schema::{DataType, Field, Schema};
+    /// use libcudf_rs::{CuDFExecutionContext, CuDFTable};
+    /// use std::sync::Arc;
     ///
-    /// let table = CuDFTable::from_parquet("data.parquet")?;
-    /// // Perform GPU operations...
+    /// let schema = Schema::new(vec![
+    ///     Field::new("a", DataType::Int32, false),
+    ///     Field::new("b", DataType::Int32, false),
+    /// ]);
+    /// let batch = RecordBatch::try_new(
+    ///     Arc::new(schema),
+    ///     vec![
+    ///         Arc::new(Int32Array::from(vec![1, 2, 3])),
+    ///         Arc::new(Int32Array::from(vec![4, 5, 6])),
+    ///     ],
+    /// )?;
     ///
-    /// // Convert back to Arrow for further processing
-    /// let batch = table.into_view().to_arrow_host()?;
+    /// let ctx = CuDFExecutionContext::try_new_non_blocking()?;
+    /// let table = ctx.execute(CuDFTable::from_arrow_host(batch))?.into_view();
+    /// let column = table.column(1)?;
+    ///
+    /// assert_eq!(column.len(), 3);
     /// # Ok::<(), libcudf_rs::CuDFError>(())
     /// ```
-    pub fn to_arrow_host(&self) -> Result<RecordBatch, CuDFError> {
-        let mut ffi_schema = FFI_ArrowSchema::empty();
-        let mut ffi_array = FFI_ArrowArray::empty();
-
-        unsafe {
-            self.inner
-                .to_arrow_schema(&mut ffi_schema as *mut FFI_ArrowSchema as *mut u8);
-            let stream = ffi::get_default_stream();
-            let mr = ffi::get_current_device_resource_ref();
-            self.inner.to_arrow_array(
-                &mut ffi_array as *mut FFI_ArrowArray as *mut u8,
-                stream_ref(&stream)?,
-                resource_ref(&mr)?,
-            );
-        }
-
-        let schema = Arc::new(Schema::try_from(&ffi_schema)?);
-        let array_data = unsafe { from_ffi(ffi_array, &ffi_schema)? };
-        let struct_array = StructArray::from(array_data);
-
-        // Carry the row count explicitly so zero-column batches (e.g. produced by
-        // `FilterExec` with `projection=[]` for `COUNT(*) WHERE ...` plans) don't
-        // trip Arrow's "must either specify a row count or at least one column" check.
-        let options = RecordBatchOptions::new().with_row_count(Some(struct_array.len()));
-        let batch =
-            RecordBatch::try_new_with_options(schema, struct_array.columns().to_vec(), &options)?;
-
-        Ok(batch)
+    pub fn column(&self, index: usize) -> Result<CuDFColumnView, CuDFError> {
+        let column_index = self.checked_column_index(index)?;
+        let inner = self.inner.column(column_index);
+        let storage: CuDFViewStorage = Arc::new(self.clone());
+        Ok(CuDFColumnView::from_view(
+            inner,
+            Some(storage),
+            self.stream_readiness.column(index),
+        ))
     }
 
-    /// Gets the Arrow Schema of the table view.
-    pub fn schema(&self) -> Result<Schema, CuDFError> {
-        // Extract schema information
-        let mut ffi_schema = FFI_ArrowSchema::empty();
-        unsafe {
-            self.inner
-                .to_arrow_schema(&mut ffi_schema as *mut FFI_ArrowSchema as *mut u8);
-        }
-        Ok(Schema::try_from(&ffi_schema)?)
-    }
-
-    /// Create a RecordBatch from the table view, keeping data on GPU
+    /// Build a table view from selected columns.
     ///
-    /// This creates a RecordBatch where each column is a CuDFColumnView (GPU array).
-    /// Unlike `to_arrow_host()`, this does NOT copy data to host memory.
-    pub fn to_record_batch(&self) -> Result<RecordBatch, CuDFError> {
-        // Create CuDFColumnView for each column (keeps data on GPU)
-        let columns: Vec<ArrayRef> = (0..self.num_columns())
-            .map(|i| Arc::new(self.column(i as i32)) as _)
-            .collect();
-
-        let options = RecordBatchOptions::new().with_row_count(Some(self.num_rows()));
-        Ok(RecordBatch::try_new_with_options(
-            Arc::new(self.schema()?),
-            columns,
-            &options,
-        )?)
+    /// Column order follows `indices`, and each selected column keeps its
+    /// source lifetime and stream readiness metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any selected column index is out of bounds or cannot
+    /// fit in cuDF's column index type.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use arrow::array::{Int32Array, RecordBatch};
+    /// use arrow_schema::{DataType, Field, Schema};
+    /// use libcudf_rs::{CuDFExecutionContext, CuDFTable};
+    /// use std::sync::Arc;
+    ///
+    /// let schema = Schema::new(vec![
+    ///     Field::new("a", DataType::Int32, false),
+    ///     Field::new("b", DataType::Int32, false),
+    /// ]);
+    /// let batch = RecordBatch::try_new(
+    ///     Arc::new(schema),
+    ///     vec![
+    ///         Arc::new(Int32Array::from(vec![1, 2, 3])),
+    ///         Arc::new(Int32Array::from(vec![4, 5, 6])),
+    ///     ],
+    /// )?;
+    ///
+    /// let ctx = CuDFExecutionContext::try_new_non_blocking()?;
+    /// let table = ctx.execute(CuDFTable::from_arrow_host(batch))?.into_view();
+    /// let selected = table.select_columns(&[1, 0])?;
+    ///
+    /// assert_eq!(selected.num_columns(), 2);
+    /// assert_eq!(selected.num_rows(), 3);
+    /// # Ok::<(), libcudf_rs::CuDFError>(())
+    /// ```
+    pub fn select_columns(&self, indices: &[usize]) -> Result<Self, CuDFError> {
+        let column_indices = indices
+            .iter()
+            .map(|&index| self.checked_column_index(index))
+            .collect::<Result<Vec<_>, _>>()?;
+        let dependencies = indices
+            .iter()
+            .map(|&index| self.stream_readiness.column(index))
+            .collect::<Vec<_>>();
+        let storage: CuDFViewStorage = Arc::new(self.clone());
+        Ok(Self::from_view(
+            self.inner.select(&column_indices),
+            Some(storage),
+            CuDFTableReadiness::columns(dependencies, indices.len()),
+        ))
     }
 
-    /// Wrap GPU columns in a `RecordBatch` whose types match `schema`.
-    ///
-    /// Delegates to [`record_batch_with_schema`]. Use this when the columns
-    /// are still in a `CuDFTableView`.
-    pub fn to_record_batch_with_schema(
-        &self,
-        schema: &SchemaRef,
-    ) -> Result<RecordBatch, CuDFError> {
-        if self.num_columns() != schema.fields().len() {
+    fn checked_column_index(&self, index: usize) -> Result<i32, CuDFError> {
+        if index >= self.num_columns() {
             return Err(CuDFError::ArrowError(ArrowError::InvalidArgumentError(
                 format!(
-                    "to_record_batch_with_schema: table has {} columns but schema has {} fields",
-                    self.num_columns(),
-                    schema.fields().len()
+                    "column index {index} out of bounds for table with {} columns",
+                    self.num_columns()
                 ),
             )));
         }
-        let columns: Vec<ArrayRef> = (0..self.num_columns())
-            .map(|i| Arc::new(self.column(i as i32)) as _)
-            .collect();
-        record_batch_with_schema(columns, schema, self.num_rows()).map_err(CuDFError::ArrowError)
-    }
-
-    /// Create a table view from a RecordBatch containing CuDF arrays (GPU)
-    ///
-    /// This expects the RecordBatch to already contain CuDF arrays allocated on GPU.
-    /// The columns will be extracted and composed into a table view.
-    pub fn from_record_batch(batch: &RecordBatch) -> Result<Self, CuDFError> {
-        let column_views: Result<Vec<_>, _> = batch
-            .columns()
-            .iter()
-            .map(|col| {
-                let Some(col) = col.as_any().downcast_ref::<CuDFColumnView>() else {
-                    return Err(CuDFError::ArrowError(ArrowError::InvalidArgumentError(
-                        "Expected all Arrays in RecordBatch to be CuDFColumnView".to_string(),
-                    )));
-                };
-                Ok(col.clone())
-            })
-            .collect();
-        let column_views = column_views?;
-
-        Self::from_column_views(column_views)
-    }
-}
-
-/// Build a `RecordBatch`, relabeling any `CuDFColumnView` whose type differs from
-/// the corresponding `schema` field.
-///
-/// cuDF normalises decimal precision to the storage maximum (e.g. 38 for Decimal128).
-/// This function restores the declared precision so `RecordBatch::try_new` accepts it.
-/// All GPU `RecordBatch` creation should go through this function instead of calling
-/// `RecordBatch::try_new` directly.
-///
-/// `num_rows` is required so zero-column batches (e.g. produced by `FilterExec`
-/// with `projection=[]` for `COUNT(*) WHERE ...` plans) carry their row count.
-pub fn record_batch_with_schema(
-    columns: Vec<ArrayRef>,
-    schema: &SchemaRef,
-    num_rows: usize,
-) -> Result<RecordBatch, ArrowError> {
-    let relabeled: Vec<ArrayRef> = columns
-        .into_iter()
-        .zip(schema.fields())
-        .map(|(col, field)| {
-            if col.data_type() != field.data_type() {
-                if let Some(v) = col.as_any().downcast_ref::<CuDFColumnView>() {
-                    return Arc::new(v.clone().with_data_type(field.data_type().clone())) as _;
-                }
-            }
-            col
+        i32::try_from(index).map_err(|_| {
+            CuDFError::ArrowError(ArrowError::InvalidArgumentError(format!(
+                "column index {index} exceeds cuDF's i32 column index range"
+            )))
         })
-        .collect();
-    let options = RecordBatchOptions::new().with_row_count(Some(num_rows));
-    RecordBatch::try_new_with_options(Arc::clone(schema), relabeled, &options)
+    }
+
+    /// Gather rows from this table using a gather-map column.
+    ///
+    /// The gather map contains row indices into this table. Executing the
+    /// returned operation produces a new [`CuDFTable`] whose rows follow the
+    /// order described by `gather_map`. This is commonly used after
+    /// [`stable_sorted_order`](Self::stable_sorted_order) when applying a
+    /// computed row ordering.
+    ///
+    /// # Errors
+    ///
+    /// Execution returns an error if:
+    /// - `gather_map` contains an out-of-bounds row index
+    /// - `gather_map` has an unsupported type
+    /// - cuDF cannot allocate the output table
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use libcudf_rs::{CuDFExecutionContext, CuDFTable, SortOrder};
+    ///
+    /// let ctx = CuDFExecutionContext::try_new_non_blocking()?;
+    /// let table = ctx.execute(CuDFTable::read_parquet("data.parquet"))?;
+    /// let view = table.into_view();
+    ///
+    /// let sort_orders = [SortOrder::AscendingNullsLast];
+    /// let indices = ctx.execute(view.stable_sorted_order(&sort_orders))?;
+    /// let indices = std::sync::Arc::new(indices).view();
+    ///
+    /// let sorted = ctx.execute(view.gather(&indices))?;
+    /// # Ok::<(), libcudf_rs::CuDFError>(())
+    /// ```
+    pub fn gather<'a>(
+        &'a self,
+        gather_map: &'a CuDFColumnView,
+    ) -> impl CuDFOperation<Output = CuDFTable> + 'a {
+        deferred(move |ctx| {
+            let mut launch = execution_policy::launch(ctx)?;
+            launch.wait_table(self)?;
+            launch.wait_column(gather_map)?;
+            let inner = ffi::gather(
+                self.inner(),
+                gather_map.inner(),
+                launch.stream()?,
+                launch.resource(),
+            )?;
+            launch.ready_table(CuDFTable::from_inner(inner))
+        })
+    }
+
+    /// Filter this table using a boolean mask column.
+    ///
+    /// The output contains only rows whose corresponding mask value is `true`.
+    /// cuDF preserves the input row order for rows that pass the filter. The
+    /// operation waits for both this table and `boolean_mask` to be ready on the
+    /// execution context stream.
+    ///
+    /// # Errors
+    ///
+    /// Execution returns an error if:
+    /// - `boolean_mask` is not a boolean column
+    /// - `boolean_mask.len()` does not match this table's row count
+    /// - cuDF cannot allocate the output table
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use arrow::array::{BooleanArray, Int32Array, RecordBatch};
+    /// use arrow_schema::{DataType, Field, Schema};
+    /// use libcudf_rs::{CuDFColumn, CuDFExecutionContext, CuDFTable};
+    /// use std::sync::Arc;
+    ///
+    /// let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+    /// let values = Int32Array::from(vec![1, 2, 3, 4, 5]);
+    /// let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(values)])?;
+    ///
+    /// let ctx = CuDFExecutionContext::try_new_non_blocking()?;
+    /// let table = ctx.execute(CuDFTable::from_arrow_host(batch))?.into_view();
+    /// let mask = BooleanArray::from(vec![true, false, true, false, true]);
+    /// let mask = ctx.execute(CuDFColumn::from_arrow_host(&mask))?.into_view();
+    ///
+    /// let filtered = ctx.execute(table.filter(&mask))?;
+    /// assert_eq!(filtered.num_rows(), 3);
+    /// # Ok::<(), libcudf_rs::CuDFError>(())
+    /// ```
+    pub fn filter<'a>(
+        &'a self,
+        boolean_mask: &'a CuDFColumnView,
+    ) -> impl CuDFOperation<Output = CuDFTable> + 'a {
+        deferred(move |ctx| {
+            let mut launch = execution_policy::launch(ctx)?;
+            launch.wait_table(self)?;
+            launch.wait_column(boolean_mask)?;
+            let inner = ffi::apply_boolean_mask(
+                self.inner(),
+                boolean_mask.inner(),
+                launch.stream()?,
+                launch.resource(),
+            )?;
+            launch.ready_table(CuDFTable::from_inner(inner))
+        })
+    }
+
+    /// Stable-sort this table by selected key columns.
+    ///
+    /// `key_columns` identifies the columns to sort by, in precedence order.
+    /// `sort_orders` may be empty to use cuDF defaults, or it must contain one
+    /// [`SortOrder`] per key column. The output table contains all input
+    /// columns, reordered by the selected keys.
+    ///
+    /// # Errors
+    ///
+    /// Execution returns an error if:
+    /// - `key_columns` is empty
+    /// - `key_columns.len()` does not match `sort_orders.len()`
+    /// - any key column index is out of bounds
+    /// - cuDF cannot allocate the output table
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use libcudf_rs::{CuDFExecutionContext, CuDFTable, SortOrder};
+    ///
+    /// let ctx = CuDFExecutionContext::try_new_non_blocking()?;
+    /// let table = ctx.execute(CuDFTable::read_parquet("data.parquet"))?;
+    /// let view = table.into_view();
+    ///
+    /// let sorted = ctx.execute(view.sort_by(
+    ///     &[0, 2],
+    ///     &[SortOrder::AscendingNullsLast, SortOrder::DescendingNullsFirst],
+    /// ))?;
+    /// # Ok::<(), libcudf_rs::CuDFError>(())
+    /// ```
+    pub fn sort_by<'a>(
+        &'a self,
+        key_columns: &'a [usize],
+        sort_orders: &'a [SortOrder],
+    ) -> impl CuDFOperation<Output = CuDFTable> + 'a {
+        deferred(move |ctx| sort::sort_by_on_context(ctx, self, key_columns, sort_orders))
+    }
+
+    /// Stable-sort this table lexicographically by all columns.
+    ///
+    /// `sort_orders` may be empty to use cuDF defaults, or it must contain one
+    /// [`SortOrder`] for every column in this table. Column order in the table
+    /// determines sort precedence.
+    ///
+    /// # Errors
+    ///
+    /// Execution returns an error if `sort_orders` does not match the table
+    /// shape or cuDF cannot allocate the output table.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use libcudf_rs::{CuDFExecutionContext, CuDFTable, SortOrder};
+    ///
+    /// let ctx = CuDFExecutionContext::try_new_non_blocking()?;
+    /// let table = ctx.execute(CuDFTable::read_parquet("data.parquet"))?;
+    /// let view = table.into_view();
+    ///
+    /// let orders = [SortOrder::AscendingNullsLast, SortOrder::DescendingNullsFirst];
+    /// let sorted = ctx.execute(view.sort_by_all(&orders))?;
+    /// # Ok::<(), libcudf_rs::CuDFError>(())
+    /// ```
+    pub fn sort_by_all<'a>(
+        &'a self,
+        sort_orders: &'a [SortOrder],
+    ) -> impl CuDFOperation<Output = CuDFTable> + 'a {
+        deferred(move |ctx| sort::sort_by_all_on_context(ctx, self, sort_orders))
+    }
+
+    /// Compute the stable row order that would sort this table.
+    ///
+    /// Executing the returned operation produces a column of row indices rather
+    /// than reordering the table. This is useful for Top-K workflows or for
+    /// applying the same order to another table with [`gather`](Self::gather).
+    /// `sort_orders` may be empty to use cuDF defaults, or it must contain one
+    /// [`SortOrder`] per column in this table.
+    ///
+    /// # Errors
+    ///
+    /// Execution returns an error if `sort_orders` does not match the table
+    /// shape or cuDF cannot allocate the output index column.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use libcudf_rs::{CuDFExecutionContext, CuDFTable, SortOrder};
+    ///
+    /// let ctx = CuDFExecutionContext::try_new_non_blocking()?;
+    /// let table = ctx.execute(CuDFTable::read_parquet("data.parquet"))?;
+    /// let view = table.into_view();
+    ///
+    /// let orders = [SortOrder::AscendingNullsLast, SortOrder::DescendingNullsFirst];
+    /// let indices = ctx.execute(view.stable_sorted_order(&orders))?;
+    /// # Ok::<(), libcudf_rs::CuDFError>(())
+    /// ```
+    pub fn stable_sorted_order<'a>(
+        &'a self,
+        sort_orders: &'a [SortOrder],
+    ) -> impl CuDFOperation<Output = CuDFColumn> + 'a {
+        deferred(move |ctx| sort::stable_sorted_order_on_context(ctx, self, sort_orders))
+    }
 }
 
 impl Clone for CuDFTableView {
     fn clone(&self) -> Self {
         Self {
-            _ref: self._ref.clone(),
+            storage: self.storage.clone(),
             inner: self.inner.clone(),
+            stream_readiness: self.stream_readiness.clone(),
         }
+    }
+}
+
+impl CuDFStreamReady for CuDFTableView {
+    fn wait_ready_on_stream(&self, stream: &ffi::CudaStreamView) -> Result<(), CuDFError> {
+        self.stream_readiness.wait_on_stream(stream)
     }
 }

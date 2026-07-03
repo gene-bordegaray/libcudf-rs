@@ -1,11 +1,11 @@
-use crate::errors::cudf_to_df;
+use crate::execution::execute_cudf;
 use arrow::array::Scalar;
 use arrow_schema::{
     DataType, DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE, DECIMAL32_MAX_PRECISION,
     DECIMAL32_MAX_SCALE, DECIMAL64_MAX_PRECISION, DECIMAL64_MAX_SCALE,
 };
 use datafusion::common::{exec_err, DataFusionError};
-use libcudf_rs::{cudf_binary_op, CuDFBinaryOp, CuDFColumnViewOrScalar, CuDFScalar};
+use libcudf_rs::{CuDFBinaryOp, CuDFColumnViewOrScalar, CuDFScalar};
 
 pub(crate) fn is_decimal_division(
     output_type: &DataType,
@@ -50,7 +50,7 @@ pub(crate) fn decimal_div(
         (lhs, rescale_decimal(rhs, rhs_type, target_scale)?)
     };
 
-    cudf_binary_op(lhs, rhs, CuDFBinaryOp::Div, output_type).map_err(cudf_to_df)
+    execute_cudf(lhs.binary_op(rhs, CuDFBinaryOp::Div, output_type))
 }
 
 fn rescale_decimal(
@@ -65,17 +65,14 @@ fn rescale_decimal(
 
     let target_type = decimal_type_with_scale(data_type, target_scale)?;
     match value {
-        CuDFColumnViewOrScalar::ColumnView(view) => Ok(libcudf_rs::cast(&view, &target_type)
-            .map_err(cudf_to_df)?
-            .into_view()
-            .into()),
+        CuDFColumnViewOrScalar::ColumnView(view) => {
+            Ok(execute_cudf(view.cast(&target_type))?.into_view().into())
+        }
         CuDFColumnViewOrScalar::Scalar(scalar) => {
-            let array = scalar.to_arrow_host().map_err(cudf_to_df)?;
+            let array = execute_cudf(scalar.to_arrow_host())?;
             let casted = arrow::compute::cast(array.as_ref(), &target_type)
                 .map_err(|err| DataFusionError::ArrowError(Box::new(err), None))?;
-            Ok(CuDFScalar::from_arrow_host(Scalar::new(casted))
-                .map_err(cudf_to_df)?
-                .into())
+            Ok(execute_cudf(CuDFScalar::from_arrow_host(Scalar::new(casted)))?.into())
         }
     }
 }

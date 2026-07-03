@@ -1,50 +1,46 @@
-use crate::cudf_reference::CuDFRef;
-use crate::data_type::cudf_type_to_arrow;
-use crate::device_resource::resource_ref;
-use crate::stream::stream_ref;
-use crate::{slice_column, CuDFError};
+use crate::data_type::{arrow_type_to_cudf_data_type, cudf_type_to_arrow};
+use crate::deferred_operation::deferred;
+use crate::execution_policy;
+use crate::stream_readiness::{CuDFStreamDependency, CuDFStreamReady};
+use crate::{CuDFColumn, CuDFError, CuDFExecutionContext, CuDFOperation, CuDFViewStorage};
 use arrow::array::{Array, ArrayData, ArrayRef};
 use arrow::buffer::{BooleanBuffer, Buffer, NullBuffer};
-use arrow::ffi::FFI_ArrowSchema;
-use arrow_schema::DataType;
+use arrow_schema::{ArrowError, DataType};
 use cxx::UniquePtr;
 use libcudf_sys::ffi;
 use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, OnceLock};
 
-/// A view into a cuDF column stored in GPU memory
+/// A non-owning view of a GPU column.
 ///
-/// This type wraps a cuDF column_view and implements Arrow's Array trait,
-/// allowing cuDF columns to be used seamlessly with the Arrow ecosystem.
-///
-/// CuDFColumnView is a non-owning view that may optionally keep the underlying
-/// column alive. It can be created from Arrow arrays (copying to GPU) or from
-/// existing cuDF columns.
+/// This is a safe wrapper around cuDF's `column_view` type. A view may keep an
+/// owning cuDF object alive so the referenced GPU buffers remain valid, and it
+/// implements Arrow's [`Array`] trait for interoperability with Arrow APIs.
 pub struct CuDFColumnView {
-    // Keep a ref to CuDF structs so that they live as long as this view exists
-    pub(crate) _ref: Option<Arc<dyn CuDFRef>>,
+    // Keep backing storage alive so the view remains valid.
+    storage: Option<CuDFViewStorage>,
     inner: UniquePtr<ffi::ColumnView>,
     dt: DataType,
     null_buf: OnceLock<Option<NullBuffer>>,
+    stream_readiness: Option<CuDFStreamDependency>,
 }
 
 impl CuDFColumnView {
-    /// Create a [CuDFColumnView] from a column view and optional table reference
-    ///
-    /// This is used internally to create column views that keep the source table or column alive
-    pub(crate) fn new_with_ref(
+    pub(crate) fn from_view(
         inner: UniquePtr<ffi::ColumnView>,
-        _ref: Option<Arc<dyn CuDFRef>>,
+        storage: Option<CuDFViewStorage>,
+        stream_readiness: Option<CuDFStreamDependency>,
     ) -> Self {
         let cudf_dtype = inner.data_type();
         let dt = cudf_type_to_arrow(&cudf_dtype);
         let dt = dt.unwrap_or(DataType::Null);
         Self {
-            _ref,
+            storage,
             inner,
             dt,
             null_buf: OnceLock::new(),
+            stream_readiness,
         }
     }
 
@@ -52,93 +48,175 @@ impl CuDFColumnView {
         &self.inner
     }
 
-    /// Consume this wrapper and return the underlying cuDF column view
     pub(crate) fn into_inner(self) -> UniquePtr<ffi::ColumnView> {
         self.inner
     }
 
     /// Relabel this view's Arrow `DataType` without touching GPU memory.
     /// Used by [`record_batch_with_schema`](crate::record_batch_with_schema) to
-    /// reconcile cuDF's max-precision decimals with declared schema types.
-    pub fn with_data_type(self, dt: DataType) -> Self {
+    /// adjust cuDF's max-precision decimals with declared schema types.
+    pub(crate) fn with_data_type(self, dt: DataType) -> Self {
         Self {
-            _ref: self._ref,
+            storage: self.storage,
             inner: self.inner,
             dt,
             null_buf: self.null_buf,
+            stream_readiness: self.stream_readiness,
         }
     }
 
-    /// Convert the cuDF column view to an Arrow array, copying data from GPU to host
+    pub(crate) fn stream_readiness(&self) -> Option<&CuDFStreamDependency> {
+        self.stream_readiness.as_ref()
+    }
+
+    /// Create a deferred operation that returns this view's own device-buffer memory.
     ///
-    /// This method copies the GPU data back to the CPU and creates an Arrow array.
+    /// This matches cuDF's `column_view::get_buffer_memory_size` and does not
+    /// include child buffers.
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - The cuDF column cannot be converted to Arrow format
-    /// - There is an error copying data from GPU to host
+    /// Execution returns an error if this view's stream readiness cannot be
+    /// waited on by the target execution context.
+    pub fn buffer_memory_size(&self) -> impl CuDFOperation<Output = usize> + '_ {
+        deferred(move |ctx| {
+            let mut launch = execution_policy::launch(ctx)?;
+            launch.wait_column(self)?;
+            Ok(self.inner().get_buffer_memory_size(launch.stream()?))
+        })
+    }
+
+    /// Create a deferred operation that returns this view's total device memory.
     ///
-    /// # Example
+    /// This matches cuDF's `column_view::get_array_memory_size` and includes
+    /// child buffers.
+    ///
+    /// # Errors
+    ///
+    /// Execution returns an error if this view's stream readiness cannot be
+    /// waited on by the target execution context.
+    pub fn array_memory_size(&self) -> impl CuDFOperation<Output = usize> + '_ {
+        deferred(move |ctx| {
+            let mut launch = execution_policy::launch(ctx)?;
+            launch.wait_column(self)?;
+            Ok(self.inner().get_array_memory_size(launch.stream()?))
+        })
+    }
+
+    /// Cast this column to a different Arrow data type on the GPU.
+    ///
+    /// This creates a deferred cuDF cast operation. The cast does not run until
+    /// the returned operation is passed to [`CuDFExecutionContext::execute`].
+    /// Execution waits for this column's stream readiness before launching the
+    /// cast on the target context.
+    ///
+    /// # Errors
+    ///
+    /// Execution returns an error if:
+    /// - `target_type` is not supported by cuDF
+    /// - cuDF cannot cast this column to `target_type`
+    /// - the output column cannot be allocated
+    ///
+    /// # Examples
     ///
     /// ```no_run
     /// use arrow::array::Int32Array;
-    /// use libcudf_rs::CuDFColumn;
+    /// use arrow_schema::DataType;
+    /// use libcudf_rs::{CuDFColumn, CuDFExecutionContext};
     ///
-    /// let array = Int32Array::from(vec![1, 2, 3, 4, 5]);
-    /// let column = CuDFColumn::from_arrow_host(&array)?.into_view();
-    /// // Do some GPU processing...
-    /// let result = column.to_arrow_host()?;
+    /// let input = Int32Array::from(vec![1, 2, 3]);
+    /// let ctx = CuDFExecutionContext::try_new_non_blocking()?;
+    /// let column = ctx.execute(CuDFColumn::from_arrow_host(&input))?.into_view();
+    ///
+    /// let casted = ctx.execute(column.cast(&DataType::Int64))?;
     /// # Ok::<(), libcudf_rs::CuDFError>(())
     /// ```
-    pub fn to_arrow_host(&self) -> Result<ArrayRef, CuDFError> {
-        let mut device_array = libcudf_sys::ArrowDeviceArray::new_cpu();
-
-        // Create schema from the column's data type
-        let ffi_schema = FFI_ArrowSchema::try_from(self.data_type())?;
-
-        // Convert the column view to Arrow format (copying from GPU to host)
-        // cuDF's to_arrow_array expects an ArrowDeviceArray pointer
-        unsafe {
-            let device_array_ptr =
-                &mut device_array as *mut libcudf_sys::ArrowDeviceArray as *mut u8;
-            let stream = ffi::get_default_stream();
-            let mr = ffi::get_current_device_resource_ref();
-            self.inner
-                .to_arrow_array(device_array_ptr, stream_ref(&stream)?, resource_ref(&mr)?);
-        }
-
-        // Convert from FFI structures to Arrow ArrayData
-        // Extract just the ArrowArray part
-        let array_data = unsafe { arrow::ffi::from_ffi(device_array.array, &ffi_schema)? };
-
-        // Create an ArrayRef from the ArrayData
-        Ok(arrow::array::make_array(array_data))
+    pub fn cast<'a>(
+        &'a self,
+        target_type: &'a DataType,
+    ) -> impl CuDFOperation<Output = CuDFColumn> + 'a {
+        deferred(move |ctx| {
+            let cudf_dt = arrow_type_to_cudf_data_type(target_type).ok_or_else(|| {
+                CuDFError::ArrowError(ArrowError::NotYetImplemented(format!(
+                    "Arrow type {} not supported in cuDF cast",
+                    target_type
+                )))
+            })?;
+            let mut launch = execution_policy::launch(ctx)?;
+            launch.wait_column(self)?;
+            let result =
+                ffi::cast_column(self.inner(), &cudf_dt, launch.stream()?, launch.resource())?;
+            launch.ready_column(CuDFColumn::from_inner(result))
+        })
     }
 
-    /// Return the device buffer memory used by this column view.
-    pub fn get_buffer_memory_size(&self) -> Result<usize, CuDFError> {
-        let stream = ffi::get_default_stream();
-        Ok(self.inner().get_buffer_memory_size(stream_ref(&stream)?))
-    }
-
-    /// Return the total device memory used by this column view, including child buffers.
-    pub fn get_array_memory_size(&self) -> Result<usize, CuDFError> {
-        let stream = ffi::get_default_stream();
-        Ok(self.inner().get_array_memory_size(stream_ref(&stream)?))
+    /// Slice this column view on the GPU.
+    ///
+    /// The returned operation produces a new [`CuDFColumnView`] covering
+    /// `offset..offset + length`. The sliced view keeps this source column
+    /// alive and inherits its stream readiness. This method is named
+    /// `slice_view` to avoid shadowing Arrow's [`Array::slice`](arrow::array::Array::slice)
+    /// on `CuDFColumnView`.
+    ///
+    /// # Errors
+    ///
+    /// Execution returns an error if the requested range is outside the column
+    /// bounds or cuDF cannot create the slice view.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use arrow::array::{Array, Int32Array};
+    /// use libcudf_rs::{CuDFColumn, CuDFExecutionContext};
+    ///
+    /// let input = Int32Array::from(vec![1, 2, 3, 4, 5]);
+    /// let ctx = CuDFExecutionContext::try_new_non_blocking()?;
+    /// let column = ctx.execute(CuDFColumn::from_arrow_host(&input))?.into_view();
+    ///
+    /// let sliced = ctx.execute(column.slice_view(1, 3))?;
+    /// assert_eq!(sliced.len(), 3);
+    /// # Ok::<(), libcudf_rs::CuDFError>(())
+    /// ```
+    pub fn slice_view(
+        &self,
+        offset: usize,
+        length: usize,
+    ) -> impl CuDFOperation<Output = CuDFColumnView> + '_ {
+        deferred(move |ctx| {
+            let mut launch = execution_policy::launch(ctx)?;
+            launch.wait_column(self)?;
+            let inner = ffi::slice_column(self.inner(), offset, length, launch.stream()?)?;
+            // cuDF slice returns a view over the original buffers. No new producer
+            // dependency is recorded; the sliced view inherits the input readiness.
+            let storage: CuDFViewStorage = Arc::new(self.clone());
+            Ok(CuDFColumnView::from_view(
+                inner,
+                Some(storage),
+                self.stream_readiness().cloned(),
+            ))
+        })
     }
 }
 
 impl Clone for CuDFColumnView {
     fn clone(&self) -> Self {
-        // Clone the view using the FFI clone method
         let cloned_inner = self.inner.clone();
         Self {
-            _ref: self._ref.clone(),
+            storage: self.storage.clone(),
             inner: cloned_inner,
             dt: self.dt.clone(),
             null_buf: self.null_buf.clone(),
+            stream_readiness: self.stream_readiness.clone(),
         }
+    }
+}
+
+impl CuDFStreamReady for CuDFColumnView {
+    fn wait_ready_on_stream(&self, stream: &ffi::CudaStreamView) -> Result<(), CuDFError> {
+        if let Some(dependency) = &self.stream_readiness {
+            dependency.wait_on_stream(stream)?;
+        }
+        Ok(())
     }
 }
 
@@ -164,12 +242,16 @@ unsafe impl Array for CuDFColumnView {
         //
         // Call to_arrow_host() explicitly rather than this method to separate
         // implicit and explicit transfers.
+        //
+        // TODO: Avoid fallible cuDF work in Arrow's infallible Array trait.
         debug_assert!(
             false,
             "CuDFColumnView::to_data(), implicit GPU->CPU copy detected. \
              Call to_arrow_host() explicitly."
         );
-        self.to_arrow_host()
+        CuDFExecutionContext::try_new_non_blocking()
+            .expect("failed to create cuDF execution context")
+            .execute(self.to_arrow_host())
             .expect("Failed to convert GPU column to host Arrow")
             .to_data()
     }
@@ -183,7 +265,13 @@ unsafe impl Array for CuDFColumnView {
     }
 
     fn slice(&self, offset: usize, length: usize) -> ArrayRef {
-        Arc::new(slice_column(self, offset, length).expect("Failed to slice column"))
+        // TODO: Avoid fallible cuDF work in Arrow's infallible Array trait.
+        Arc::new(
+            CuDFExecutionContext::try_new_non_blocking()
+                .expect("failed to create cuDF execution context")
+                .execute(self.slice_view(offset, length))
+                .expect("Failed to slice column"),
+        )
     }
 
     fn len(&self) -> usize {
@@ -199,11 +287,24 @@ unsafe impl Array for CuDFColumnView {
     }
 
     fn nulls(&self) -> Option<&NullBuffer> {
+        // TODO: Avoid fallible cuDF work in Arrow's infallible Array trait.
         self.null_buf
             .get_or_init(|| {
                 if self.null_count() == 0 {
                     return None;
                 }
+                let ctx = CuDFExecutionContext::try_new_non_blocking()
+                    .expect("failed to create cuDF execution context");
+                let mut launch =
+                    execution_policy::launch(&ctx).expect("failed to launch cuDF operation");
+                launch
+                    .wait_column(self)
+                    .expect("failed to wait for cuDF column readiness");
+                launch
+                    .stream()
+                    .expect("cuDF stream should not be null")
+                    .synchronize()
+                    .expect("failed to synchronize default cuDF stream");
                 let null_bytes = self.inner().get_null_buffer();
                 let offset = self.inner().offset() as usize;
                 let length = self.inner().size();
@@ -216,12 +317,16 @@ unsafe impl Array for CuDFColumnView {
     }
 
     fn get_buffer_memory_size(&self) -> usize {
-        CuDFColumnView::get_buffer_memory_size(self)
+        CuDFExecutionContext::try_new_non_blocking()
+            .expect("failed to create cuDF execution context")
+            .execute(self.buffer_memory_size())
             .expect("failed to get cuDF column buffer memory size")
     }
 
     fn get_array_memory_size(&self) -> usize {
-        CuDFColumnView::get_array_memory_size(self)
+        CuDFExecutionContext::try_new_non_blocking()
+            .expect("failed to create cuDF execution context")
+            .execute(self.array_memory_size())
             .expect("failed to get cuDF column array memory size")
     }
 
@@ -262,12 +367,12 @@ unsafe impl Array for CuDFColumnView {
 mod tests {
     use super::*;
     use crate::CuDFColumn;
-    use arrow::array::{Int32Array, StringArray};
+    use arrow::array::{Int32Array, Int64Array, StringArray};
 
     #[test]
     fn test_column_view_clone() -> Result<(), Box<dyn std::error::Error>> {
         let array = Int32Array::from(vec![1, 2, 3, 4, 5]);
-        let column = CuDFColumn::from_arrow_host(&array)
+        let column = crate::execute_cudf(CuDFColumn::from_arrow_host(&array))
             .expect("Failed to convert Arrow array to column")
             .into_view();
 
@@ -289,9 +394,9 @@ mod tests {
     #[test]
     fn test_string_column_view_memory_size() -> Result<(), Box<dyn std::error::Error>> {
         let array = StringArray::from(vec!["hello", "world", ""]);
-        let column = CuDFColumn::from_arrow_host(&array)?.into_view();
+        let column = crate::execute_cudf(CuDFColumn::from_arrow_host(&array))?.into_view();
 
-        let size = column.get_array_memory_size()?;
+        let size = crate::execute_cudf(column.array_memory_size())?;
         let min_offsets_and_chars =
             (array.len() + 1) * std::mem::size_of::<i32>() + array.value_data().len();
         assert!(size >= min_offsets_and_chars);
@@ -302,7 +407,7 @@ mod tests {
     #[test]
     fn test_multiple_clones() -> Result<(), Box<dyn std::error::Error>> {
         let array = Int32Array::from(vec![10, 20, 30]);
-        let column = CuDFColumn::from_arrow_host(&array)
+        let column = crate::execute_cudf(CuDFColumn::from_arrow_host(&array))
             .expect("Failed to convert Arrow array to column")
             .into_view();
 
@@ -330,7 +435,7 @@ mod tests {
     #[test]
     fn test_column_data_is_on_gpu() -> Result<(), Box<dyn std::error::Error>> {
         let array = Int32Array::from(vec![1, 2, 3, 4, 5]);
-        let column = CuDFColumn::from_arrow_host(&array)
+        let column = crate::execute_cudf(CuDFColumn::from_arrow_host(&array))
             .expect("Failed to convert Arrow array to column")
             .into_view();
 
@@ -372,11 +477,11 @@ mod tests {
     #[test]
     fn test_get_buffer_memory_size_int32() -> Result<(), Box<dyn std::error::Error>> {
         let array = Int32Array::from(vec![1, 2, 3, 4, 5]);
-        let column = CuDFColumn::from_arrow_host(&array)
+        let column = crate::execute_cudf(CuDFColumn::from_arrow_host(&array))
             .expect("Failed to convert Arrow array to column")
             .into_view();
 
-        let size = column.get_buffer_memory_size()?;
+        let size = crate::execute_cudf(column.buffer_memory_size())?;
         assert_eq!(size, 20, "Int32 column should be 20 bytes");
 
         Ok(())
@@ -386,11 +491,11 @@ mod tests {
     fn test_get_buffer_memory_size_large() -> Result<(), Box<dyn std::error::Error>> {
         let data: Vec<i32> = (0..1_000_000).collect();
         let array = Int32Array::from(data);
-        let column = CuDFColumn::from_arrow_host(&array)
+        let column = crate::execute_cudf(CuDFColumn::from_arrow_host(&array))
             .expect("Failed to convert Arrow array to column")
             .into_view();
 
-        let size = column.get_buffer_memory_size()?;
+        let size = crate::execute_cudf(column.buffer_memory_size())?;
         assert_eq!(size, 4_000_000, "1M Int32 elements should be 4MB");
 
         Ok(())
@@ -399,12 +504,12 @@ mod tests {
     #[test]
     fn test_get_array_memory_size_no_nulls() -> Result<(), Box<dyn std::error::Error>> {
         let array = Int32Array::from(vec![1, 2, 3, 4, 5]);
-        let column = CuDFColumn::from_arrow_host(&array)
+        let column = crate::execute_cudf(CuDFColumn::from_arrow_host(&array))
             .expect("Failed to convert Arrow array to column")
             .into_view();
 
-        let buffer_size = column.get_buffer_memory_size()?;
-        let array_size = column.get_array_memory_size()?;
+        let buffer_size = crate::execute_cudf(column.buffer_memory_size())?;
+        let array_size = crate::execute_cudf(column.array_memory_size())?;
 
         // With no nulls, array_size should equal buffer_size
         assert_eq!(
@@ -418,12 +523,12 @@ mod tests {
     #[test]
     fn test_get_array_memory_size_with_nulls() -> Result<(), Box<dyn std::error::Error>> {
         let array = Int32Array::from(vec![Some(1), None, Some(3), None, Some(5)]);
-        let column = CuDFColumn::from_arrow_host(&array)
+        let column = crate::execute_cudf(CuDFColumn::from_arrow_host(&array))
             .expect("Failed to convert Arrow array to column")
             .into_view();
 
-        let buffer_size = column.get_buffer_memory_size()?;
-        let array_size = column.get_array_memory_size()?;
+        let buffer_size = crate::execute_cudf(column.buffer_memory_size())?;
+        let array_size = crate::execute_cudf(column.array_memory_size())?;
 
         // With nulls -> array_size = buffer_size + null_mask_size
         assert!(
@@ -444,7 +549,7 @@ mod tests {
     #[test]
     fn test_nulls_no_nulls_returns_none() -> Result<(), Box<dyn std::error::Error>> {
         let array = Int32Array::from(vec![1, 2, 3, 4, 5]);
-        let column = CuDFColumn::from_arrow_host(&array)
+        let column = crate::execute_cudf(CuDFColumn::from_arrow_host(&array))
             .expect("Failed to convert Arrow array to column")
             .into_view();
 
@@ -457,7 +562,7 @@ mod tests {
     #[test]
     fn test_nulls_with_nulls_returns_buffer() -> Result<(), Box<dyn std::error::Error>> {
         let array = Int32Array::from(vec![Some(1), None, Some(3), None, Some(5)]);
-        let column = CuDFColumn::from_arrow_host(&array)
+        let column = crate::execute_cudf(CuDFColumn::from_arrow_host(&array))
             .expect("Failed to convert Arrow array to column")
             .into_view();
 
@@ -473,7 +578,7 @@ mod tests {
     #[test]
     fn test_nulls_correct_bit_pattern() -> Result<(), Box<dyn std::error::Error>> {
         let array = Int32Array::from(vec![Some(10), None, Some(30), None, Some(50)]);
-        let column = CuDFColumn::from_arrow_host(&array)
+        let column = crate::execute_cudf(CuDFColumn::from_arrow_host(&array))
             .expect("Failed to convert Arrow array to column")
             .into_view();
 
@@ -490,7 +595,7 @@ mod tests {
     #[test]
     fn test_nulls_cached_same_reference() -> Result<(), Box<dyn std::error::Error>> {
         let array = Int32Array::from(vec![Some(1), None, Some(3)]);
-        let column = CuDFColumn::from_arrow_host(&array)
+        let column = crate::execute_cudf(CuDFColumn::from_arrow_host(&array))
             .expect("Failed to convert Arrow array to column")
             .into_view();
 
@@ -514,7 +619,7 @@ mod tests {
     #[test]
     fn test_is_null_uses_null_buffer() -> Result<(), Box<dyn std::error::Error>> {
         let array = Int32Array::from(vec![Some(1), None, Some(3), None, Some(5)]);
-        let column = CuDFColumn::from_arrow_host(&array)
+        let column = crate::execute_cudf(CuDFColumn::from_arrow_host(&array))
             .expect("Failed to convert Arrow array to column")
             .into_view();
 
@@ -530,7 +635,7 @@ mod tests {
     #[test]
     fn test_is_valid_inverse_of_is_null() -> Result<(), Box<dyn std::error::Error>> {
         let array = Int32Array::from(vec![Some(1), None, Some(3)]);
-        let column = CuDFColumn::from_arrow_host(&array)
+        let column = crate::execute_cudf(CuDFColumn::from_arrow_host(&array))
             .expect("Failed to convert Arrow array to column")
             .into_view();
 
@@ -549,7 +654,7 @@ mod tests {
     #[test]
     fn test_null_count_matches_null_buffer() -> Result<(), Box<dyn std::error::Error>> {
         let array = Int32Array::from(vec![Some(1), None, Some(3), None, Some(5), None]);
-        let column = CuDFColumn::from_arrow_host(&array)
+        let column = crate::execute_cudf(CuDFColumn::from_arrow_host(&array))
             .expect("Failed to convert Arrow array to column")
             .into_view();
 
@@ -573,7 +678,7 @@ mod tests {
             .map(|i| if i % 2 == 0 { Some(i) } else { None })
             .collect();
         let array = Int32Array::from(data);
-        let column = CuDFColumn::from_arrow_host(&array)
+        let column = crate::execute_cudf(CuDFColumn::from_arrow_host(&array))
             .expect("Failed to convert Arrow array to column")
             .into_view();
 
@@ -597,7 +702,7 @@ mod tests {
     fn test_logical_nulls_equals_physical_nulls() -> Result<(), Box<dyn std::error::Error>> {
         // For primitive types, logical_nulls should equal physical nulls
         let array = Int32Array::from(vec![Some(1), None, Some(3)]);
-        let column = CuDFColumn::from_arrow_host(&array)
+        let column = crate::execute_cudf(CuDFColumn::from_arrow_host(&array))
             .expect("Failed to convert Arrow array to column")
             .into_view();
 
@@ -624,6 +729,40 @@ mod tests {
             }
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_cast_int32_to_int64_with_nulls() -> Result<(), Box<dyn std::error::Error>> {
+        let array = Int32Array::from(vec![Some(1), None, Some(3), None, Some(5)]);
+        let column = crate::execute_cudf(CuDFColumn::from_arrow_host(&array))?.into_view();
+
+        let casted = crate::execute_cudf(column.cast(&DataType::Int64))?;
+        let view = casted.into_view();
+        assert_eq!(view.data_type(), &DataType::Int64);
+
+        let result = crate::execute_cudf(view.to_arrow_host())?;
+
+        let result = result.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(result.len(), 5);
+        assert!(result.is_valid(0));
+        assert!(result.is_null(1));
+        assert!(result.is_valid(2));
+        assert!(result.is_null(3));
+        assert!(result.is_valid(4));
+        assert_eq!(result.value(0), 1);
+        assert_eq!(result.value(2), 3);
+        assert_eq!(result.value(4), 5);
+        Ok(())
+    }
+
+    #[test]
+    fn test_cast_unsupported_type_returns_error() -> Result<(), Box<dyn std::error::Error>> {
+        let array = Int32Array::from(vec![1, 2, 3]);
+        let column = crate::execute_cudf(CuDFColumn::from_arrow_host(&array))?.into_view();
+
+        let result = crate::execute_cudf(column.cast(&DataType::Null));
+        assert!(result.is_err());
         Ok(())
     }
 }

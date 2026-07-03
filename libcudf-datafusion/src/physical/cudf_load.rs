@@ -1,4 +1,5 @@
 use crate::errors::cudf_to_df;
+use crate::execution::execute_cudf;
 use crate::metrics::CuDFBaselineMetrics;
 use crate::planner::CuDFConfig;
 use arrow::array::{Array, RecordBatch, RecordBatchOptions};
@@ -17,7 +18,7 @@ use datafusion_physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
 use futures_util::stream::StreamExt;
-use libcudf_rs::{is_cudf_array, pin_record_batch, synchronize_default_stream, CuDFTable};
+use libcudf_rs::{is_cudf_array, pin_record_batch, CuDFTable};
 use std::any::Any;
 use std::fmt::Formatter;
 use std::sync::Arc;
@@ -199,15 +200,8 @@ impl CuDFRecordBatchReceiverStreamBuilder {
                     pin_timer.done();
 
                     let import_timer = ctx.metrics.import_time.timer();
-                    let table = CuDFTable::from_arrow_host(pinned_batch).map_err(cudf_to_df)?;
+                    let table = execute_cudf(CuDFTable::from_arrow_host(pinned_batch))?;
                     import_timer.done();
-
-                    let sync_timer = ctx.metrics.sync_time.timer();
-                    // Beware: `CuDFTable::from_arrow_host` internally uses the default stream.
-                    // If we ever migrate that to a different stream, this call should 
-                    // be updated to synchronize that stream.
-                    synchronize_default_stream().map_err(cudf_to_df)?;
-                    sync_timer.done();
 
                     let output_batch_timer = ctx.metrics.output_batch_time.timer();
                     let num_rows = table.num_rows();
@@ -259,7 +253,6 @@ struct CuDFLoadMetrics {
     coalesce_time: Time,
     pin_time: Time,
     import_time: Time,
-    sync_time: Time,
     output_batch_time: Time,
     output_send_time: Time,
     input_batches: Count,
@@ -283,7 +276,6 @@ impl CuDFLoadMetrics {
             coalesce_time: MetricBuilder::new(metrics).subset_time("coalesce_time", partition),
             pin_time: MetricBuilder::new(metrics).subset_time("pin_time", partition),
             import_time: MetricBuilder::new(metrics).subset_time("import_time", partition),
-            sync_time: MetricBuilder::new(metrics).subset_time("sync_time", partition),
             output_batch_time: MetricBuilder::new(metrics)
                 .subset_time("output_batch_time", partition),
             output_send_time: MetricBuilder::new(metrics)

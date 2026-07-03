@@ -6,56 +6,74 @@
 //! # Examples
 //!
 //! ```no_run
-//! use libcudf_rs::CuDFTable;
+//! use libcudf_rs::{CuDFExecutionContext, CuDFTable};
 //!
 //! // Read a Parquet file
-//! let table = CuDFTable::from_parquet("data.parquet").expect("Failed to read Parquet");
+//! let ctx = CuDFExecutionContext::try_new_non_blocking()?;
+//! let table = ctx.execute(CuDFTable::read_parquet("data.parquet"))?;
 //! println!("Loaded table with {} rows and {} columns",
 //!          table.num_rows(), table.num_columns());
 //!
 //! // Write to Parquet
-//! table.to_parquet("output.parquet").expect("Failed to write Parquet");
+//! ctx.execute(table.into_view().write_parquet("output.parquet"))?;
+//! # Ok::<(), libcudf_rs::CuDFError>(())
 //! ```
 
+mod arrow;
 mod ast;
 mod binary_op;
 mod column;
 mod column_view;
 mod config;
-mod cudf_array;
-mod cudf_reference;
 mod data_type;
-mod device_resource;
+mod deferred_operation;
 mod errors;
+mod execution_context;
+mod execution_policy;
 mod group_by;
 mod join;
-mod operations;
+mod keep_alive;
+mod parquet;
 mod pinned;
 mod scalar;
 mod sort;
 mod stream;
+mod stream_readiness;
 mod table;
 mod table_view;
 
-pub use ast::{CuDFAstExpression, CuDFAstNode, CuDFAstOperator, CuDFAstTableReference};
-pub use binary_op::{cudf_binary_op, CuDFBinaryOp};
+pub use arrow::{is_cudf_array, is_cudf_record_batch, record_batch_with_schema};
+pub use ast::{
+    CuDFAstExpression, CuDFAstExpressionBuilder, CuDFAstNode, CuDFAstOperator,
+    CuDFAstTableReference,
+};
+pub use binary_op::{CuDFBinaryOp, CuDFColumnViewOrScalar};
 pub use column::CuDFColumn;
 pub use column_view::CuDFColumnView;
-pub use cudf_array::*;
-pub use cudf_reference::CuDFRef;
+pub use deferred_operation::CuDFOperation;
 pub use errors::{CuDFError, Result};
+pub use execution_context::CuDFExecutionContext;
 pub use group_by::*;
 pub use join::{
     cross_join, full_join, inner_join, left_anti_join, left_join, left_semi_join,
     CuDFFilteredHashJoinArgs, CuDFHashJoin, CuDFNullEquality,
 };
-pub use operations::{apply_boolean_mask, cast, gather, slice_column};
-pub use pinned::{pin_record_batch, synchronize_default_stream, PinnedHostBuffer};
+pub use parquet::{CuDFParquetReadOptions, CuDFParquetReadResult};
+pub use pinned::pin_record_batch;
 pub use scalar::CuDFScalar;
-pub use sort::{sort, sort_by_all, stable_sorted_order, SortOrder};
+pub use sort::SortOrder;
+use std::any::Any;
+use std::sync::Arc;
 pub use stream::{CuDFStream, CuDFStreamFlags};
 pub use table::*;
 pub use table_view::*;
+
+/// Type-erased storage retained by non-owning cuDF views.
+///
+/// cuDF views point at buffers owned by tables, columns, other views, or small
+/// helper containers. Holding this `Arc` is enough to keep that backing storage
+/// alive for as long as the view exists.
+pub(crate) type CuDFViewStorage = Arc<dyn Any + Send + Sync>;
 
 /// Get cuDF version information
 ///
@@ -68,6 +86,14 @@ pub use table_view::*;
 /// ```
 pub fn version() -> String {
     libcudf_sys::ffi::get_cudf_version()
+}
+
+#[cfg(test)]
+pub(crate) fn execute_cudf<O>(operation: O) -> Result<O::Output>
+where
+    O: CuDFOperation,
+{
+    CuDFExecutionContext::try_new_non_blocking()?.execute(operation)
 }
 
 #[cfg(test)]
