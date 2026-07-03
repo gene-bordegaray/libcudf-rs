@@ -1,4 +1,5 @@
 use crate::errors::cudf_to_df;
+use crate::execution::execute_cudf;
 use crate::expr::{columnar_value_to_cudf, expr_to_cudf_expr};
 use crate::metrics::CuDFBaselineMetrics;
 use arrow::array::{Array, RecordBatch};
@@ -19,7 +20,7 @@ use datafusion_physical_plan::{
 };
 use delegate::delegate;
 use futures_util::{Stream, StreamExt};
-use libcudf_rs::{apply_boolean_mask, CuDFColumnView};
+use libcudf_rs::CuDFColumnView;
 use libcudf_rs::{CuDFColumnViewOrScalar, CuDFTableView};
 use std::any::Any;
 use std::fmt::Formatter;
@@ -80,11 +81,10 @@ impl ExecutionPlan for CuDFFilterExec {
         // FilterExec::try_new alone does not set the projection; only with_new_children
         // calls .with_projection(self.projection().cloned()), so using it here is essential.
         let updated = Arc::new(self.host_exec.clone()).with_new_children(children)?;
-        let f_exec = updated
-            .as_any()
-            .downcast_ref::<FilterExec>()
-            .expect("FilterExec::with_new_children should return a FilterExec")
-            .clone();
+        let Some(f_exec) = updated.as_any().downcast_ref::<FilterExec>() else {
+            return internal_err!("FilterExec::with_new_children returned a different plan type");
+        };
+        let f_exec = f_exec.clone();
         Ok(Arc::new(Self::try_new(f_exec)?))
     }
 
@@ -191,7 +191,7 @@ fn filter_and_project(
     let table_view = CuDFTableView::from_column_views(column_views).map_err(cudf_to_df)?;
 
     // Apply boolean mask using CuDF on GPU
-    let filtered_table = apply_boolean_mask(&table_view, &bool_mask).map_err(cudf_to_df)?;
+    let filtered_table = execute_cudf(table_view.filter(&bool_mask))?;
 
     // Keep data on GPU by wrapping table in an Arc and creating column views that reference it
     let table_view = filtered_table.into_view();
@@ -200,7 +200,7 @@ fn filter_and_project(
 
     let mut cudf_columns: Vec<Arc<dyn Array>> = Vec::with_capacity(num_cols);
     for i in 0..num_cols {
-        let col_view = table_view.column(i as i32);
+        let col_view = table_view.column(i).map_err(cudf_to_df)?;
         cudf_columns.push(Arc::new(col_view));
     }
 

@@ -1,14 +1,94 @@
 use crate::column::CuDFColumn;
 use crate::data_type::arrow_type_to_cudf_data_type;
-use crate::device_resource::resource_ref;
-use crate::stream::stream_ref;
-use crate::{CuDFColumnViewOrScalar, CuDFError};
+use crate::deferred_operation::deferred;
+use crate::execution_policy::OperationLaunch;
+use crate::{CuDFColumnView, CuDFError, CuDFExecutionContext, CuDFOperation, CuDFScalar};
 use arrow_schema::{ArrowError, DataType};
 use libcudf_sys::ffi;
 
-/// Binary operations supported by cuDF
+/// A cuDF column view or scalar value.
 ///
-/// Maps to cuDF's `binary_operator` enum
+/// This is the operand/result shape for cuDF APIs that accept either a column
+/// or a scalar value. Binary operations require at least one operand to be a
+/// column.
+pub enum CuDFColumnViewOrScalar {
+    /// A column view containing one value per row.
+    ColumnView(CuDFColumnView),
+    /// A single scalar value.
+    Scalar(CuDFScalar),
+}
+
+impl CuDFColumnViewOrScalar {
+    /// Create a deferred operation that applies a cuDF binary operation.
+    ///
+    /// Calling this method only captures the operands and options. cuDF work is
+    /// not submitted until the returned operation is passed to
+    /// [`CuDFExecutionContext::execute`](crate::CuDFExecutionContext::execute).
+    /// Execution then waits for both operands to be ready on the target context
+    /// stream before launching the binary operation. At least one operand must
+    /// be a column; scalar-scalar binary operations are rejected by the cuDF
+    /// binding used here.
+    ///
+    /// # Errors
+    ///
+    /// Execution returns an error if:
+    /// - `output_type` is not supported by cuDF
+    /// - the operands are incompatible with `op`
+    /// - both operands are scalars
+    /// - cuDF cannot allocate the output column
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use arrow::array::Int32Array;
+    /// use arrow_schema::DataType;
+    /// use libcudf_rs::{CuDFBinaryOp, CuDFColumn, CuDFColumnViewOrScalar, CuDFExecutionContext};
+    ///
+    /// let lhs = Int32Array::from(vec![1, 2, 3]);
+    /// let rhs = Int32Array::from(vec![10, 20, 30]);
+    ///
+    /// let ctx = CuDFExecutionContext::try_new_non_blocking()?;
+    /// let lhs = ctx.execute(CuDFColumn::from_arrow_host(&lhs))?.into_view();
+    /// let rhs = ctx.execute(CuDFColumn::from_arrow_host(&rhs))?.into_view();
+    ///
+    /// let result = ctx.execute(
+    ///     CuDFColumnViewOrScalar::ColumnView(lhs).binary_op(
+    ///         CuDFColumnViewOrScalar::ColumnView(rhs),
+    ///         CuDFBinaryOp::Add,
+    ///         &DataType::Int32,
+    ///     ),
+    /// )?;
+    /// # Ok::<(), libcudf_rs::CuDFError>(())
+    /// ```
+    pub fn binary_op<'a>(
+        self,
+        right: Self,
+        op: CuDFBinaryOp,
+        output_type: &'a DataType,
+    ) -> impl CuDFOperation<Output = Self> + 'a {
+        deferred(move |ctx| binary_op_on_context(ctx, self, right, op, output_type))
+    }
+}
+
+impl From<CuDFColumnView> for CuDFColumnViewOrScalar {
+    fn from(col: CuDFColumnView) -> Self {
+        Self::ColumnView(col)
+    }
+}
+
+impl From<CuDFScalar> for CuDFColumnViewOrScalar {
+    fn from(scalar: CuDFScalar) -> Self {
+        Self::Scalar(scalar)
+    }
+}
+
+/// A binary operator supported by cuDF column/scalar operations.
+///
+/// This maps to cuDF's `binary_operator` enum. The generic PTX-backed
+/// operator is listed for enum parity, but this wrapper does not expose the
+/// extra UDF input needed to execute it through [`CuDFColumnViewOrScalar::binary_op`].
+///
+/// [`CuDFColumnViewOrScalar::binary_op`]: crate::CuDFColumnViewOrScalar::binary_op
 #[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CuDFBinaryOp {
@@ -78,7 +158,10 @@ pub enum CuDFBinaryOp {
     /// Returns min of operands when both are non-null; returns the non-null
     /// operand when one is null; or invalid when both are null
     NullMin = 30,
-    /// generic binary operator to be generated with input ptx code
+    /// Generic binary operator generated from PTX code.
+    ///
+    /// This variant cannot be executed through the current high-level binary
+    /// operation API because that API has no PTX/code input.
     GenericBinary = 31,
     /// operator && with Spark rules
     NullLogicalAnd = 32,
@@ -88,7 +171,8 @@ pub enum CuDFBinaryOp {
     InvalidBinary = 34,
 }
 
-pub fn cudf_binary_op(
+pub(crate) fn binary_op_on_context(
+    ctx: &CuDFExecutionContext,
     left: CuDFColumnViewOrScalar,
     right: CuDFColumnViewOrScalar,
     op: CuDFBinaryOp,
@@ -99,49 +183,72 @@ pub fn cudf_binary_op(
             "Output type {output_type} not supported in CuDF"
         )))?;
     };
-    let stream = ffi::get_default_stream();
-    let mr = ffi::get_current_device_resource_ref();
-    let stream_view = stream_ref(&stream)?;
-    let mr_ref = resource_ref(&mr)?;
+    let op = cudf_binary_operator(op)?;
+    let mut launch = crate::execution_policy::launch(ctx)?;
+    wait_operand(&mut launch, &left)?;
+    wait_operand(&mut launch, &right)?;
 
     let result = match (left, right) {
         (CuDFColumnViewOrScalar::ColumnView(lhs), CuDFColumnViewOrScalar::ColumnView(rhs)) => {
             ffi::binary_operation_col_col(
                 lhs.inner(),
                 rhs.inner(),
-                op as i32,
+                op,
                 &dt,
-                stream_view,
-                mr_ref,
+                launch.stream()?,
+                launch.resource(),
             )
         }
         (CuDFColumnViewOrScalar::ColumnView(lhs), CuDFColumnViewOrScalar::Scalar(rhs)) => {
             ffi::binary_operation_col_scalar(
                 lhs.inner(),
                 rhs.inner(),
-                op as i32,
+                op,
                 &dt,
-                stream_view,
-                mr_ref,
+                launch.stream()?,
+                launch.resource(),
             )
         }
         (CuDFColumnViewOrScalar::Scalar(lhs), CuDFColumnViewOrScalar::ColumnView(rhs)) => {
             ffi::binary_operation_scalar_col(
                 lhs.inner(),
                 rhs.inner(),
-                op as i32,
+                op,
                 &dt,
-                stream_view,
-                mr_ref,
+                launch.stream()?,
+                launch.resource(),
             )
         }
         (CuDFColumnViewOrScalar::Scalar(_), CuDFColumnViewOrScalar::Scalar(_)) => {
-            return Err(ArrowError::InvalidArgumentError("".to_string()))?
+            return Err(ArrowError::InvalidArgumentError(
+                "cuDF binary operation requires at least one column operand".to_string(),
+            ))?
         }
     }?;
-    Ok(CuDFColumnViewOrScalar::ColumnView(
-        CuDFColumn::new(result).into_view(),
-    ))
+    let column = launch.ready_column(CuDFColumn::from_inner(result))?;
+    Ok(CuDFColumnViewOrScalar::ColumnView(column.into_view()))
+}
+
+fn cudf_binary_operator(op: CuDFBinaryOp) -> Result<i32, CuDFError> {
+    match op {
+        CuDFBinaryOp::GenericBinary => Err(ArrowError::NotYetImplemented(
+            "GenericBinary requires PTX input that is not exposed by this API".to_string(),
+        ))?,
+        CuDFBinaryOp::InvalidBinary => Err(ArrowError::InvalidArgumentError(
+            "InvalidBinary is not an executable cuDF binary operator".to_string(),
+        ))?,
+        _ => Ok(op as i32),
+    }
+}
+
+fn wait_operand(
+    launch: &mut OperationLaunch<'_>,
+    value: &CuDFColumnViewOrScalar,
+) -> Result<(), CuDFError> {
+    match value {
+        CuDFColumnViewOrScalar::ColumnView(column) => launch.wait_column(column),
+        CuDFColumnViewOrScalar::Scalar(scalar) => launch.wait_scalar(scalar),
+    }
 }
 
 #[cfg(test)]
@@ -159,15 +266,16 @@ mod tests {
         let array1 = Decimal128Array::from(values1).with_precision_and_scale(38, 2)?;
         let array2 = Decimal128Array::from(values2).with_precision_and_scale(38, 2)?;
 
-        let col1 = CuDFColumn::from_arrow_host(&array1)?;
-        let col2 = CuDFColumn::from_arrow_host(&array2)?;
+        let col1 = crate::execute_cudf(CuDFColumn::from_arrow_host(&array1))?;
+        let col2 = crate::execute_cudf(CuDFColumn::from_arrow_host(&array2))?;
 
         // Add the two decimal columns
-        let result = cudf_binary_op(
-            CuDFColumnViewOrScalar::ColumnView(col1.into_view()),
-            CuDFColumnViewOrScalar::ColumnView(col2.into_view()),
-            CuDFBinaryOp::Add,
-            &DataType::Decimal128(38, 2),
+        let result = crate::execute_cudf(
+            CuDFColumnViewOrScalar::ColumnView(col1.into_view()).binary_op(
+                CuDFColumnViewOrScalar::ColumnView(col2.into_view()),
+                CuDFBinaryOp::Add,
+                &DataType::Decimal128(38, 2),
+            ),
         )?;
 
         // Convert result back to Arrow
@@ -176,7 +284,7 @@ mod tests {
             _ => panic!("Expected column view"),
         };
 
-        let result_array = result_col.to_arrow_host()?;
+        let result_array = crate::execute_cudf(result_col.to_arrow_host())?;
         let result_decimal = result_array
             .as_any()
             .downcast_ref::<Decimal128Array>()
@@ -200,15 +308,16 @@ mod tests {
         let price_array = Decimal128Array::from(prices).with_precision_and_scale(38, 2)?;
         let qty_array = Decimal128Array::from(quantities).with_precision_and_scale(38, 0)?;
 
-        let col_price = CuDFColumn::from_arrow_host(&price_array)?;
-        let col_qty = CuDFColumn::from_arrow_host(&qty_array)?;
+        let col_price = crate::execute_cudf(CuDFColumn::from_arrow_host(&price_array))?;
+        let col_qty = crate::execute_cudf(CuDFColumn::from_arrow_host(&qty_array))?;
 
         // Multiply: result should have scale = 2 + 0 = 2
-        let result = cudf_binary_op(
-            CuDFColumnViewOrScalar::ColumnView(col_price.into_view()),
-            CuDFColumnViewOrScalar::ColumnView(col_qty.into_view()),
-            CuDFBinaryOp::Mul,
-            &DataType::Decimal128(38, 2),
+        let result = crate::execute_cudf(
+            CuDFColumnViewOrScalar::ColumnView(col_price.into_view()).binary_op(
+                CuDFColumnViewOrScalar::ColumnView(col_qty.into_view()),
+                CuDFBinaryOp::Mul,
+                &DataType::Decimal128(38, 2),
+            ),
         )?;
 
         let result_col = match result {
@@ -216,7 +325,7 @@ mod tests {
             _ => panic!("Expected column view"),
         };
 
-        let result_array = result_col.to_arrow_host()?;
+        let result_array = crate::execute_cudf(result_col.to_arrow_host())?;
         let result_decimal = result_array
             .as_any()
             .downcast_ref::<Decimal128Array>()

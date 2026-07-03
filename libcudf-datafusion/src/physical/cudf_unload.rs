@@ -1,4 +1,5 @@
 use crate::errors::cudf_to_df;
+use crate::execution::execute_cudf;
 use crate::metrics::CuDFBaselineMetrics;
 use arrow::array::{RecordBatch, RecordBatchOptions};
 use arrow_schema::{DataType, Field, FieldRef, Schema, SchemaRef};
@@ -99,7 +100,7 @@ impl ExecutionPlan for CuDFUnloadExec {
             };
 
             let view = CuDFTableView::from_record_batch(&batch).map_err(cudf_to_df)?;
-            let host_batch = view.to_arrow_host().map_err(cudf_to_df)?;
+            let host_batch = execute_cudf(view.to_arrow_host())?;
             let num_rows = host_batch.num_rows();
             let columns = host_batch
                 .columns()

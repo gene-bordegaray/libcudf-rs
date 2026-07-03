@@ -1,13 +1,14 @@
 use super::read_plan::FileBatch;
 use super::{CuDFParquetSource, RowGroupSelection};
 use crate::errors::cudf_to_df;
+use crate::execution::execute_cudf;
 use crate::physical::normalize_scalar_for_cudf;
 use arrow_schema::SchemaRef;
 use datafusion::common::{plan_err, DataFusionError};
 use datafusion::scalar::ScalarValue;
 use libcudf_rs::{
-    CuDFAstExpression, CuDFColumn, CuDFError, CuDFParquetReadOptions, CuDFParquetReadResult,
-    CuDFScalar,
+    CuDFAstExpression, CuDFColumn, CuDFError, CuDFExecutionContext, CuDFParquetReadOptions,
+    CuDFParquetReadResult, CuDFScalar,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -107,32 +108,37 @@ where
     let mut emitted = false;
     let mut continued = true;
     let mut callback_error = None;
-    let read_result = libcudf_rs::CuDFTable::for_each_parquet_chunk(
-        CuDFParquetReadOptions {
-            paths,
-            columns: read_columns,
-            row_groups,
-            filter,
-            allow_mismatched_pq_schemas: read_columns.is_some(),
-            ignore_missing_columns: true,
-        },
-        chunk_read_limit,
-        pass_read_limit,
-        |read| {
-            emitted = true;
-            match align_parquet_read(read, schema).and_then(&mut *emit) {
-                Ok(keep_reading) => {
-                    continued = keep_reading;
-                    Ok(keep_reading)
+    let read_result = (|| -> Result<(), CuDFError> {
+        let ctx = CuDFExecutionContext::try_default_stream()?;
+        ctx.execute(libcudf_rs::CuDFTable::for_each_parquet_chunk(
+            CuDFParquetReadOptions {
+                paths,
+                columns: read_columns,
+                row_groups,
+                filter,
+                allow_mismatched_pq_schemas: read_columns.is_some(),
+                ignore_missing_columns: true,
+            },
+            chunk_read_limit,
+            pass_read_limit,
+            |read| {
+                emitted = true;
+                match align_parquet_read(read, schema).and_then(&mut *emit) {
+                    Ok(keep_reading) => {
+                        continued = keep_reading;
+                        Ok(keep_reading)
+                    }
+                    Err(err) => {
+                        continued = false;
+                        callback_error = Some(err);
+                        Ok(false)
+                    }
                 }
-                Err(err) => {
-                    continued = false;
-                    callback_error = Some(err);
-                    Ok(false)
-                }
-            }
-        },
-    );
+            },
+        ))?;
+        ctx.synchronize()?;
+        Ok(())
+    })();
 
     if let Some(err) = callback_error {
         return Err(err);
@@ -414,8 +420,8 @@ fn null_column(
     num_rows: usize,
 ) -> datafusion::common::Result<CuDFColumn> {
     let scalar = normalize_scalar_for_cudf(ScalarValue::try_new_null(data_type)?)?;
-    let scalar = CuDFScalar::from_arrow_host(scalar.to_scalar()?).map_err(cudf_to_df)?;
-    CuDFColumn::from_scalar(&scalar, num_rows).map_err(cudf_to_df)
+    let scalar = execute_cudf(CuDFScalar::from_arrow_host(scalar.to_scalar()?))?;
+    execute_cudf(CuDFColumn::from_scalar(&scalar, num_rows))
 }
 
 fn parquet_batch_row_count(batch: &FileBatch) -> datafusion::common::Result<usize> {

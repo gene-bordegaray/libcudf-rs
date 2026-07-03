@@ -5,6 +5,7 @@
 
 mod decimal;
 mod errors;
+mod execution;
 mod expr;
 mod metrics;
 mod physical;

@@ -7,7 +7,10 @@ use libcudf_sys::ffi;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum CuDFStreamFlags {
-    /// Create a stream that synchronizes with the default stream.
+    /// Create an owned stream with CUDA's default synchronization behavior.
+    ///
+    /// This is not the legacy default stream itself, it is a separate stream
+    /// that synchronizes with default-stream work according to CUDA rules.
     SyncDefault = 0,
     /// Create a non-blocking stream that does not synchronize with the default stream.
     NonBlocking = 1,
@@ -19,79 +22,99 @@ impl From<CuDFStreamFlags> for u32 {
     }
 }
 
-/// Owning Rust wrapper for a CUDA stream used by cuDF operations.
+/// Owned CUDA stream used by cuDF operations.
 ///
-/// For the default stream, use [`ffi::get_default_stream`] to get the default stream
-/// view instead.
-///
-/// This type owns an opaque C++ `rmm::cuda_stream`. Dropping `CuDFStream`
-/// destroys that underlying stream.
+/// Most callers should use [`CuDFExecutionContext`](crate::CuDFExecutionContext)
+/// to submit work. Use `CuDFStream` directly when constructing a context from a
+/// specific owned stream.
 ///
 /// The handle may be shared across host threads. Work enqueued onto the same
 /// stream executes in order; sharing the handle does not by itself synchronize
 /// access to GPU memory used by those operations.
 pub struct CuDFStream {
-    // Kept alive so the underlying C++ `rmm::cuda_stream` is destroyed on
-    // drop. Accessed via `inner()` from within the crate.
     inner: UniquePtr<libcudf_sys::ffi::CudaStream>,
+    device_id: i32,
 }
 
 impl CuDFStream {
-    /// Try to create a stream using the sync-default creation flag.
+    /// Creates an owned stream with [`CuDFStreamFlags::SyncDefault`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if CUDA cannot create the stream or report the current
+    /// device.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use libcudf_rs::{CuDFExecutionContext, CuDFStream};
+    ///
+    /// let stream = CuDFStream::try_new()?;
+    /// let ctx = CuDFExecutionContext::try_from_stream(stream)?;
+    /// ctx.synchronize()?;
+    /// # Ok::<(), libcudf_rs::CuDFError>(())
+    /// ```
     pub fn try_new() -> Result<Self> {
         Ok(Self {
-            inner: libcudf_sys::ffi::cuda_stream_create()?,
+            inner: ffi::cuda_stream_create()?,
+            device_id: ffi::cuda_get_device()?,
         })
     }
 
-    /// Create a stream using the sync-default creation flag.
-    pub fn new() -> Self {
-        Self::try_new().expect("failed to create CUDA stream")
-    }
-
-    /// Try to create a stream with explicit creation flags.
+    /// Creates an owned stream with explicit CUDA stream creation flags.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if CUDA cannot create the stream or report the current
+    /// device.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use libcudf_rs::{CuDFExecutionContext, CuDFStream, CuDFStreamFlags};
+    ///
+    /// let stream = CuDFStream::try_with_flags(CuDFStreamFlags::NonBlocking)?;
+    /// let ctx = CuDFExecutionContext::try_from_stream(stream)?;
+    /// ctx.synchronize()?;
+    /// # Ok::<(), libcudf_rs::CuDFError>(())
+    /// ```
     pub fn try_with_flags(flags: CuDFStreamFlags) -> Result<Self> {
         Ok(Self {
-            inner: libcudf_sys::ffi::cuda_stream_create_with_flags(flags.into())?,
+            inner: ffi::cuda_stream_create_with_flags(flags.into())?,
+            device_id: ffi::cuda_get_device()?,
         })
     }
 
-    /// Create a stream with explicit creation flags.
-    pub fn with_flags(flags: CuDFStreamFlags) -> Self {
-        Self::try_with_flags(flags).expect("failed to create CUDA stream")
-    }
-
-    /// Block until all work submitted to this stream has completed.
+    /// Blocks until all work submitted to this stream has completed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if CUDA stream synchronization fails.
     pub fn synchronize(&self) -> Result<()> {
-        self.inner().synchronize()?;
+        self.inner()?.synchronize()?;
         Ok(())
     }
 
-    /// Returns an owned [ffi::CudaStreamView] for this stream.
-    #[allow(dead_code)]
-    pub(crate) fn view(&self) -> UniquePtr<ffi::CudaStreamView> {
-        ffi::cuda_stream_view(self.inner())
+    /// Returns an owned cuDF stream view for this stream.
+    pub(crate) fn view(&self) -> Result<UniquePtr<ffi::CudaStreamView>> {
+        Ok(ffi::cuda_stream_view(self.inner()?))
     }
 
-    /// Get a reference to the underlying FFI stream handle.
-    #[allow(dead_code)]
-    pub(crate) fn inner(&self) -> &libcudf_sys::ffi::CudaStream {
-        self.inner.as_ref().expect("CudaStream should not be null")
+    /// Returns the CUDA device that was current when this stream was created.
+    pub(crate) fn device_id(&self) -> i32 {
+        self.device_id
+    }
+
+    fn inner(&self) -> Result<&ffi::CudaStream> {
+        self.inner
+            .as_ref()
+            .ok_or(CuDFError::NullHandle("CUDA stream"))
     }
 }
 
 /// Return a non-null CUDA stream view reference from a cuDF FFI handle.
-///
-/// cuDF should always return a valid stream view; this surfaces a Rust error if
-/// the FFI handle is unexpectedly null.
 pub(crate) fn stream_ref(stream: &UniquePtr<ffi::CudaStreamView>) -> Result<&ffi::CudaStreamView> {
     stream
         .as_ref()
         .ok_or(CuDFError::NullHandle("CUDA stream view"))
-}
-
-impl Default for CuDFStream {
-    fn default() -> Self {
-        Self::new()
-    }
 }

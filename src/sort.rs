@@ -1,30 +1,30 @@
-use crate::device_resource::resource_ref;
-use crate::stream::stream_ref;
-use crate::{CuDFColumn, CuDFError, CuDFTable, CuDFTableView};
+use crate::execution_policy;
+use crate::{CuDFColumn, CuDFError, CuDFExecutionContext, CuDFTable, CuDFTableView};
+use arrow::error::ArrowError;
 use libcudf_sys::{ffi, NullOrder, Order};
 
-/// Sort options combining sort order and null precedence
+/// Sort direction and null precedence for cuDF table sorting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SortOrder {
-    /// Sort ascending with nulls first
+    /// Sort ascending with null values before non-null values.
     AscendingNullsFirst,
-    /// Sort ascending with nulls last
+    /// Sort ascending with null values after non-null values.
     AscendingNullsLast,
-    /// Sort descending with nulls first
+    /// Sort descending with null values before non-null values.
     DescendingNullsFirst,
-    /// Sort descending with nulls last
+    /// Sort descending with null values after non-null values.
     DescendingNullsLast,
 }
 
 impl SortOrder {
-    pub fn order(self) -> Order {
+    fn order(self) -> Order {
         match self {
             SortOrder::AscendingNullsFirst | SortOrder::AscendingNullsLast => Order::Ascending,
             SortOrder::DescendingNullsFirst | SortOrder::DescendingNullsLast => Order::Descending,
         }
     }
 
-    pub fn null_order(self) -> NullOrder {
+    fn null_order(self) -> NullOrder {
         match self {
             SortOrder::AscendingNullsFirst | SortOrder::DescendingNullsFirst => NullOrder::Before,
             SortOrder::AscendingNullsLast | SortOrder::DescendingNullsLast => NullOrder::After,
@@ -32,208 +32,128 @@ impl SortOrder {
     }
 }
 
-/// Sort a table by specified columns
-///
-/// Sorts the entire table based on the specified key columns.
-/// This operation uses a stable sort algorithm, preserving the relative order of equivalent rows.
-///
-/// # Arguments
-///
-/// * `table` - The table view to sort
-/// * `key_columns` - Indices of columns to sort by (in order of precedence)
-/// * `sort_orders` - Sort order for each key column, specifying both direction and null handling
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - The sort_orders length doesn't match key_columns length
-/// - Any key column index is out of bounds
-/// - There is insufficient GPU memory
-///
-/// # Examples
-///
-/// ```no_run
-/// use libcudf_rs::{CuDFTable, SortOrder, sort};
-///
-/// let table = CuDFTable::from_parquet("data.parquet")?;
-/// let view = table.into_view();
-///
-/// // Sort by column 0 ascending, then column 2 descending as tiebreaker
-/// let sorted = sort(&view, &[0, 2], &[SortOrder::AscendingNullsLast, SortOrder::DescendingNullsFirst])?;
-/// # Ok::<(), libcudf_rs::CuDFError>(())
-/// ```
-pub fn sort(
+pub(crate) fn sort_by_on_context(
+    ctx: &CuDFExecutionContext,
     table: &CuDFTableView,
     key_columns: &[usize],
     sort_orders: &[SortOrder],
 ) -> Result<CuDFTable, CuDFError> {
     if key_columns.is_empty() {
-        return Err(CuDFError::ArrowError(
-            arrow::error::ArrowError::InvalidArgumentError(
-                "key_columns cannot be empty".to_string(),
-            ),
-        ));
+        return Err(CuDFError::ArrowError(ArrowError::InvalidArgumentError(
+            "key_columns cannot be empty".to_string(),
+        )));
     }
 
-    if key_columns.len() != sort_orders.len() {
-        return Err(CuDFError::ArrowError(
-            arrow::error::ArrowError::InvalidArgumentError(format!(
-                "key_columns length ({}) must match sort_orders length ({})",
-                key_columns.len(),
-                sort_orders.len()
-            )),
-        ));
-    }
+    validate_sort_order_len("sort_by", key_columns.len(), sort_orders.len())?;
 
-    // Build keys table view from specified columns
     let key_views: Result<Vec<_>, _> = key_columns
         .iter()
-        .map(|&idx| {
-            if idx >= table.num_columns() {
-                Err(CuDFError::ArrowError(
-                    arrow::error::ArrowError::InvalidArgumentError(format!(
-                        "column index {idx} out of bounds (table has {} columns)",
-                        table.num_columns()
-                    )),
-                ))
-            } else {
-                Ok(table.column(idx as i32))
-            }
-        })
+        .map(|&column_index| table.column(column_index))
         .collect();
     let key_views = key_views?;
     let keys_view = CuDFTableView::from_column_views(key_views)?;
 
-    let column_order_i32: Vec<i32> = sort_orders.iter().map(|&o| o.order() as i32).collect();
-    let null_precedence_i32: Vec<i32> =
-        sort_orders.iter().map(|&o| o.null_order() as i32).collect();
-    let stream = ffi::get_default_stream();
-    let mr = ffi::get_current_device_resource_ref();
+    let (column_order, null_precedence) = encoded_sort_options(sort_orders);
+    let mut launch = execution_policy::launch(ctx)?;
+    launch.wait_table(table)?;
+    launch.wait_table(&keys_view)?;
 
     let inner = ffi::stable_sort_by_key(
         table.inner(),
         keys_view.inner(),
-        &column_order_i32,
-        &null_precedence_i32,
-        stream_ref(&stream)?,
-        resource_ref(&mr)?,
+        &column_order,
+        &null_precedence,
+        launch.stream()?,
+        launch.resource(),
     )?;
-    Ok(CuDFTable::from_inner(inner))
+    launch.ready_table(CuDFTable::from_inner(inner))
 }
 
-/// Sort a table by all columns in lexicographic order
-///
-/// Sorts the rows of the table according to the specified sort orders for ALL columns.
-/// This operation uses a stable sort algorithm, preserving the relative order of equivalent rows.
-///
-/// # Arguments
-///
-/// * `table` - The table view to sort
-/// * `sort_orders` - Sort order for each column, specifying both direction and null handling
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - The sort_orders length doesn't match the number of columns
-/// - There is insufficient GPU memory
-///
-/// # Examples
-///
-/// ```no_run
-/// use libcudf_rs::{CuDFTable, SortOrder, sort_by_all};
-///
-/// let table = CuDFTable::from_parquet("data.parquet")?;
-/// let view = table.into_view();
-///
-/// // Sort by first column ascending (nulls last), second column descending (nulls first)
-/// let sort_orders = vec![SortOrder::AscendingNullsLast, SortOrder::DescendingNullsFirst];
-/// let sorted = sort_by_all(&view, &sort_orders)?;
-/// # Ok::<(), libcudf_rs::CuDFError>(())
-/// ```
-pub fn sort_by_all(
+pub(crate) fn sort_by_all_on_context(
+    ctx: &CuDFExecutionContext,
     table: &CuDFTableView,
     sort_orders: &[SortOrder],
 ) -> Result<CuDFTable, CuDFError> {
-    let column_order_i32: Vec<i32> = sort_orders.iter().map(|&o| o.order() as i32).collect();
-    let null_precedence_i32: Vec<i32> =
-        sort_orders.iter().map(|&o| o.null_order() as i32).collect();
-    let stream = ffi::get_default_stream();
-    let mr = ffi::get_current_device_resource_ref();
+    validate_sort_order_len("sort_by_all", table.num_columns(), sort_orders.len())?;
+    let (column_order, null_precedence) = encoded_sort_options(sort_orders);
+    let mut launch = execution_policy::launch(ctx)?;
+    launch.wait_table(table)?;
 
     let inner = ffi::stable_sort_table(
         table.inner(),
-        &column_order_i32,
-        &null_precedence_i32,
-        stream_ref(&stream)?,
-        resource_ref(&mr)?,
+        &column_order,
+        &null_precedence,
+        launch.stream()?,
+        launch.resource(),
     )?;
-    Ok(CuDFTable::from_inner(inner))
+    launch.ready_table(CuDFTable::from_inner(inner))
 }
 
-/// Get the sorted order (indices) of a table
-///
-/// Returns a column of indices that would stably sort the table according to the specified sort orders.
-/// This is useful for implementing top-K or when you need the sort order without actually reordering the data.
-///
-/// # Arguments
-///
-/// * `table` - The table view to compute sort order for
-/// * `sort_orders` - Sort order for each column, specifying both direction and null handling
-///
-/// # Errors
-///
-/// Returns an error if there is insufficient GPU memory
-///
-/// # Examples
-///
-/// ```no_run
-/// use libcudf_rs::{CuDFTable, SortOrder, stable_sorted_order};
-///
-/// let table = CuDFTable::from_parquet("data.parquet")?;
-/// let view = table.into_view();
-///
-/// let sort_orders = vec![SortOrder::AscendingNullsLast, SortOrder::DescendingNullsFirst];
-/// let indices = stable_sorted_order(&view, &sort_orders)?;
-/// # Ok::<(), libcudf_rs::CuDFError>(())
-/// ```
-pub fn stable_sorted_order(
+pub(crate) fn stable_sorted_order_on_context(
+    ctx: &CuDFExecutionContext,
     table: &CuDFTableView,
     sort_orders: &[SortOrder],
 ) -> Result<CuDFColumn, CuDFError> {
-    let column_order_i32: Vec<i32> = sort_orders.iter().map(|&o| o.order() as i32).collect();
-    let null_precedence_i32: Vec<i32> =
-        sort_orders.iter().map(|&o| o.null_order() as i32).collect();
-    let stream = ffi::get_default_stream();
-    let mr = ffi::get_current_device_resource_ref();
+    validate_sort_order_len(
+        "stable_sorted_order",
+        table.num_columns(),
+        sort_orders.len(),
+    )?;
+    let (column_order, null_precedence) = encoded_sort_options(sort_orders);
+    let mut launch = execution_policy::launch(ctx)?;
+    launch.wait_table(table)?;
 
     let inner = ffi::stable_sorted_order(
         table.inner(),
-        &column_order_i32,
-        &null_precedence_i32,
-        stream_ref(&stream)?,
-        resource_ref(&mr)?,
+        &column_order,
+        &null_precedence,
+        launch.stream()?,
+        launch.resource(),
     )?;
-    Ok(CuDFColumn::new(inner))
+    launch.ready_column(CuDFColumn::from_inner(inner))
+}
+
+fn validate_sort_order_len(
+    operation: &str,
+    expected_columns: usize,
+    actual_orders: usize,
+) -> Result<(), CuDFError> {
+    if actual_orders == 0 || actual_orders == expected_columns {
+        return Ok(());
+    }
+
+    Err(CuDFError::ArrowError(ArrowError::InvalidArgumentError(
+        format!(
+            "{operation} expected either no sort orders or one per sorted column \
+             ({expected_columns}), got {actual_orders}"
+        ),
+    )))
+}
+
+fn encoded_sort_options(sort_orders: &[SortOrder]) -> (Vec<i32>, Vec<i32>) {
+    let column_order = sort_orders
+        .iter()
+        .map(|&order| order.order() as i32)
+        .collect();
+    let null_precedence = sort_orders
+        .iter()
+        .map(|&order| order.null_order() as i32)
+        .collect();
+    (column_order, null_precedence)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow::array::*;
+    use arrow::record_batch::RecordBatch;
 
     #[test]
     fn test_sort_ascending() -> Result<(), Box<dyn std::error::Error>> {
         let batch = record_batch!(("a", Int32, [3, 1, 4, 1, 5, 9, 2, 6]))?;
 
-        let table = CuDFTable::from_arrow_host(batch)?;
-        let view = table.into_view();
-
-        let sorted = sort(&view, &[0], &[SortOrder::AscendingNullsLast])?;
-        let result = sorted.into_view().to_arrow_host()?;
-
-        let col: &Int32Array = cast(result.column(0));
-
-        assert_eq!(col.values(), &[1, 1, 2, 3, 4, 5, 6, 9]);
+        let result = sort_by(batch, &[0], &[SortOrder::AscendingNullsLast])?;
+        assert_i32_column(&result, 0, &[1, 1, 2, 3, 4, 5, 6, 9]);
         Ok(())
     }
 
@@ -241,15 +161,8 @@ mod tests {
     fn test_sort_descending() -> Result<(), Box<dyn std::error::Error>> {
         let batch = record_batch!(("a", Int32, [3, 1, 4, 1, 5]))?;
 
-        let table = CuDFTable::from_arrow_host(batch)?;
-        let view = table.into_view();
-
-        let sorted = sort(&view, &[0], &[SortOrder::DescendingNullsLast])?;
-        let result = sorted.into_view().to_arrow_host()?;
-
-        let col: &Int32Array = cast(result.column(0));
-
-        assert_eq!(col.values(), &[5, 4, 3, 1, 1]);
+        let result = sort_by(batch, &[0], &[SortOrder::DescendingNullsLast])?;
+        assert_i32_column(&result, 0, &[5, 4, 3, 1, 1]);
         Ok(())
     }
 
@@ -260,24 +173,15 @@ mod tests {
             ("b", Int32, [10, 20, 30, 40, 50])
         )?;
 
-        let table = CuDFTable::from_arrow_host(batch)?;
-        let view = table.into_view();
-
-        // Sort by column A ascending, then column B ascending
-        let sorted = sort(
-            &view,
+        let result = sort_by(
+            batch,
             &[0, 1],
             &[SortOrder::AscendingNullsLast, SortOrder::AscendingNullsLast],
         )?;
-        let result = sorted.into_view().to_arrow_host()?;
-
-        let col_a: &Int32Array = cast(result.column(0));
-        let col_b: &Int32Array = cast(result.column(1));
 
         // Expected: First sort by A, then by B within same A values
         // (1, 20), (1, 40), (2, 50), (3, 10), (3, 30)
-        assert_eq!(col_a.values(), &[1, 1, 2, 3, 3]);
-        assert_eq!(col_b.values(), &[20, 40, 50, 10, 30]);
+        assert_i32_columns(&result, &[&[1, 1, 2, 3, 3], &[20, 40, 50, 10, 30]]);
         Ok(())
     }
 
@@ -288,20 +192,11 @@ mod tests {
             ("b", Int32, [10, 40, 30, 20, 50])
         )?;
 
-        let table = CuDFTable::from_arrow_host(batch)?;
-        let view = table.into_view();
-
-        // Sort by column A only - column B order should be preserved (stable sort)
-        let sorted = sort(&view, &[0], &[SortOrder::AscendingNullsLast])?;
-        let result = sorted.into_view().to_arrow_host()?;
-
-        let col_a: &Int32Array = cast(result.column(0));
-        let col_b: &Int32Array = cast(result.column(1));
+        let result = sort_by(batch, &[0], &[SortOrder::AscendingNullsLast])?;
 
         // Expected: Sort by A only, stable sort preserves original B order within same A
         // (1, 40), (1, 20), (2, 50), (3, 10), (3, 30)
-        assert_eq!(col_a.values(), &[1, 1, 2, 3, 3]);
-        assert_eq!(col_b.values(), &[40, 20, 50, 10, 30]);
+        assert_i32_columns(&result, &[&[1, 1, 2, 3, 3], &[40, 20, 50, 10, 30]]);
         Ok(())
     }
 
@@ -312,24 +207,42 @@ mod tests {
             ("b", Int32, [10, 40, 30, 20, 50])
         )?;
 
-        let table = CuDFTable::from_arrow_host(batch)?;
-        let view = table.into_view();
-
-        // Sort by all columns
-        let sorted = sort_by_all(
-            &view,
+        let result = sort_by_all(
+            batch,
             &[SortOrder::AscendingNullsLast, SortOrder::AscendingNullsLast],
         )?;
-        let result = sorted.into_view().to_arrow_host()?;
-
-        let col_a: &Int32Array = cast(result.column(0));
-        let col_b: &Int32Array = cast(result.column(1));
 
         // Expected: Sort by A first, then by B as tiebreaker
         // (1, 20), (1, 40), (2, 50), (3, 10), (3, 30)
-        assert_eq!(col_a.values(), &[1, 1, 2, 3, 3]);
-        assert_eq!(col_b.values(), &[20, 40, 50, 10, 30]);
+        assert_i32_columns(&result, &[&[1, 1, 2, 3, 3], &[20, 40, 50, 10, 30]]);
         Ok(())
+    }
+
+    fn sort_by(
+        batch: RecordBatch,
+        key_columns: &[usize],
+        orders: &[SortOrder],
+    ) -> Result<RecordBatch, CuDFError> {
+        let table = crate::execute_cudf(CuDFTable::from_arrow_host(batch))?;
+        let sorted = crate::execute_cudf(table.into_view().sort_by(key_columns, orders))?;
+        crate::execute_cudf(sorted.into_view().to_arrow_host())
+    }
+
+    fn sort_by_all(batch: RecordBatch, orders: &[SortOrder]) -> Result<RecordBatch, CuDFError> {
+        let table = crate::execute_cudf(CuDFTable::from_arrow_host(batch))?;
+        let sorted = crate::execute_cudf(table.into_view().sort_by_all(orders))?;
+        crate::execute_cudf(sorted.into_view().to_arrow_host())
+    }
+
+    fn assert_i32_columns(batch: &RecordBatch, expected_columns: &[&[i32]]) {
+        for (column, expected) in expected_columns.iter().enumerate() {
+            assert_i32_column(batch, column, expected);
+        }
+    }
+
+    fn assert_i32_column(batch: &RecordBatch, column: usize, expected: &[i32]) {
+        let col: &Int32Array = cast(batch.column(column));
+        assert_eq!(col.values(), expected);
     }
 
     fn cast<T: 'static + Array>(arr: &dyn Array) -> &T {

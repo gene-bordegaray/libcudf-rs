@@ -1,92 +1,48 @@
-//! Pinned host memory utilities for accelerating Arrow → GPU uploads.
-//!
-//! When the host source of a `cudaMemcpyAsync` is pageable memory (e.g. a Rust
-//! `Vec` or an arrow-rs default-allocator buffer), the CUDA driver must first
-//! stage the data through a single device-wide pinned staging buffer before
-//! kicking off the DMA. That staging step is synchronous. All `cudaMemcpyAsync`
-//! calls on a stream will serialize.
-//!
-//! When the source is page-locked ("pinned") memory allocated via
-//! `cudaMallocHost`, the driver can DMA directly from the source and the call
-//! is fully asynchronous.
 use crate::config::ensure_pools_configured;
-use crate::errors::Result;
-use crate::stream::stream_ref;
+use crate::errors::{CuDFError, Result};
 use arrow::alloc::Allocation;
 use arrow::array::{make_array, ArrayData, ArrayDataBuilder, RecordBatch};
 use arrow::buffer::{BooleanBuffer, Buffer, NullBuffer};
 use cxx::UniquePtr;
-use libcudf_sys::ffi::{self, get_pinned_memory_resource, HostDeviceAsyncResourceRef};
+use libcudf_sys::ffi::{get_pinned_memory_resource, HostDeviceAsyncResourceRef};
 use std::ptr::NonNull;
 use std::sync::{Arc, OnceLock};
 
-/// Process-global handle to cuDF's pinned MR. Lazily initialized once;
-/// thereafter every alloc/dealloc reads through the same `&'static` handle.
-/// The underlying cuDF MR (a `pinned_pool_with_fallback_memory_resource`
-/// backed by `rmm::mr::pool_memory_resource`) is itself thread-safe.
-fn pinned_mr() -> &'static HostDeviceAsyncResourceRef {
-    static MR: OnceLock<UniquePtr<HostDeviceAsyncResourceRef>> = OnceLock::new();
-    MR.get_or_init(get_pinned_memory_resource)
-        .as_ref()
-        .expect("pinned MR is null")
-}
-
-/// RAII wrapper for a single pinned host allocation drawn from cuDF's pinned
-/// memory resource. The pool is process-global and shared with cuDF's own
-/// pinned-memory consumers (e.g. the download path).
-pub struct PinnedHostBuffer {
-    ptr: *mut u8,
-    bytes: usize,
-}
-
-// SAFETY: A pinned host allocation is plain memory addressable by both the
-// host and the device. There is no thread-affinity on the CUDA side, so the
-// buffer can be moved across threads.
-unsafe impl Send for PinnedHostBuffer {}
-unsafe impl Sync for PinnedHostBuffer {}
-
-impl PinnedHostBuffer {
-    /// Allocate `bytes` of pinned host memory from cuDF's pinned MR.
-    fn new(bytes: usize) -> Result<Self> {
-        let ptr = pinned_mr().allocate_sync(bytes)? as *mut u8;
-        Ok(Self { ptr, bytes })
-    }
-
-    /// Raw pointer to the start of the allocation.
-    fn as_ptr(&self) -> *mut u8 {
-        self.ptr
-    }
-}
-
-impl Drop for PinnedHostBuffer {
-    fn drop(&mut self) {
-        if !self.ptr.is_null() {
-            pinned_mr().deallocate_sync(self.ptr as usize, self.bytes);
-        }
-    }
-}
-
-/// Block until all GPU work submitted to cuDF's default stream has
-/// completed.
+/// Copies an Arrow `RecordBatch` into pinned host memory.
 ///
-/// Required after issuing an asynchronous upload from a pinned source if the
-/// source is about to be dropped, since `cudaMemcpyAsync` returns before the
-/// DMA has finished and the pinned buffer must outlive the transfer.
-pub fn synchronize_default_stream() -> Result<()> {
-    let stream = ffi::get_default_stream();
-    stream_ref(&stream)?.synchronize()?;
-    Ok(())
-}
-
-/// Return a copy of `batch` whose underlying buffers all live in pinned
-/// (page-locked) host memory.
+/// Pinned host memory lets CUDA copy Arrow buffers to the GPU asynchronously.
+/// Pageable Arrow buffers often require the CUDA driver to stage data through a
+/// temporary pinned buffer first, which can serialize uploads.
 ///
-/// The schema, lengths, offsets, and null counts of every column are
-/// preserved exactly; only the host-side storage of each leaf
-/// [`Buffer`] is replaced with a pinned-backed copy.
+/// The returned batch has the same schema, lengths, offsets, and null counts as
+/// `batch`. Only the storage backing each leaf [`Buffer`] is replaced. Empty
+/// buffers are passed through unchanged because zero-byte pinned allocations
+/// are not portable and have no data to copy.
 ///
-/// Empty buffers are passed through unchanged because `cudaMallocHost(0)` is
-/// not portable and a zero-byte buffer has no data to DMA.
+/// # Errors
+///
+/// Returns an error if pinned memory allocation fails or if the copied arrays
+/// cannot be rebuilt into a valid `RecordBatch`.
+///
+/// # Examples
+///
+/// ```no_run
+/// use arrow::array::Int32Array;
+/// use arrow::datatypes::{DataType, Field, Schema};
+/// use arrow::record_batch::RecordBatch;
+/// use libcudf_rs::pin_record_batch;
+/// use std::sync::Arc;
+///
+/// let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+/// let batch = RecordBatch::try_new(
+///     schema,
+///     vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+/// )?;
+///
+/// let pinned = pin_record_batch(batch)?;
+/// assert_eq!(pinned.num_rows(), 3);
+/// # Ok::<(), libcudf_rs::CuDFError>(())
+/// ```
 pub fn pin_record_batch(batch: RecordBatch) -> Result<RecordBatch> {
     ensure_pools_configured();
     let schema = batch.schema();
@@ -153,12 +109,56 @@ fn pin_buffer(buf: &Buffer) -> Result<Buffer> {
     // overlap (different allocations).
     unsafe {
         std::ptr::copy_nonoverlapping(buf.as_ptr(), dst, bytes);
+        let dst = NonNull::new(dst).ok_or(CuDFError::NullHandle("pinned allocation pointer"))?;
         Ok(Buffer::from_custom_allocation(
-            NonNull::new(dst).expect("pinned allocation pointer is non-null"),
+            dst,
             bytes,
             pinned as Arc<dyn Allocation>,
         ))
     }
+}
+
+/// Pinned host allocation owned by an Arrow custom buffer.
+pub(crate) struct PinnedHostBuffer {
+    ptr: *mut u8,
+    bytes: usize,
+}
+
+// SAFETY: A pinned host allocation is plain memory addressable by both the
+// host and the device. There is no thread-affinity on the CUDA side, so the
+// buffer can be moved across threads.
+unsafe impl Send for PinnedHostBuffer {}
+unsafe impl Sync for PinnedHostBuffer {}
+
+impl PinnedHostBuffer {
+    /// Allocate `bytes` of pinned host memory from cuDF's pinned MR.
+    fn new(bytes: usize) -> Result<Self> {
+        let ptr = pinned_mr()?.allocate_sync(bytes)? as *mut u8;
+        Ok(Self { ptr, bytes })
+    }
+
+    /// Raw pointer to the start of the allocation.
+    fn as_ptr(&self) -> *mut u8 {
+        self.ptr
+    }
+}
+
+impl Drop for PinnedHostBuffer {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            if let Ok(mr) = pinned_mr() {
+                mr.deallocate_sync(self.ptr as usize, self.bytes);
+            }
+        }
+    }
+}
+
+/// Process-global handle to cuDF's pinned host memory resource.
+fn pinned_mr() -> Result<&'static HostDeviceAsyncResourceRef> {
+    static MR: OnceLock<UniquePtr<HostDeviceAsyncResourceRef>> = OnceLock::new();
+    MR.get_or_init(get_pinned_memory_resource)
+        .as_ref()
+        .ok_or(CuDFError::NullHandle("pinned memory resource"))
 }
 
 #[cfg(test)]
@@ -224,7 +224,7 @@ mod tests {
     /// user `panic!` while a pinned batch is in flight should propagate
     /// cleanly without double-panic.
     #[test]
-    fn drop_during_unwinding_does_not_double_panic() {
+    fn drop_during_unwinding_does_not_double_panic() -> Result<()> {
         let result = std::panic::catch_unwind(|| {
             let _buf = PinnedHostBuffer::new(1024).expect("alloc");
             panic!("simulated user panic");
@@ -233,5 +233,6 @@ mod tests {
             result.is_err(),
             "outer panic should propagate to catch_unwind"
         );
+        Ok(())
     }
 }

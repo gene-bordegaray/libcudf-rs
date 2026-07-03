@@ -7,7 +7,7 @@ use self::reader::ParquetBatchReader;
 pub(crate) use self::scan_source::{
     CuDFParquetSource, CuDFParquetSourceBuilder, CuDFParquetSourceError, RowGroupSelection,
 };
-use crate::errors::cudf_to_df;
+use crate::execution::execute_cudf;
 use crate::metrics::CuDFBaselineMetrics;
 use crate::planner::{
     DEFAULT_PARQUET_SCAN_CHUNK_READ_LIMIT, DEFAULT_PARQUET_SCAN_FILES_PER_BATCH,
@@ -27,7 +27,7 @@ use datafusion_physical_plan::stream::RecordBatchReceiverStream;
 use datafusion_physical_plan::{
     project_schema, DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
 };
-use libcudf_rs::{cast, synchronize_default_stream, CuDFAstExpression};
+use libcudf_rs::CuDFAstExpression;
 use std::any::Any;
 use std::fmt::Formatter;
 use std::sync::Arc;
@@ -319,16 +319,12 @@ fn build_record_batch(
         let column: ArrayRef = if view.data_type() == field.data_type() {
             Arc::new(view)
         } else {
-            let casted = cast(&view, field.data_type()).map_err(cudf_to_df)?;
+            let casted = execute_cudf(view.cast(field.data_type()))?;
             Arc::new(casted.into_view())
         };
         cudf_cols.push(column);
     }
     cast_timer.done();
-
-    let sync_timer = metrics.sync_time.timer();
-    synchronize_default_stream().map_err(cudf_to_df)?;
-    sync_timer.done();
 
     let output_batch_timer = metrics.output_batch_time.timer();
     let batch = libcudf_rs::record_batch_with_schema(cudf_cols, schema, parquet_batch.num_rows)?;
@@ -343,7 +339,6 @@ struct ScanMetrics {
     baseline: CuDFBaselineMetrics,
     read_time: Time,
     cast_time: Time,
-    sync_time: Time,
     output_batch_time: Time,
     output_send_time: Time,
     files: Count,
@@ -356,7 +351,6 @@ impl ScanMetrics {
             baseline: CuDFBaselineMetrics::new(metrics, partition),
             read_time: MetricBuilder::new(metrics).subset_time("read_time", partition),
             cast_time: MetricBuilder::new(metrics).subset_time("cast_time", partition),
-            sync_time: MetricBuilder::new(metrics).subset_time("sync_time", partition),
             output_batch_time: MetricBuilder::new(metrics)
                 .subset_time("output_batch_time", partition),
             output_send_time: MetricBuilder::new(metrics)
@@ -375,6 +369,7 @@ impl ScanMetrics {
 #[cfg(test)]
 mod tests {
     use super::{CuDFParquetScanConfig, CuDFParquetScanExec, CuDFParquetSourceBuilder};
+    use crate::execution::execute_cudf;
     use arrow::array::{Array, ArrayRef, Int32Array, Scalar};
     use arrow::record_batch::RecordBatch;
     use arrow_schema::{DataType, Field, Schema};
@@ -588,12 +583,14 @@ mod tests {
         column: &str,
         value: i32,
     ) -> Result<CuDFAstExpression, Box<dyn std::error::Error>> {
-        let mut filter = CuDFAstExpression::new();
+        let mut filter = CuDFAstExpression::builder();
         let column = filter.column_name_reference(column)?;
-        let value = CuDFScalar::from_arrow_host(Scalar::new(&Int32Array::from(vec![value])))?;
+        let value = execute_cudf(CuDFScalar::from_arrow_host(Scalar::new(&Int32Array::from(
+            vec![value],
+        ))))?;
         let value = filter.literal(value)?;
         filter.binary_operation(CuDFAstOperator::Greater, column, value)?;
-        Ok(filter)
+        Ok(filter.finish())
     }
 
     fn cudf_i32_values(column: &ArrayRef) -> Result<Vec<Option<i32>>, Box<dyn std::error::Error>> {
@@ -601,7 +598,7 @@ mod tests {
             .as_any()
             .downcast_ref::<CuDFColumnView>()
             .expect("parquet scan should return cuDF columns");
-        let host = column.to_arrow_host()?;
+        let host = execute_cudf(column.to_arrow_host())?;
         let ints = host
             .as_any()
             .downcast_ref::<Int32Array>()

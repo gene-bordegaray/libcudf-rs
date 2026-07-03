@@ -2,7 +2,7 @@ use arrow_schema::{DataType, TimeUnit};
 use cxx::UniquePtr;
 use libcudf_sys::ffi;
 
-// cuDF type IDs - from https://docs.rapids.ai/api/libcudf/stable/types_8hpp_source
+// Numeric values mirror cudf::type_id in the local cuDF header.
 const TYPE_EMPTY: i32 = 0;
 const TYPE_INT8: i32 = 1;
 const TYPE_INT16: i32 = 2;
@@ -33,44 +33,34 @@ const TYPE_DECIMAL64: i32 = 26;
 const TYPE_DECIMAL128: i32 = 27;
 const TYPE_STRUCT: i32 = 28;
 
-/// Convert Arrow DataType to cuDF DataType object
-///
-/// Creates a cuDF DataType with full metadata (including scale for decimals).
-///
-/// # Returns
-///
-/// Returns a UniquePtr<DataType> for the cuDF data type, or None if not supported.
+/// Converts an Arrow type to a cuDF data type, including decimal scale metadata.
 pub(crate) fn arrow_type_to_cudf_data_type(
     arrow_type: &DataType,
 ) -> Option<UniquePtr<ffi::DataType>> {
     match arrow_type {
-        // For decimals, negate the scale because Arrow and CuDF use opposite sign conventions:
-        // - Arrow: scale=2 means 2 decimal places (e.g., 123 with scale=2 -> 1.23)
-        // - CuDF: scale=-2 means value * 10^(-2) (e.g., 123 with scale=-2 -> 1.23)
-        // Therefore when converting Arrow -> CuDF: arrow_scale=2 -> cudf_scale=-2
-        DataType::Decimal32(_, scale) => {
-            Some(ffi::new_data_type_with_scale(TYPE_DECIMAL32, -scale as i32))
-        }
-        DataType::Decimal64(_, scale) => {
-            Some(ffi::new_data_type_with_scale(TYPE_DECIMAL64, -scale as i32))
-        }
+        // Arrow and cuDF fixed-point scales use opposite signs.
+        DataType::Decimal32(_, scale) => Some(ffi::new_data_type_with_scale(
+            TYPE_DECIMAL32,
+            -i32::from(*scale),
+        )),
+        DataType::Decimal64(_, scale) => Some(ffi::new_data_type_with_scale(
+            TYPE_DECIMAL64,
+            -i32::from(*scale),
+        )),
         DataType::Decimal128(_, scale) => Some(ffi::new_data_type_with_scale(
             TYPE_DECIMAL128,
-            -scale as i32,
+            -i32::from(*scale),
         )),
-        _ => arrow_type_to_cudf(arrow_type).map(ffi::new_data_type),
+        _ => arrow_type_to_cudf_type_id(arrow_type).map(ffi::new_data_type),
     }
 }
 
-/// Convert Arrow DataType to cuDF type ID
-///
-/// Maps Arrow data types to their corresponding cuDF type identifiers.
-///
-/// # Returns
-///
-/// Returns `Some(i32)` if the Arrow type has a direct cuDF equivalent,
-/// `None` if the type is not supported by cuDF.
-pub(crate) fn arrow_type_to_cudf(dtype: &DataType) -> Option<i32> {
+/// Returns true if the Arrow type has a direct cuDF type mapping.
+pub(crate) fn is_arrow_type_supported_by_cudf(dtype: &DataType) -> bool {
+    arrow_type_to_cudf_type_id(dtype).is_some()
+}
+
+fn arrow_type_to_cudf_type_id(dtype: &DataType) -> Option<i32> {
     match dtype {
         DataType::Int8 => Some(TYPE_INT8),
         DataType::Int16 => Some(TYPE_INT16),
@@ -98,19 +88,14 @@ pub(crate) fn arrow_type_to_cudf(dtype: &DataType) -> Option<i32> {
         DataType::LargeList(_) => Some(TYPE_LIST),
         DataType::Struct(_) => Some(TYPE_STRUCT),
         DataType::Dictionary(_, _) => Some(TYPE_DICTIONARY32),
+        DataType::Decimal32(_, _) => Some(TYPE_DECIMAL32),
+        DataType::Decimal64(_, _) => Some(TYPE_DECIMAL64),
         DataType::Decimal128(_, _) => Some(TYPE_DECIMAL128),
         _ => None,
     }
 }
 
-/// Convert cuDF type ID to Arrow DataType
-///
-/// Maps cuDF type identifiers to their corresponding Arrow data types.
-///
-/// # Returns
-///
-/// Returns `Some(DataType)` for simple types, `None` for complex types
-/// that require additional metadata (precision, scale, child types, etc.)
+/// Converts a cuDF data type to Arrow when the Arrow type can be reconstructed locally.
 pub(crate) fn cudf_type_to_arrow(typ: &UniquePtr<ffi::DataType>) -> Option<DataType> {
     match typ.id() {
         TYPE_EMPTY => None,
@@ -138,18 +123,10 @@ pub(crate) fn cudf_type_to_arrow(typ: &UniquePtr<ffi::DataType>) -> Option<DataT
         TYPE_DICTIONARY32 => None,
         TYPE_STRING => Some(DataType::Utf8),
         TYPE_LIST => None,
-        // Precision is derived from the representation type (int32/int64/int128).
-        // See https://github.com/rapidsai/cudf/blob/main/cpp/include/cudf/types.hpp#L267-275
-        //
-        // Scale sign must be negated because CuDF and Arrow use opposite conventions:
-        // - CuDF: scale=-2 means value * 10^(-2), so 123 with scale=-2 -> 1.23
-        //   See https://github.com/rapidsai/cudf/blob/main/cpp/include/cudf/fixed_point/fixed_point.hpp#L578-590
-        // - Arrow: scale=2 means 2 decimal places, so 123 with scale=2 -> 1.23
-        //   See https://docs.rs/arrow/latest/arrow/datatypes/enum.DataType.html (Decimal256 docs)
-        // Therefore: cudf_scale=-2 -> arrow_scale=2
-        TYPE_DECIMAL32 => Some(DataType::Decimal32(9, -typ.scale() as i8)),
-        TYPE_DECIMAL64 => Some(DataType::Decimal64(18, -typ.scale() as i8)),
-        TYPE_DECIMAL128 => Some(DataType::Decimal128(38, -typ.scale() as i8)),
+        // Arrow and cuDF fixed-point scales use opposite signs.
+        TYPE_DECIMAL32 => Some(DataType::Decimal32(9, (-typ.scale()) as i8)),
+        TYPE_DECIMAL64 => Some(DataType::Decimal64(18, (-typ.scale()) as i8)),
+        TYPE_DECIMAL128 => Some(DataType::Decimal128(38, (-typ.scale()) as i8)),
         TYPE_STRUCT => None,
         _ => None,
     }

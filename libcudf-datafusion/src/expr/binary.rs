@@ -1,5 +1,5 @@
 use crate::decimal::{decimal_div, is_decimal_division};
-use crate::errors::cudf_to_df;
+use crate::execution::execute_cudf;
 use crate::expr::{columnar_value_to_cudf, cudf_to_columnar_value, expr_to_cudf_expr};
 use arrow::array::RecordBatch;
 use arrow_schema::{DataType, FieldRef, Schema};
@@ -9,7 +9,7 @@ use datafusion::physical_expr::expressions::BinaryExpr;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion_expr::Operator;
 use delegate::delegate;
-use libcudf_rs::{cudf_binary_op, CuDFBinaryOp};
+use libcudf_rs::CuDFBinaryOp;
 use std::any::Any;
 use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
@@ -90,7 +90,7 @@ impl PhysicalExpr for CuDFBinaryExpr {
         {
             decimal_div(lhs, rhs, &lhs_type, &rhs_type, &cudf_output_type)?
         } else {
-            cudf_binary_op(lhs, rhs, self.op, &cudf_output_type).map_err(cudf_to_df)?
+            execute_cudf(lhs.binary_op(rhs, self.op, &cudf_output_type))?
         };
         Ok(cudf_to_columnar_value(result))
     }

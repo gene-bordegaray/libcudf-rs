@@ -1,4 +1,4 @@
-use crate::errors::cudf_to_df;
+use crate::execution::execute_cudf;
 use crate::physical::aggregate::op::udf::CuDFAggregateUDF;
 use crate::physical::aggregate::{CuDFAggregationOp, ExprKey, ReusableStateKey};
 use arrow_schema::{DataType, SchemaRef};
@@ -75,8 +75,8 @@ impl CuDFAggregationOp for CuDFCount {
 
     fn normalize_partial_state(&self, mut cols: Vec<CuDFColumn>) -> Result<Vec<CuDFColumn>> {
         // cuDF COUNT returns Int32 -> cast to Int64 to match merge_requests (SUM) output type
-        let casted =
-            libcudf_rs::cast(&cols.remove(0).into_view(), &DataType::Int64).map_err(cudf_to_df)?;
+        let state = cols.remove(0).into_view();
+        let casted = execute_cudf(state.cast(&DataType::Int64))?;
         Ok(vec![casted])
     }
 
@@ -92,7 +92,7 @@ impl CuDFAggregationOp for CuDFCount {
             );
         }
         // cuDF COUNT returns Int32, DataFusion expects Int64
-        let casted = libcudf_rs::cast(&state_cols[0], &DataType::Int64).map_err(cudf_to_df)?;
+        let casted = execute_cudf(state_cols[0].cast(&DataType::Int64))?;
         Ok(casted.into_view())
     }
 }

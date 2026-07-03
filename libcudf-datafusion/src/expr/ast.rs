@@ -1,7 +1,8 @@
 use crate::errors::cudf_to_df;
+use crate::execution::execute_cudf;
 use crate::physical::normalize_scalar_for_cudf;
 use arrow_schema::{DataType, Schema};
-use datafusion::common::{not_impl_err, JoinSide};
+use datafusion::common::{internal_err, not_impl_err, JoinSide};
 use datafusion::error::DataFusionError;
 use datafusion::physical_expr::expressions::{
     BinaryExpr, CastExpr, Column, IsNotNullExpr, IsNullExpr, Literal, NotExpr,
@@ -10,7 +11,8 @@ use datafusion::physical_expr::PhysicalExpr;
 use datafusion_expr::Operator;
 use datafusion_physical_plan::joins::utils::{ColumnIndex, JoinFilter};
 use libcudf_rs::{
-    CuDFAstExpression, CuDFAstNode, CuDFAstOperator, CuDFAstTableReference, CuDFScalar,
+    CuDFAstExpression, CuDFAstExpressionBuilder, CuDFAstNode, CuDFAstOperator,
+    CuDFAstTableReference, CuDFScalar,
 };
 
 /// cuDF AST filter plus the file-schema columns it reads.
@@ -34,12 +36,12 @@ pub(crate) fn join_filter_to_cudf_ast(
         return not_impl_err!("Join filter expression must evaluate to Boolean for cuDF AST");
     }
 
-    let mut ast = CuDFAstExpression::new();
+    let mut ast = CuDFAstExpression::builder();
     let mut resolver = JoinColumnResolver {
         column_indices: filter.column_indices(),
     };
     lower_expr(filter.expression().as_ref(), &mut resolver, &mut ast)?;
-    Ok(ast)
+    Ok(ast.finish())
 }
 
 pub(crate) fn is_join_filter_supported_by_cudf_ast(
@@ -69,12 +71,12 @@ pub(crate) fn parquet_filter_to_cudf_filter(
         return not_impl_err!("Parquet filter expression must evaluate to Boolean for cuDF AST");
     }
 
-    let mut ast = CuDFAstExpression::new();
+    let mut ast = CuDFAstExpression::builder();
     let mut resolver = ParquetColumnResolver::new(file_schema);
     lower_expr(filter, &mut resolver, &mut ast)?;
 
     Ok(CuDFParquetScanFilter {
-        expression: ast,
+        expression: ast.finish(),
         column_names: resolver.into_column_names(),
     })
 }
@@ -85,7 +87,7 @@ trait AstColumnResolver {
     fn lower_column(
         &mut self,
         column: &Column,
-        ast: &mut CuDFAstExpression,
+        ast: &mut CuDFAstExpressionBuilder,
     ) -> Result<CuDFAstNode, DataFusionError>;
 
     fn can_lower_column(&self, column: &Column) -> bool;
@@ -93,7 +95,7 @@ trait AstColumnResolver {
     fn lower_binary(
         &mut self,
         expr: &BinaryExpr,
-        ast: &mut CuDFAstExpression,
+        ast: &mut CuDFAstExpressionBuilder,
     ) -> Result<CuDFAstNode, DataFusionError>
     where
         Self: Sized,
@@ -111,7 +113,7 @@ trait AstColumnResolver {
     fn lower_cast(
         &mut self,
         cast: &CastExpr,
-        ast: &mut CuDFAstExpression,
+        ast: &mut CuDFAstExpressionBuilder,
     ) -> Result<CuDFAstNode, DataFusionError>
     where
         Self: Sized,
@@ -132,7 +134,7 @@ trait AstColumnResolver {
     fn lower_not(
         &mut self,
         not: &NotExpr,
-        ast: &mut CuDFAstExpression,
+        ast: &mut CuDFAstExpressionBuilder,
     ) -> Result<CuDFAstNode, DataFusionError>
     where
         Self: Sized,
@@ -152,7 +154,7 @@ trait AstColumnResolver {
     fn lower_is_null(
         &mut self,
         is_null: &IsNullExpr,
-        ast: &mut CuDFAstExpression,
+        ast: &mut CuDFAstExpressionBuilder,
     ) -> Result<CuDFAstNode, DataFusionError>
     where
         Self: Sized,
@@ -172,7 +174,7 @@ trait AstColumnResolver {
     fn lower_is_not_null(
         &mut self,
         is_not_null: &IsNotNullExpr,
-        ast: &mut CuDFAstExpression,
+        ast: &mut CuDFAstExpressionBuilder,
     ) -> Result<CuDFAstNode, DataFusionError>
     where
         Self: Sized,
@@ -205,7 +207,7 @@ impl AstColumnResolver for JoinColumnResolver<'_> {
     fn lower_column(
         &mut self,
         column: &Column,
-        ast: &mut CuDFAstExpression,
+        ast: &mut CuDFAstExpressionBuilder,
     ) -> Result<CuDFAstNode, DataFusionError> {
         let Some(ColumnIndex { index, side }) = self.column_indices.get(column.index()) else {
             return not_impl_err!(
@@ -250,7 +252,7 @@ impl<'a> ParquetColumnResolver<'a> {
     fn lower_column_arg(
         &mut self,
         expr: &dyn PhysicalExpr,
-        ast: &mut CuDFAstExpression,
+        ast: &mut CuDFAstExpressionBuilder,
     ) -> Result<CuDFAstNode, DataFusionError> {
         let Some(column) = expr.as_any().downcast_ref::<Column>() else {
             return unsupported_parquet_filter();
@@ -267,7 +269,7 @@ impl AstColumnResolver for ParquetColumnResolver<'_> {
     fn lower_column(
         &mut self,
         column: &Column,
-        ast: &mut CuDFAstExpression,
+        ast: &mut CuDFAstExpressionBuilder,
     ) -> Result<CuDFAstNode, DataFusionError> {
         let Some((name, data_type)) = parquet_column_name_and_type(column, self.file_schema) else {
             return unsupported_parquet_filter();
@@ -289,13 +291,15 @@ impl AstColumnResolver for ParquetColumnResolver<'_> {
     fn lower_binary(
         &mut self,
         expr: &BinaryExpr,
-        ast: &mut CuDFAstExpression,
+        ast: &mut CuDFAstExpressionBuilder,
     ) -> Result<CuDFAstNode, DataFusionError> {
         match expr.op() {
             Operator::And | Operator::Or => {
                 let left = lower_expr(expr.left().as_ref(), self, ast)?;
                 let right = lower_expr(expr.right().as_ref(), self, ast)?;
-                let op = map_binary_op(expr.op()).expect("logical parquet op should map");
+                let Some(op) = map_binary_op(expr.op()) else {
+                    return internal_err!("logical parquet operator should map to cuDF AST");
+                };
                 ast.binary_operation(op, left, right).map_err(cudf_to_df)
             }
             Operator::Eq
@@ -311,7 +315,9 @@ impl AstColumnResolver for ParquetColumnResolver<'_> {
                 )?;
                 let left = lower_expr(expr.left().as_ref(), self, ast)?;
                 let right = lower_expr(expr.right().as_ref(), self, ast)?;
-                let op = map_binary_op(expr.op()).expect("comparison parquet op should map");
+                let Some(op) = map_binary_op(expr.op()) else {
+                    return internal_err!("comparison parquet operator should map to cuDF AST");
+                };
                 ast.binary_operation(op, left, right).map_err(cudf_to_df)
             }
             _ => unsupported_parquet_filter(),
@@ -344,7 +350,7 @@ impl AstColumnResolver for ParquetColumnResolver<'_> {
     fn lower_cast(
         &mut self,
         _cast: &CastExpr,
-        _ast: &mut CuDFAstExpression,
+        _ast: &mut CuDFAstExpressionBuilder,
     ) -> Result<CuDFAstNode, DataFusionError> {
         unsupported_parquet_filter()
     }
@@ -356,7 +362,7 @@ impl AstColumnResolver for ParquetColumnResolver<'_> {
     fn lower_not(
         &mut self,
         _not: &NotExpr,
-        _ast: &mut CuDFAstExpression,
+        _ast: &mut CuDFAstExpressionBuilder,
     ) -> Result<CuDFAstNode, DataFusionError> {
         unsupported_parquet_filter()
     }
@@ -368,7 +374,7 @@ impl AstColumnResolver for ParquetColumnResolver<'_> {
     fn lower_is_null(
         &mut self,
         is_null: &IsNullExpr,
-        ast: &mut CuDFAstExpression,
+        ast: &mut CuDFAstExpressionBuilder,
     ) -> Result<CuDFAstNode, DataFusionError> {
         let input = self.lower_column_arg(is_null.arg().as_ref(), ast)?;
         ast.unary_operation(CuDFAstOperator::IsNull, input)
@@ -386,7 +392,7 @@ impl AstColumnResolver for ParquetColumnResolver<'_> {
     fn lower_is_not_null(
         &mut self,
         is_not_null: &IsNotNullExpr,
-        ast: &mut CuDFAstExpression,
+        ast: &mut CuDFAstExpressionBuilder,
     ) -> Result<CuDFAstNode, DataFusionError> {
         let input = self.lower_column_arg(is_not_null.arg().as_ref(), ast)?;
         let is_null = ast
@@ -408,7 +414,7 @@ impl AstColumnResolver for ParquetColumnResolver<'_> {
 fn lower_expr(
     expr: &dyn PhysicalExpr,
     resolver: &mut impl AstColumnResolver,
-    ast: &mut CuDFAstExpression,
+    ast: &mut CuDFAstExpressionBuilder,
 ) -> Result<CuDFAstNode, DataFusionError> {
     let any = expr.as_any();
     if let Some(binary) = any.downcast_ref::<BinaryExpr>() {
@@ -558,7 +564,7 @@ fn unsupported_parquet_filter<T>() -> Result<T, DataFusionError> {
 fn lower_binary_expr(
     expr: &BinaryExpr,
     resolver: &mut impl AstColumnResolver,
-    ast: &mut CuDFAstExpression,
+    ast: &mut CuDFAstExpressionBuilder,
 ) -> Result<CuDFAstNode, DataFusionError> {
     let left = lower_expr(expr.left().as_ref(), resolver, ast)?;
     let right = lower_expr(expr.right().as_ref(), resolver, ast)?;
@@ -595,17 +601,17 @@ fn can_lower_binary_expr(expr: &BinaryExpr, resolver: &impl AstColumnResolver) -
 
 fn lower_literal_expr(
     literal: &Literal,
-    ast: &mut CuDFAstExpression,
+    ast: &mut CuDFAstExpressionBuilder,
 ) -> Result<CuDFAstNode, DataFusionError> {
     let value = normalize_scalar_for_cudf(literal.value().clone())?;
-    let scalar = CuDFScalar::from_arrow_host(value.to_scalar()?).map_err(cudf_to_df)?;
+    let scalar = execute_cudf(CuDFScalar::from_arrow_host(value.to_scalar()?))?;
     ast.literal(scalar).map_err(cudf_to_df)
 }
 
 fn lower_cast_expr(
     cast: &CastExpr,
     resolver: &mut impl AstColumnResolver,
-    ast: &mut CuDFAstExpression,
+    ast: &mut CuDFAstExpressionBuilder,
 ) -> Result<CuDFAstNode, DataFusionError> {
     let input = lower_expr(cast.expr().as_ref(), resolver, ast)?;
     let op = match cast.cast_type() {
@@ -647,6 +653,7 @@ mod tests {
         is_join_filter_supported_by_cudf_ast, join_filter_to_cudf_ast,
         parquet_filter_to_cudf_filter,
     };
+    use crate::execution::execute_cudf;
     use arrow::array::{Array, Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::common::{DataFusionError, JoinSide, ScalarValue};
@@ -813,7 +820,7 @@ mod tests {
                 Arc::new(Int32Array::from(values)),
             ],
         )?;
-        Ok(CuDFTable::from_arrow_host(batch)?)
+        Ok(execute_cudf(CuDFTable::from_arrow_host(batch))?)
     }
 
     fn make_nullable_table(
@@ -830,7 +837,7 @@ mod tests {
                 Arc::new(Int32Array::from(values)),
             ],
         )?;
-        Ok(CuDFTable::from_arrow_host(batch)?)
+        Ok(execute_cudf(CuDFTable::from_arrow_host(batch))?)
     }
 
     fn filter_schema() -> Arc<Schema> {
@@ -927,6 +934,6 @@ mod tests {
             build_out_cols: Some(&[1]),
             probe_out_cols: Some(&[1]),
         })?;
-        Ok(result.into_view().to_arrow_host()?)
+        Ok(execute_cudf(result.into_view().to_arrow_host())?)
     }
 }
