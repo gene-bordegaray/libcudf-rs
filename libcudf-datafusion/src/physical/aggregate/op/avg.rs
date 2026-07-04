@@ -15,8 +15,7 @@ use datafusion_expr::AggregateUDF;
 use datafusion_physical_plan::aggregates::AggregateMode;
 use datafusion_physical_plan::PhysicalExpr;
 use libcudf_rs::{
-    AggregationOp, AggregationRequest, CuDFBinaryOp, CuDFColumn, CuDFColumnView,
-    CuDFColumnViewOrScalar,
+    Aggregation, CuDFBinaryOp, CuDFColumn, CuDFColumnView, CuDFColumnViewOrScalar, GroupByRequest,
 };
 use std::sync::Arc;
 
@@ -88,16 +87,14 @@ impl CuDFAggregationOp for CuDFAvg {
         }))
     }
 
-    fn partial_requests(&self, args: &[CuDFColumnView]) -> Result<Vec<AggregationRequest>> {
+    fn partial_requests(&self, args: &[CuDFColumnView]) -> Result<Vec<GroupByRequest>> {
         if args.len() != 1 {
             return exec_err!("AVG expects 1 argument, got {}", args.len());
         }
 
-        let mut request = AggregationRequest::from_column_view(args[0].clone());
-        request.add(AggregationOp::COUNT.group_by());
-        request.add(AggregationOp::SUM.group_by());
-
-        Ok(vec![request])
+        Ok(vec![GroupByRequest::new(args[0].clone())
+            .with(Aggregation::Count)
+            .with(Aggregation::Sum)])
     }
 
     fn normalize_partial_state(&self, mut cols: Vec<CuDFColumn>) -> Result<Vec<CuDFColumn>> {
@@ -109,7 +106,7 @@ impl CuDFAggregationOp for CuDFAvg {
         Ok(vec![casted_count, sum])
     }
 
-    fn merge_requests(&self, state_cols: &[CuDFColumnView]) -> Result<Vec<AggregationRequest>> {
+    fn merge_requests(&self, state_cols: &[CuDFColumnView]) -> Result<Vec<GroupByRequest>> {
         if state_cols.len() != 2 {
             return exec_err!(
                 "AVG merge expects 2 state columns, got {}",
@@ -117,13 +114,10 @@ impl CuDFAggregationOp for CuDFAvg {
             );
         }
 
-        let mut count_request = AggregationRequest::from_column_view(state_cols[0].clone());
-        count_request.add(AggregationOp::SUM.group_by());
-
-        let mut sum_request = AggregationRequest::from_column_view(state_cols[1].clone());
-        sum_request.add(AggregationOp::SUM.group_by());
-
-        Ok(vec![count_request, sum_request])
+        Ok(vec![
+            GroupByRequest::new(state_cols[0].clone()).with(Aggregation::Sum),
+            GroupByRequest::new(state_cols[1].clone()).with(Aggregation::Sum),
+        ])
     }
 
     fn finalize(

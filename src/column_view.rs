@@ -18,9 +18,10 @@ use std::sync::{Arc, OnceLock};
 /// owning cuDF object alive so the referenced GPU buffers remain valid, and it
 /// implements Arrow's [`Array`] trait for interoperability with Arrow APIs.
 pub struct CuDFColumnView {
-    // Keep backing storage alive so the view remains valid.
-    storage: Option<CuDFViewStorage>,
+    // Non-owning cuDF view. Keep this before `storage` so it drops first.
     inner: UniquePtr<ffi::ColumnView>,
+    // Backing owner for the buffers referenced by `inner`.
+    storage: Option<CuDFViewStorage>,
     dt: DataType,
     null_buf: OnceLock<Option<NullBuffer>>,
     stream_readiness: Option<CuDFStreamDependency>,
@@ -36,8 +37,8 @@ impl CuDFColumnView {
         let dt = cudf_type_to_arrow(&cudf_dtype);
         let dt = dt.unwrap_or(DataType::Null);
         Self {
-            storage,
             inner,
+            storage,
             dt,
             null_buf: OnceLock::new(),
             stream_readiness,
@@ -57,8 +58,8 @@ impl CuDFColumnView {
     /// adjust cuDF's max-precision decimals with declared schema types.
     pub(crate) fn with_data_type(self, dt: DataType) -> Self {
         Self {
-            storage: self.storage,
             inner: self.inner,
+            storage: self.storage,
             dt,
             null_buf: self.null_buf,
             stream_readiness: self.stream_readiness,
@@ -202,8 +203,8 @@ impl Clone for CuDFColumnView {
     fn clone(&self) -> Self {
         let cloned_inner = self.inner.clone();
         Self {
-            storage: self.storage.clone(),
             inner: cloned_inner,
+            storage: self.storage.clone(),
             dt: self.dt.clone(),
             null_buf: self.null_buf.clone(),
             stream_readiness: self.stream_readiness.clone(),

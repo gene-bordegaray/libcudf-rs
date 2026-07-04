@@ -4,7 +4,7 @@ use arrow_schema::SchemaRef;
 use datafusion::error::Result;
 use datafusion_physical_plan::aggregates::AggregateMode;
 use datafusion_physical_plan::PhysicalExpr;
-use libcudf_rs::{AggregationRequest, CuDFColumn, CuDFColumnView};
+use libcudf_rs::{CuDFColumn, CuDFColumnView, GroupByRequest};
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -70,7 +70,7 @@ pub trait CuDFAggregationOp: Debug + Send + Sync {
     }
 
     /// Build cuDF aggregation requests for raw input data.
-    fn partial_requests(&self, args: &[CuDFColumnView]) -> Result<Vec<AggregationRequest>>;
+    fn partial_requests(&self, args: &[CuDFColumnView]) -> Result<Vec<GroupByRequest>>;
 
     /// Normalize state columns produced by `partial_requests` so their types are
     /// compatible with `merge_requests` for subsequent merge cycles, and match the
@@ -84,7 +84,7 @@ pub trait CuDFAggregationOp: Debug + Send + Sync {
     }
 
     /// Build cuDF aggregation requests that combine intermediate state columns.
-    fn merge_requests(&self, args: &[CuDFColumnView]) -> Result<Vec<AggregationRequest>>;
+    fn merge_requests(&self, args: &[CuDFColumnView]) -> Result<Vec<GroupByRequest>>;
 
     /// Convert merged state columns into the final output column.
     fn finalize(&self, args: &[CuDFColumnView], output_type: &DataType) -> Result<CuDFColumnView>;

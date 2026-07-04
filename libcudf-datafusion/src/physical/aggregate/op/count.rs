@@ -7,7 +7,7 @@ use datafusion::error::Result;
 use datafusion::functions_aggregate::count::Count;
 use datafusion_expr::AggregateUDF;
 use datafusion_physical_plan::PhysicalExpr;
-use libcudf_rs::{AggregationOp, AggregationRequest, CuDFColumn, CuDFColumnView};
+use libcudf_rs::{Aggregation, CuDFColumn, CuDFColumnView, GroupByRequest};
 use std::sync::Arc;
 
 pub fn count() -> Arc<AggregateUDF> {
@@ -45,22 +45,20 @@ impl CuDFAggregationOp for CuDFCount {
             .unwrap_or_default())
     }
 
-    fn partial_requests(&self, args: &[CuDFColumnView]) -> Result<Vec<AggregationRequest>> {
+    fn partial_requests(&self, args: &[CuDFColumnView]) -> Result<Vec<GroupByRequest>> {
         if args.len() != 1 {
             return exec_err!("COUNT expects 1 argument, got {}", args.len());
         }
 
-        let mut request = AggregationRequest::from_column_view(args[0].clone());
-        let op = if self.count_nulls {
-            AggregationOp::COUNT_ALL
+        let aggregation = if self.count_nulls {
+            Aggregation::CountAll
         } else {
-            AggregationOp::COUNT
+            Aggregation::Count
         };
-        request.add(op.group_by());
-        Ok(vec![request])
+        Ok(vec![GroupByRequest::new(args[0].clone()).with(aggregation)])
     }
 
-    fn merge_requests(&self, state_cols: &[CuDFColumnView]) -> Result<Vec<AggregationRequest>> {
+    fn merge_requests(&self, state_cols: &[CuDFColumnView]) -> Result<Vec<GroupByRequest>> {
         if state_cols.len() != 1 {
             return exec_err!(
                 "COUNT merge expects 1 state column, got {}",
@@ -68,9 +66,9 @@ impl CuDFAggregationOp for CuDFCount {
             );
         }
 
-        let mut request = AggregationRequest::from_column_view(state_cols[0].clone());
-        request.add(AggregationOp::SUM.group_by());
-        Ok(vec![request])
+        Ok(vec![
+            GroupByRequest::new(state_cols[0].clone()).with(Aggregation::Sum)
+        ])
     }
 
     fn normalize_partial_state(&self, mut cols: Vec<CuDFColumn>) -> Result<Vec<CuDFColumn>> {

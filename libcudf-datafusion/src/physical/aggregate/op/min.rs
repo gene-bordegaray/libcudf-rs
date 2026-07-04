@@ -4,7 +4,7 @@ use datafusion::common::exec_err;
 use datafusion::error::Result;
 use datafusion::functions_aggregate::min_max::Min;
 use datafusion_expr::AggregateUDF;
-use libcudf_rs::{AggregationOp, AggregationRequest, CuDFColumnView};
+use libcudf_rs::{Aggregation, CuDFColumnView, GroupByRequest};
 use std::sync::Arc;
 
 pub fn min() -> Arc<AggregateUDF> {
@@ -20,24 +20,24 @@ impl CuDFAggregationOp for CuDFMin {
         1
     }
 
-    fn partial_requests(&self, args: &[CuDFColumnView]) -> Result<Vec<AggregationRequest>> {
+    fn partial_requests(&self, args: &[CuDFColumnView]) -> Result<Vec<GroupByRequest>> {
         if args.len() != 1 {
             return exec_err!("MIN expects 1 argument, got {}", args.len());
         }
 
-        let mut request = AggregationRequest::from_column_view(args[0].clone());
-        request.add(AggregationOp::MIN.group_by());
-        Ok(vec![request])
+        Ok(vec![
+            GroupByRequest::new(args[0].clone()).with(Aggregation::Min)
+        ])
     }
 
-    fn merge_requests(&self, state_cols: &[CuDFColumnView]) -> Result<Vec<AggregationRequest>> {
+    fn merge_requests(&self, state_cols: &[CuDFColumnView]) -> Result<Vec<GroupByRequest>> {
         if state_cols.len() != 1 {
             return exec_err!("MIN merge expects 1 state column, got {}", state_cols.len());
         }
 
-        let mut request = AggregationRequest::from_column_view(state_cols[0].clone());
-        request.add(AggregationOp::MIN.group_by());
-        Ok(vec![request])
+        Ok(vec![
+            GroupByRequest::new(state_cols[0].clone()).with(Aggregation::Min)
+        ])
     }
 
     fn finalize(
