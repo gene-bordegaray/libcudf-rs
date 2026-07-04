@@ -16,7 +16,7 @@ use datafusion_physical_plan::aggregates::{evaluate_group_by, evaluate_many, Agg
 use datafusion_physical_plan::PhysicalExpr;
 use futures::{ready, StreamExt};
 use libcudf_rs::{
-    record_batch_with_schema, CuDFColumn, CuDFColumnView, CuDFGroupBy, CuDFTable, CuDFTableView,
+    record_batch_with_schema, CuDFColumn, CuDFColumnView, CuDFTable, CuDFTableView, GroupByRequest,
 };
 use std::pin::Pin;
 use std::sync::Arc;
@@ -186,11 +186,10 @@ impl CuDFAggregateStream {
         let evaluated_args = self.evaluate_batch_arguments(&chunk)?;
         let requests = self.build_batch_requests(evaluated_args)?;
 
-        let (chunk_keys, chunk_results) = {
+        let (chunk_keys, mut chunk_state_columns) = {
             let _timer = self.group_by_metrics.aggregation_time.timer();
-            execute_cudf(group_by.aggregate(requests))?
+            execute_cudf(group_by.aggregate(requests))?.into_flat_columns()
         };
-        let mut chunk_state_columns = chunk_results.into_iter().flatten().collect();
 
         // Normalize partial state column types so they are compatible with merge_requests.
         if !matches!(
@@ -226,7 +225,7 @@ impl CuDFAggregateStream {
     fn build_batch_requests(
         &self,
         evaluated_args: Vec<Vec<CuDFColumnView>>,
-    ) -> Result<Vec<libcudf_rs::AggregationRequest>> {
+    ) -> Result<Vec<GroupByRequest>> {
         let mut requests = Vec::new();
 
         let use_merge = matches!(
@@ -294,12 +293,11 @@ impl CuDFAggregateStream {
         }
 
         // Re-aggregate
-        let group_by = CuDFGroupBy::from_table_view(combined_keys.into_view());
-        let (merged_keys, merged_results) = {
+        let group_by = combined_keys.into_view().group_by_all();
+        let (merged_keys, merged_state_columns) = {
             let _timer = self.group_by_metrics.aggregation_time.timer();
-            execute_cudf(group_by.aggregate(requests))?
+            execute_cudf(group_by.aggregate(requests))?.into_flat_columns()
         };
-        let merged_state_columns = merged_results.into_iter().flatten().collect();
 
         self.running = Some(RunningState {
             keys: merged_keys,
@@ -397,7 +395,7 @@ impl CuDFAggregateStream {
 
     /// Evaluate GROUP BY expressions on a batch and wrap the resulting key
     /// columns into a [`CuDFGroupBy`] for GPU aggregation.
-    fn evaluate_batch_groups(&self, batch: &RecordBatch) -> Result<CuDFGroupBy> {
+    fn evaluate_batch_groups(&self, batch: &RecordBatch) -> Result<libcudf_rs::CuDFGroupBy> {
         let _timer = self.group_by_metrics.time_calculating_group_ids.timer();
         let grouping_sets = evaluate_group_by(&self.prepared.group_by, batch)?;
 
@@ -418,7 +416,7 @@ impl CuDFAggregateStream {
 
         let table_view = CuDFTableView::from_column_views(column_views).map_err(cudf_to_df)?;
 
-        Ok(CuDFGroupBy::from_table_view(table_view))
+        Ok(table_view.group_by_all())
     }
 
     /// Evaluate each aggregate function's argument expressions on a batch,

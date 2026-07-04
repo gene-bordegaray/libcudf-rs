@@ -433,10 +433,13 @@ mod tests {
             .execute(crate::CuDFColumn::from_arrow_host(&values))?
             .into_view();
 
-        let group_by = crate::CuDFGroupBy::from_table_view(keys);
-        let mut request = crate::AggregationRequest::from_column_view(values);
-        request.add(crate::AggregationOp::SUM.group_by());
-        let (keys, results) = consumer.execute(group_by.aggregate([request]))?;
+        let group_by = keys.group_by_all();
+        let result =
+            consumer
+                .execute(group_by.aggregate([
+                    crate::GroupByRequest::new(values).with(crate::Aggregation::Sum),
+                ]))?;
+        let (keys, results) = result.into_parts();
         let sums = results
             .into_iter()
             .next()
