@@ -3,10 +3,11 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use datafusion::execution::TaskContext;
+use datafusion::prelude::SessionConfig;
 use datafusion_physical_plan::test::TestMemoryExec;
 use datafusion_physical_plan::{execute_stream, ExecutionPlan};
 use futures_util::TryStreamExt;
-use libcudf_datafusion::{CuDFLoadExec, CuDFUnloadExec};
+use libcudf_datafusion::{CuDFConfig, CuDFLoadExec, CuDFUnloadExec};
 use std::hint::black_box;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
@@ -65,7 +66,7 @@ fn unload_plan(gpu_batches: Vec<RecordBatch>) -> Arc<dyn ExecutionPlan> {
 }
 
 async fn drain(plan: Arc<dyn ExecutionPlan>) {
-    let ctx = Arc::new(TaskContext::default());
+    let ctx = cudf_task_context();
     black_box(
         execute_stream(plan, ctx)
             .unwrap()
@@ -77,13 +78,21 @@ async fn drain(plan: Arc<dyn ExecutionPlan>) {
 
 fn gpu_batches(rt: &Runtime, total_rows: usize) -> Vec<RecordBatch> {
     rt.block_on(async {
-        let ctx = Arc::new(TaskContext::default());
+        let ctx = cudf_task_context();
         execute_stream(load_plan(make_cpu_batches(total_rows)), ctx)
             .unwrap()
             .try_collect()
             .await
             .unwrap()
     })
+}
+
+fn cudf_task_context() -> Arc<TaskContext> {
+    Arc::new(
+        TaskContext::default().with_session_config(
+            SessionConfig::default().with_option_extension(CuDFConfig::default()),
+        ),
+    )
 }
 
 // Unpooled benchmarks must run first, pools are one-time global state.
