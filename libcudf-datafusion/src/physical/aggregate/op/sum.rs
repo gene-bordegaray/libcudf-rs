@@ -6,7 +6,7 @@ use datafusion::error::Result;
 use datafusion::functions_aggregate::sum::Sum;
 use datafusion_expr::AggregateUDF;
 use datafusion_physical_plan::PhysicalExpr;
-use libcudf_rs::{AggregationOp, AggregationRequest, CuDFColumnView};
+use libcudf_rs::{Aggregation, CuDFColumnView, GroupByRequest};
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -33,17 +33,17 @@ impl CuDFAggregationOp for CuDFSum {
             .unwrap_or_default())
     }
 
-    fn partial_requests(&self, args: &[CuDFColumnView]) -> Result<Vec<AggregationRequest>> {
+    fn partial_requests(&self, args: &[CuDFColumnView]) -> Result<Vec<GroupByRequest>> {
         if args.len() != 1 {
             return exec_err!("SUM expects 1 argument, received: {}", args.len());
         }
 
-        let mut request = AggregationRequest::from_column_view(args[0].clone());
-        request.add(AggregationOp::SUM.group_by());
-        Ok(vec![request])
+        Ok(vec![
+            GroupByRequest::new(args[0].clone()).with(Aggregation::Sum)
+        ])
     }
 
-    fn merge_requests(&self, state_cols: &[CuDFColumnView]) -> Result<Vec<AggregationRequest>> {
+    fn merge_requests(&self, state_cols: &[CuDFColumnView]) -> Result<Vec<GroupByRequest>> {
         if state_cols.len() != 1 {
             return exec_err!(
                 "SUM merge expects 1 state column, received: {}",
@@ -51,9 +51,9 @@ impl CuDFAggregationOp for CuDFSum {
             );
         }
 
-        let mut request = AggregationRequest::from_column_view(state_cols[0].clone());
-        request.add(AggregationOp::SUM.group_by());
-        Ok(vec![request])
+        Ok(vec![
+            GroupByRequest::new(state_cols[0].clone()).with(Aggregation::Sum)
+        ])
     }
 
     fn finalize(

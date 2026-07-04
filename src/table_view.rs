@@ -3,7 +3,8 @@ use crate::execution_policy;
 use crate::sort;
 use crate::stream_readiness::{CuDFStreamReady, CuDFTableReadiness};
 use crate::{
-    CuDFColumn, CuDFColumnView, CuDFError, CuDFOperation, CuDFTable, CuDFViewStorage, SortOrder,
+    CuDFColumn, CuDFColumnView, CuDFError, CuDFGroupBy, CuDFOperation, CuDFTable, CuDFViewStorage,
+    SortOrder,
 };
 use arrow_schema::ArrowError;
 use cxx::UniquePtr;
@@ -15,9 +16,10 @@ use std::sync::Arc;
 /// This is a safe wrapper around cuDF's table_view type.
 /// Views provide a lightweight way to reference table data without ownership.
 pub struct CuDFTableView {
-    // Keep backing storage alive so the view remains valid.
-    storage: Option<CuDFViewStorage>,
+    // Non-owning cuDF view. Keep this before `storage` so it drops first.
     inner: UniquePtr<ffi::TableView>,
+    // Backing owner for the buffers referenced by `inner`.
+    storage: Option<CuDFViewStorage>,
     stream_readiness: CuDFTableReadiness,
 }
 
@@ -28,8 +30,8 @@ impl CuDFTableView {
         stream_readiness: CuDFTableReadiness,
     ) -> Self {
         Self {
-            storage,
             inner,
+            storage,
             stream_readiness,
         }
     }
@@ -95,8 +97,8 @@ impl CuDFTableView {
         let num_columns = inner.num_columns();
         let storage: CuDFViewStorage = Arc::new(storage);
         Ok(Self {
-            storage: Some(storage),
             inner,
+            storage: Some(storage),
             stream_readiness: CuDFTableReadiness::columns(dependencies, num_columns),
         })
     }
@@ -247,6 +249,24 @@ impl CuDFTableView {
             Some(storage),
             CuDFTableReadiness::columns(dependencies, indices.len()),
         ))
+    }
+
+    /// Build a group-by operation from selected key columns.
+    ///
+    /// Rows with matching values in `key_columns` are grouped together.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any selected key column index is out of bounds.
+    pub fn group_by(&self, key_columns: &[usize]) -> Result<CuDFGroupBy, CuDFError> {
+        Ok(CuDFGroupBy::from_table_view(
+            self.select_columns(key_columns)?,
+        ))
+    }
+
+    /// Build a group-by operation using every column in this view as a key.
+    pub fn group_by_all(&self) -> CuDFGroupBy {
+        CuDFGroupBy::from_table_view(self.clone())
     }
 
     fn checked_column_index(&self, index: usize) -> Result<i32, CuDFError> {
@@ -473,8 +493,8 @@ impl CuDFTableView {
 impl Clone for CuDFTableView {
     fn clone(&self) -> Self {
         Self {
-            storage: self.storage.clone(),
             inner: self.inner.clone(),
+            storage: self.storage.clone(),
             stream_readiness: self.stream_readiness.clone(),
         }
     }
