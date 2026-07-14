@@ -25,6 +25,8 @@ pub mod ffi {
         include!("libcudf-sys/src/scalar.h");
         include!("libcudf-sys/src/ast.h");
         include!("libcudf-sys/src/table.h");
+        include!("libcudf-sys/src/interop.h");
+        include!("libcudf-sys/src/pinned_memory.h");
         include!("libcudf-sys/src/aggregation.h");
         include!("libcudf-sys/src/groupby.h");
         include!("libcudf-sys/src/io.h");
@@ -55,6 +57,12 @@ pub mod ffi {
         /// contain null values and have an associated data type.
         type Column;
 
+        /// Non-owning reference to a column owned by a table.
+        ///
+        /// This is the minimal cxx wrapper for `cudf::column const&` and must
+        /// not outlive its owning [`Table`].
+        type ColumnRef;
+
         /// Non-owning view of a column
         ///
         /// A column_view is a non-owning, immutable view of device data as a column of elements,
@@ -71,6 +79,80 @@ pub mod ffi {
         /// A scalar is a singular value of any of the supported data types in cuDF.
         /// Scalars can be valid or null.
         type Scalar;
+
+        /// Direct wrapper for `cudf::column_metadata`.
+        type ColumnMetadata;
+
+        /// Direct wrapper for `std::vector<cudf::column_metadata>`.
+        type ColumnMetadataVector;
+
+        /// Return the number of metadata entries.
+        fn len(self: &ColumnMetadataVector) -> usize;
+
+        /// Return whether there are no metadata entries.
+        fn is_empty(self: &ColumnMetadataVector) -> bool;
+
+        /// Return the metadata entry at `index` by value.
+        fn get(self: &ColumnMetadataVector, index: usize) -> Result<UniquePtr<ColumnMetadata>>;
+
+        /// Replace the metadata entry at `index`.
+        fn set(
+            self: Pin<&mut ColumnMetadataVector>,
+            index: usize,
+            metadata: &ColumnMetadata,
+        ) -> Result<()>;
+
+        /// Append one metadata entry.
+        fn push(self: Pin<&mut ColumnMetadataVector>, metadata: &ColumnMetadata);
+
+        /// Return the column name.
+        fn name(self: &ColumnMetadata) -> String;
+
+        /// Replace the column name.
+        fn set_name(self: Pin<&mut ColumnMetadata>, value: &str);
+
+        /// Return the column timezone.
+        fn timezone(self: &ColumnMetadata) -> String;
+
+        /// Replace the column timezone.
+        fn set_timezone(self: Pin<&mut ColumnMetadata>, value: &str);
+
+        /// Return whether decimal precision is present.
+        fn has_precision(self: &ColumnMetadata) -> bool;
+
+        /// Return decimal precision, or an error if it is absent.
+        fn precision(self: &ColumnMetadata) -> Result<i32>;
+
+        /// Set decimal precision.
+        fn set_precision(self: Pin<&mut ColumnMetadata>, value: i32);
+
+        /// Clear decimal precision.
+        fn clear_precision(self: Pin<&mut ColumnMetadata>);
+
+        /// Return the number of recursive child metadata entries.
+        fn children_len(self: &ColumnMetadata) -> usize;
+
+        /// Return a recursive child metadata entry by value.
+        fn child(self: &ColumnMetadata, index: usize) -> Result<UniquePtr<ColumnMetadata>>;
+
+        /// Replace a recursive child metadata entry.
+        fn set_child(
+            self: Pin<&mut ColumnMetadata>,
+            index: usize,
+            child: &ColumnMetadata,
+        ) -> Result<()>;
+
+        /// Append a recursive child metadata entry.
+        fn push_child(self: Pin<&mut ColumnMetadata>, child: &ColumnMetadata);
+
+        /// Construct `cudf::column_metadata()`.
+        fn make_column_metadata() -> UniquePtr<ColumnMetadata>;
+
+        /// Construct `cudf::column_metadata(name)`.
+        fn make_column_metadata_with_name(name: &str) -> UniquePtr<ColumnMetadata>;
+
+        /// Construct an empty `std::vector<cudf::column_metadata>`.
+        fn make_column_metadata_vector() -> UniquePtr<ColumnMetadataVector>;
 
         /// Owning cuDF AST expression tree.
         type AstExpressionTree;
@@ -123,7 +205,11 @@ pub mod ffi {
         fn size(self: &DeviceIndexVector) -> usize;
 
         /// View the row indices as a non-owning cuDF column view.
-        fn view(self: &DeviceIndexVector) -> UniquePtr<ColumnView>;
+        ///
+        /// # Safety
+        ///
+        /// The returned view must not outlive this vector.
+        unsafe fn view(self: &DeviceIndexVector) -> UniquePtr<ColumnView>;
 
         /// Pair of cuDF join index maps.
         type JoinIndices;
@@ -311,109 +397,111 @@ pub mod ffi {
 
         // Table methods
         /// Get the number of columns in the table
-        fn num_columns(self: &Table) -> usize;
+        fn num_columns(self: &Table) -> Result<i32>;
 
         /// Get the number of rows in the table
-        fn num_rows(self: &Table) -> usize;
+        fn num_rows(self: &Table) -> Result<i32>;
 
         /// Get a view of this table
-        fn view(self: &Table) -> UniquePtr<TableView>;
+        ///
+        /// # Safety
+        ///
+        /// The returned view must not outlive this table.
+        unsafe fn view(self: &Table) -> Result<UniquePtr<TableView>>;
+
+        /// Get a const column reference at index.
+        ///
+        /// # Safety
+        ///
+        /// The returned reference wrapper must not outlive this table.
+        unsafe fn get_column(self: &Table, index: i32) -> Result<UniquePtr<ColumnRef>>;
 
         /// Release and take ownership of the table's columns
-        fn release(self: &Table) -> UniquePtr<ColumnVectorHelper>;
+        fn release(self: Pin<&mut Table>) -> Result<UniquePtr<ColumnVectorHelper>>;
 
         // TableView methods
         /// Get the number of columns in the table view
-        fn num_columns(self: &TableView) -> usize;
+        fn num_columns(self: &TableView) -> Result<i32>;
 
         /// Get the number of rows in the table view
-        fn num_rows(self: &TableView) -> usize;
+        fn num_rows(self: &TableView) -> Result<i32>;
 
         /// Select specific columns by indices
-        fn select(self: &TableView, column_indices: &[i32]) -> UniquePtr<TableView>;
+        fn select(self: &TableView, column_indices: &[i32]) -> Result<UniquePtr<TableView>>;
 
         /// Get column view at index
-        fn column(self: &TableView, index: i32) -> UniquePtr<ColumnView>;
+        fn column(self: &TableView, index: i32) -> Result<UniquePtr<ColumnView>>;
 
-        /// Get the table view schema as an FFI ArrowSchema
-        ///
-        /// # Safety
-        ///
-        /// `out_schema_ptr` must point to a valid `ArrowSchema`. Caller must release it.
-        unsafe fn to_arrow_schema(self: &TableView, out_schema_ptr: *mut u8);
-
-        /// Get the table view data as an FFI ArrowArray
-        ///
-        /// # Safety
-        ///
-        /// `out_array_ptr` must point to a valid `ArrowArray`. Caller must release it.
-        unsafe fn to_arrow_array(
-            self: &TableView,
-            out_array_ptr: *mut u8,
-            stream: &CudaStreamView,
-            mr: &DeviceAsyncResourceRef,
-        );
-
-        /// Clone this table view
-        ///
-        /// Note: Cannot implement `Clone` trait due to cxx FFI limitations.
-        /// This creates a deep copy of the view structure (not the underlying data).
-        #[allow(clippy::should_implement_trait)]
-        fn clone(self: &TableView) -> UniquePtr<TableView>;
+        /// Mechanical factory for `cudf::table_view`'s copy constructor.
+        fn table_view_clone(view: &TableView) -> Result<UniquePtr<TableView>>;
 
         // Column methods
         /// Get the number of elements in the column
-        fn size(self: &Column) -> usize;
+        fn size(self: &Column) -> Result<i32>;
 
         /// Get the data type of the column
-        fn data_type(self: &Column) -> UniquePtr<DataType>;
+        #[cxx_name = "type"]
+        fn data_type(self: &Column) -> Result<UniquePtr<DataType>>;
+
+        /// Get the total device allocation size of the column.
+        fn alloc_size(self: &Column) -> Result<usize>;
+
+        /// Get the total device allocation size of a referenced column.
+        fn alloc_size(self: &ColumnRef) -> Result<usize>;
 
         // ColumnView methods
         /// Get the number of elements in the column view
-        fn size(self: &ColumnView) -> usize;
+        fn size(self: &ColumnView) -> Result<i32>;
 
         /// Get a view of this column
-        fn view(self: &Column) -> UniquePtr<ColumnView>;
-
-        /// Get the column view data as an FFI ArrowDeviceArray
         ///
         /// # Safety
         ///
-        /// `out_array_ptr` must point to a valid `ArrowDeviceArray`. Caller must release it.
-        unsafe fn to_arrow_array(
-            self: &ColumnView,
-            out_array_ptr: *mut u8,
-            stream: &CudaStreamView,
-            mr: &DeviceAsyncResourceRef,
-        );
+        /// The returned view must not outlive this column.
+        unsafe fn view(self: &Column) -> Result<UniquePtr<ColumnView>>;
 
         /// Get the raw device pointer to the column view's data
-        fn data_ptr(self: &ColumnView) -> u64;
+        fn head(self: &ColumnView) -> Result<usize>;
 
         /// Get the data type of the column view
-        fn data_type(self: &ColumnView) -> UniquePtr<DataType>;
+        #[cxx_name = "type"]
+        fn data_type(self: &ColumnView) -> Result<UniquePtr<DataType>>;
 
-        /// Clone this column view
-        ///
-        /// Note: Cannot implement `Clone` trait due to cxx FFI limitations.
-        /// This creates a deep copy of the view structure (not the underlying data).
-        #[allow(clippy::should_implement_trait)]
-        fn clone(self: &ColumnView) -> UniquePtr<ColumnView>;
+        /// Mechanical factory for `cudf::column_view`'s copy constructor.
+        fn column_view_clone(view: &ColumnView) -> Result<UniquePtr<ColumnView>>;
 
         /// Get the offset of the current ColumnView in case it was a slice of another one
-        fn offset(self: &ColumnView) -> i32;
+        fn offset(self: &ColumnView) -> Result<i32>;
 
         /// Get the number of null values in the column
-        fn null_count(self: &ColumnView) -> i32;
+        fn null_count(self: &ColumnView) -> Result<i32>;
 
-        /// Get buffer memory size (data + offsets, no null mask)
-        fn get_buffer_memory_size(self: &ColumnView, stream: &CudaStreamView) -> usize;
+        /// Return whether the column view has a null mask.
+        fn nullable(self: &ColumnView) -> Result<bool>;
 
-        /// Get total array memory size (data + offsets + null mask + children)
-        fn get_array_memory_size(self: &ColumnView, stream: &CudaStreamView) -> usize;
+        /// Return the number of child column views.
+        fn num_children(self: &ColumnView) -> Result<i32>;
 
-        /// Transfer the null buffer
-        fn get_null_buffer(self: &ColumnView) -> Vec<u8>;
+        /// Return a child column view by index.
+        ///
+        /// The index must be less than `num_children`, matching cuDF's
+        /// unchecked `column_view::child` contract.
+        unsafe fn child(self: &ColumnView, index: i32) -> Result<UniquePtr<ColumnView>>;
+
+        /// Return `column_view::null_mask()` encoded as an integer because cxx
+        /// cannot return `bitmask_type const*` directly.
+        fn null_mask(self: &ColumnView) -> Result<usize>;
+
+        /// Construct the full pointer-based `cudf::column_view` overload.
+        unsafe fn column_view_create(
+            dtype: &DataType,
+            size: i32,
+            data: usize,
+            null_mask: usize,
+            null_count: i32,
+            offset: i32,
+            children: &[*const ColumnView],
+        ) -> Result<UniquePtr<ColumnView>>;
 
         // DataType methods
         /// Get the type_id
@@ -422,31 +510,53 @@ pub mod ffi {
         /// Get the scale (for fixed_point types)
         fn scale(self: &DataType) -> i32;
 
-        // Scalar methods
-        /// Get the scalar data as an FFI ArrowDeviceArray
-        ///
-        /// # Safety
-        ///
-        /// `out_array_ptr` must point to a valid `ArrowDeviceArray`. Caller must release it.
-        unsafe fn to_arrow_array(
-            self: &Scalar,
+        /// Return whether `type` has a fixed-width representation.
+        fn is_fixed_width(dtype: &DataType) -> bool;
+
+        /// Return the byte width of a fixed-width `type`.
+        fn size_of(dtype: &DataType) -> Result<usize>;
+
+        /// Return the padded allocation size for a null mask.
+        fn bitmask_allocation_size_bytes(number_of_bits: i32, padding_boundary: usize) -> usize;
+
+        /// Direct wrapper for `cudf::get_column_metadata`.
+        fn get_column_metadata(input: &ColumnView) -> Result<UniquePtr<ColumnMetadata>>;
+
+        /// Direct wrapper for `cudf::get_table_metadata`.
+        fn get_table_metadata(input: &TableView) -> Result<UniquePtr<ColumnMetadataVector>>;
+
+        /// Direct wrapper for `cudf::to_arrow_schema`.
+        unsafe fn to_arrow_schema(
+            input: &TableView,
+            metadata: &ColumnMetadataVector,
+            out_schema_ptr: *mut u8,
+        ) -> Result<()>;
+
+        /// Direct wrapper for the table-view overload of `cudf::to_arrow_host`.
+        #[rust_name = "to_arrow_host_table"]
+        unsafe fn to_arrow_host(
+            input: &TableView,
             out_array_ptr: *mut u8,
             stream: &CudaStreamView,
             mr: &DeviceAsyncResourceRef,
-        );
+        ) -> Result<()>;
 
+        /// Direct wrapper for the column-view overload of `cudf::to_arrow_host`.
+        #[rust_name = "to_arrow_host_column"]
+        unsafe fn to_arrow_host(
+            input: &ColumnView,
+            out_array_ptr: *mut u8,
+            stream: &CudaStreamView,
+            mr: &DeviceAsyncResourceRef,
+        ) -> Result<()>;
+
+        // Scalar methods
         /// Check if the scalar is valid (not null)
-        fn is_valid(self: &Scalar) -> bool;
+        fn is_valid(self: &Scalar, stream: &CudaStreamView) -> Result<bool>;
 
         /// Get the data type of the scalar
-        fn data_type(self: &Scalar) -> UniquePtr<DataType>;
-
-        /// Clone this scalar (deep copy)
-        ///
-        /// Note: Cannot implement `Clone` trait due to cxx FFI limitations.
-        /// This creates a deep copy of the scalar and its data.
-        #[allow(clippy::should_implement_trait)]
-        fn clone(self: &Scalar) -> UniquePtr<Scalar>;
+        #[cxx_name = "type"]
+        fn data_type(self: &Scalar) -> Result<UniquePtr<DataType>>;
 
         // Factory functions
 
@@ -457,11 +567,13 @@ pub mod ffi {
         fn new_data_type_with_scale(type_id: i32, scale: i32) -> UniquePtr<DataType>;
 
         /// Create an empty table with no columns and no rows
-        fn create_empty_table() -> UniquePtr<Table>;
+        fn create_empty_table() -> Result<UniquePtr<Table>>;
 
         /// Create a table from a set of column pointers (takes ownership)
         /// The columns are consumed and should not be used after this call
-        fn create_table_from_columns_move(columns: &[*mut Column]) -> UniquePtr<Table>;
+        unsafe fn create_table_from_columns_move(
+            columns: &[*mut Column],
+        ) -> Result<UniquePtr<Table>>;
 
         /// Create a table from vertically concatenating TableView together
         fn concat_table_views(
@@ -495,9 +607,9 @@ pub mod ffi {
         ) -> Result<UniquePtr<Column>>;
 
         /// Create a TableView from a set of ColumnView pointers (non-owning)
-        fn create_table_view_from_column_views(
+        unsafe fn create_table_view_from_column_views(
             column_views: &[*const ColumnView],
-        ) -> UniquePtr<TableView>;
+        ) -> Result<UniquePtr<TableView>>;
 
         // Parquet I/O
 
@@ -1025,7 +1137,7 @@ pub mod ffi {
         /// # Safety
         ///
         /// Pointers must be valid Arrow C Data Interface structures.
-        unsafe fn table_from_arrow_host(
+        unsafe fn from_arrow_host(
             schema_ptr: *const u8,
             device_array_ptr: *const u8,
             stream: &CudaStreamView,
@@ -1037,7 +1149,7 @@ pub mod ffi {
         /// # Safety
         ///
         /// Pointers must be valid Arrow C Data Interface structures.
-        unsafe fn column_from_arrow(
+        unsafe fn from_arrow_column(
             schema_ptr: *const u8,
             array_ptr: *const u8,
             stream: &CudaStreamView,
@@ -1045,7 +1157,7 @@ pub mod ffi {
         ) -> Result<UniquePtr<Column>>;
 
         /// Cast a column to a different data type using GPU-native cudf::cast
-        fn cast_column(
+        fn cast(
             input: &ColumnView,
             target_type: &DataType,
             stream: &CudaStreamView,
@@ -1055,16 +1167,27 @@ pub mod ffi {
         /// Extract a scalar from a column at the specified index
         fn get_element(
             column: &ColumnView,
-            index: usize,
+            index: i32,
             stream: &CudaStreamView,
             mr: &DeviceAsyncResourceRef,
-        ) -> UniquePtr<Scalar>;
+        ) -> Result<UniquePtr<Scalar>>;
 
         /// Get the version of the cuDF library
         fn get_cudf_version() -> String;
 
-        /// Configure cuDF's default pinned-memory resource pool.
-        fn config_default_pinned_memory_resource(pool_size_bytes: usize) -> bool;
+        /// Opaque wrapper around `cudf::pinned_mr_options`.
+        type PinnedMrOptions;
+
+        /// Construct options with upstream's default `pool_size = nullopt`.
+        fn make_pinned_mr_options() -> UniquePtr<PinnedMrOptions>;
+
+        /// Construct options with an explicit pool size.
+        fn make_pinned_mr_options_with_pool_size(
+            pool_size_bytes: usize,
+        ) -> UniquePtr<PinnedMrOptions>;
+
+        /// Direct wrapper for `cudf::config_default_pinned_memory_resource`.
+        fn config_default_pinned_memory_resource(options: &PinnedMrOptions) -> bool;
 
         /// Set cuDF's host allocation threshold for pinned memory.
         fn set_allocate_host_as_pinned_threshold(threshold_bytes: usize);
@@ -1076,7 +1199,11 @@ pub mod ffi {
         fn cuda_stream_create_with_flags(flags: u32) -> Result<UniquePtr<CudaStream>>;
 
         /// Return a non-owning view for an owned CUDA stream.
-        fn cuda_stream_view(stream: &CudaStream) -> UniquePtr<CudaStreamView>;
+        ///
+        /// # Safety
+        ///
+        /// The returned view must not outlive `stream`.
+        unsafe fn cuda_stream_view(stream: &CudaStream) -> UniquePtr<CudaStreamView>;
 
         /// Convert an RMM CUDA stream view into an upstream CCCL CUDA stream ref.
         ///
@@ -1100,11 +1227,23 @@ pub mod ffi {
         /// Set the current CUDA device ordinal.
         fn cuda_set_device(device_id: i32) -> Result<()>;
 
+        /// Direct wrapper for `cudaMemcpy`. Pointer values are integer-encoded
+        /// because cxx cannot expose untyped CUDA pointers directly.
+        unsafe fn cuda_memcpy(destination: usize, source: usize, count: usize, kind: i32) -> i32;
+
+        /// Direct wrapper for `cudaGetErrorString`.
+        fn cuda_get_error_string(error: i32) -> String;
+
         /// Return cuDF's current device memory resource reference.
         fn get_current_device_resource_ref() -> UniquePtr<DeviceAsyncResourceRef>;
 
         /// Set cuDF's current device memory resource reference.
-        fn set_current_device_resource_ref(
+        ///
+        /// # Safety
+        ///
+        /// The referenced resource must remain alive until it is replaced or
+        /// reset and all work using it has completed.
+        unsafe fn set_current_device_resource_ref(
             resource: &DeviceAsyncResourceRef,
         ) -> UniquePtr<DeviceAsyncResourceRef>;
 
@@ -1141,19 +1280,62 @@ pub mod ffi {
         type PoolMemoryResource;
 
         /// Construct an RMM pool memory resource.
-        fn make_pool_memory_resource(
+        ///
+        /// # Safety
+        ///
+        /// `upstream` must outlive the returned pool.
+        unsafe fn make_pool_memory_resource(
             upstream: &CudaMemoryResource,
             initial_size: usize,
-            max_size: usize,
-        ) -> UniquePtr<PoolMemoryResource>;
+        ) -> Result<UniquePtr<PoolMemoryResource>>;
 
-        /// Install the pool as RMM's current device resource.
-        fn set_current_device_resource(resource: &PoolMemoryResource);
+        /// Construct an RMM pool memory resource with an explicit maximum size.
+        ///
+        /// # Safety
+        ///
+        /// `upstream` must outlive the returned pool.
+        unsafe fn make_pool_memory_resource_with_maximum(
+            upstream: &CudaMemoryResource,
+            initial_size: usize,
+            maximum_size: usize,
+        ) -> Result<UniquePtr<PoolMemoryResource>>;
 
-        /// Return total VRAM bytes on the current CUDA device.
-        fn total_device_memory() -> usize;
+        /// Construct RMM's non-owning resource-reference type from a pool.
+        ///
+        /// # Safety
+        ///
+        /// `resource` must outlive the returned reference and every operation
+        /// to which that reference is passed.
+        unsafe fn make_device_async_resource_ref(
+            resource: &PoolMemoryResource,
+        ) -> UniquePtr<DeviceAsyncResourceRef>;
+
+        /// Opaque wrapper for the pair returned by `rmm::available_device_memory`.
+        type AvailableDeviceMemory;
+
+        /// Return the pair's available-memory component.
+        fn free_bytes(self: &AvailableDeviceMemory) -> usize;
+
+        /// Return the pair's total-memory component.
+        fn total_bytes(self: &AvailableDeviceMemory) -> usize;
+
+        /// Direct wrapper for `rmm::available_device_memory`.
+        fn available_device_memory() -> Result<UniquePtr<AvailableDeviceMemory>>;
     }
 }
+
+/// `cudaMemcpyHostToHost` from `cudaMemcpyKind`.
+pub const CUDA_MEMCPY_HOST_TO_HOST: i32 = 0;
+/// `cudaMemcpyHostToDevice` from `cudaMemcpyKind`.
+pub const CUDA_MEMCPY_HOST_TO_DEVICE: i32 = 1;
+/// `cudaMemcpyDeviceToHost` from `cudaMemcpyKind`.
+pub const CUDA_MEMCPY_DEVICE_TO_HOST: i32 = 2;
+/// `cudaMemcpyDeviceToDevice` from `cudaMemcpyKind`.
+pub const CUDA_MEMCPY_DEVICE_TO_DEVICE: i32 = 3;
+/// `cudaMemcpyDefault` from `cudaMemcpyKind`.
+pub const CUDA_MEMCPY_DEFAULT: i32 = 4;
+/// `cudaSuccess` from `cudaError_t`.
+pub const CUDA_SUCCESS: i32 = 0;
 
 /// Return cuDF's current default stream as an explicit stream-view handle.
 pub fn get_default_stream() -> cxx::UniquePtr<ffi::CudaStreamView> {
@@ -1576,18 +1758,34 @@ pub struct ArrowDeviceArray {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 pub enum ArrowDeviceType {
+    /// CPU memory.
     Cpu = 1,
+    /// CUDA device memory.
     Cuda = 2,
+    /// CUDA-pinned host memory.
     CudaHost = 3,
+    /// OpenCL device memory.
     OpenCL = 4,
-    Vulkan = 5,
-    Metal = 6,
-    VulkanHost = 7,
-    OpenCLHost = 8,
-    CudaManaged = 9,
-    OneAPI = 10,
-    WebGPU = 11,
-    Hexagon = 12,
+    /// Vulkan device memory.
+    Vulkan = 7,
+    /// Metal device memory.
+    Metal = 8,
+    /// NVIDIA VPI device memory.
+    Vpi = 9,
+    /// ROCm device memory.
+    Rocm = 10,
+    /// ROCm-pinned host memory.
+    RocmHost = 11,
+    /// Extension-defined device memory.
+    ExtDev = 12,
+    /// CUDA managed memory.
+    CudaManaged = 13,
+    /// oneAPI device memory.
+    OneAPI = 14,
+    /// WebGPU device memory.
+    WebGPU = 15,
+    /// Hexagon device memory.
+    Hexagon = 16,
 }
 
 impl ArrowDeviceType {
@@ -1792,7 +1990,7 @@ unsafe impl Send for ffi::CudaMemoryResource {}
 unsafe impl Sync for ffi::CudaMemoryResource {}
 
 /// SAFETY: Same as `CudaMemoryResource`. Once installed via
-/// `set_current_device_resource`, RMM serializes its own concurrent allocate /
+/// `set_current_device_resource_ref`, RMM serializes its own concurrent allocate /
 /// deallocate, so shared references to the handle are safe.
 unsafe impl Send for ffi::PoolMemoryResource {}
 unsafe impl Sync for ffi::PoolMemoryResource {}
@@ -1812,7 +2010,7 @@ mod tests {
     use arrow::ffi::{from_ffi, from_ffi_and_data_type, FFI_ArrowArray};
     use arrow::util::pretty::{pretty_format_batches, pretty_format_columns};
     use arrow_schema::ffi::FFI_ArrowSchema;
-    use arrow_schema::{ArrowError, DataType, Field, Schema};
+    use arrow_schema::{DataType, Field, Schema};
     use insta::assert_snapshot;
     use std::fmt::Display;
     use std::sync::Arc;
@@ -1900,7 +2098,7 @@ mod tests {
         assert!(result.num_input_row_groups() > 0);
 
         let table = result.pin_mut().release_table();
-        assert!(table.num_rows() > 0);
+        assert!(table.num_rows()? > 0);
 
         Ok(())
     }
@@ -1915,9 +2113,9 @@ mod tests {
             stream_view,
             resource_ref,
         )?;
-        let table_view = table.view();
+        let table_view = unsafe { table.view() }?;
 
-        let num_cols = table.num_columns();
+        let num_cols = usize::try_from(table.num_columns()?)?;
         let column_order: Vec<i32> = vec![Order::Ascending as i32; num_cols];
         let null_precedence: Vec<i32> = vec![NullOrder::Before as i32; num_cols];
 
@@ -1929,9 +2127,9 @@ mod tests {
             resource_ref,
         )?;
 
-        assert_eq!(sorted_table.num_rows(), table.num_rows());
-        assert_eq!(sorted_table.num_columns(), table.num_columns());
-        assert_snapshot!(pretty_table(&sorted_table.view())?);
+        assert_eq!(sorted_table.num_rows()?, table.num_rows()?);
+        assert_eq!(sorted_table.num_columns()?, table.num_columns()?);
+        assert_snapshot!(pretty_table(&*unsafe { sorted_table.view() }?)?);
 
         Ok(())
     }
@@ -1945,9 +2143,9 @@ mod tests {
             stream_view,
             resource_ref,
         )?;
-        let table_view = table.view();
+        let table_view = unsafe { table.view() }?;
 
-        let num_cols = table.num_columns();
+        let num_cols = usize::try_from(table.num_columns()?)?;
         let column_order: Vec<i32> = vec![Order::Descending as i32; num_cols];
         let null_precedence: Vec<i32> = vec![NullOrder::After as i32; num_cols];
 
@@ -1959,9 +2157,9 @@ mod tests {
             resource_ref,
         )?;
 
-        assert_eq!(sorted_table.num_rows(), table.num_rows());
-        assert_eq!(sorted_table.num_columns(), table.num_columns());
-        assert_snapshot!(pretty_table(&sorted_table.view())?);
+        assert_eq!(sorted_table.num_rows()?, table.num_rows()?);
+        assert_eq!(sorted_table.num_columns()?, table.num_columns()?);
+        assert_snapshot!(pretty_table(&*unsafe { sorted_table.view() }?)?);
 
         Ok(())
     }
@@ -1975,9 +2173,9 @@ mod tests {
             stream_view,
             resource_ref,
         )?;
-        let table_view = table.view();
+        let table_view = unsafe { table.view() }?;
 
-        let num_cols = table.num_columns();
+        let num_cols = usize::try_from(table.num_columns()?)?;
         let column_order: Vec<i32> = vec![Order::Ascending as i32; num_cols];
         let null_precedence: Vec<i32> = vec![NullOrder::Before as i32; num_cols];
 
@@ -1989,9 +2187,9 @@ mod tests {
             resource_ref,
         )?;
 
-        assert_eq!(sorted_table.num_rows(), table.num_rows());
-        assert_eq!(sorted_table.num_columns(), table.num_columns());
-        assert_snapshot!(pretty_table(&sorted_table.view())?);
+        assert_eq!(sorted_table.num_rows()?, table.num_rows()?);
+        assert_eq!(sorted_table.num_columns()?, table.num_columns()?);
+        assert_snapshot!(pretty_table(&*unsafe { sorted_table.view() }?)?);
 
         Ok(())
     }
@@ -2005,9 +2203,9 @@ mod tests {
             stream_view,
             resource_ref,
         )?;
-        let table_view = table.view();
+        let table_view = unsafe { table.view() }?;
 
-        let num_cols = table.num_columns();
+        let num_cols = usize::try_from(table.num_columns()?)?;
         let column_order: Vec<i32> = vec![Order::Ascending as i32; num_cols];
         let null_precedence: Vec<i32> = vec![NullOrder::Before as i32; num_cols];
 
@@ -2019,8 +2217,11 @@ mod tests {
             resource_ref,
         )?;
 
-        assert_eq!(indices.size(), table.num_rows());
-        assert_snapshot!(pretty_column(&indices.view(), DataType::Int32)?);
+        assert_eq!(indices.size()?, table.num_rows()?);
+        assert_snapshot!(pretty_column(
+            &*unsafe { indices.view() }?,
+            DataType::Int32
+        )?);
 
         Ok(())
     }
@@ -2034,9 +2235,9 @@ mod tests {
             stream_view,
             resource_ref,
         )?;
-        let table_view = table.view();
+        let table_view = unsafe { table.view() }?;
 
-        let num_cols = table.num_columns();
+        let num_cols = usize::try_from(table.num_columns()?)?;
         let column_order: Vec<i32> = vec![Order::Ascending as i32; num_cols];
         let null_precedence: Vec<i32> = vec![NullOrder::Before as i32; num_cols];
 
@@ -2047,7 +2248,7 @@ mod tests {
             stream_view,
             resource_ref,
         )?;
-        let sorted_view = sorted_table.view();
+        let sorted_view = unsafe { sorted_table.view() }?;
 
         let is_sorted = ffi::is_sorted(&sorted_view, &column_order, &null_precedence, stream_view)?;
         assert!(is_sorted, "Table should be sorted after calling sort_table");
@@ -2064,9 +2265,9 @@ mod tests {
             stream_view,
             resource_ref,
         )?;
-        let table_view = table.view();
+        let table_view = unsafe { table.view() }?;
 
-        let keys_view = table_view.select(&[0]);
+        let keys_view = table_view.select(&[0])?;
 
         let column_order = vec![Order::Ascending as i32];
         let null_precedence = vec![NullOrder::Before as i32];
@@ -2080,9 +2281,9 @@ mod tests {
             resource_ref,
         )?;
 
-        assert_eq!(sorted_table.num_rows(), table.num_rows());
-        assert_eq!(sorted_table.num_columns(), table.num_columns());
-        assert_snapshot!(pretty_table(&sorted_table.view())?);
+        assert_eq!(sorted_table.num_rows()?, table.num_rows()?);
+        assert_eq!(sorted_table.num_columns()?, table.num_columns()?);
+        assert_snapshot!(pretty_table(&*unsafe { sorted_table.view() }?)?);
 
         Ok(())
     }
@@ -2096,9 +2297,9 @@ mod tests {
             stream_view,
             resource_ref,
         )?;
-        let table_view = table.view();
+        let table_view = unsafe { table.view() }?;
 
-        let keys_view = table_view.select(&[0, 1]);
+        let keys_view = table_view.select(&[0, 1])?;
 
         let column_order = vec![Order::Ascending as i32, Order::Descending as i32];
         let null_precedence = vec![NullOrder::Before as i32, NullOrder::After as i32];
@@ -2112,9 +2313,9 @@ mod tests {
             resource_ref,
         )?;
 
-        assert_eq!(sorted_table.num_rows(), table.num_rows());
-        assert_eq!(sorted_table.num_columns(), table.num_columns());
-        assert_snapshot!(pretty_table(&sorted_table.view())?);
+        assert_eq!(sorted_table.num_rows()?, table.num_rows()?);
+        assert_eq!(sorted_table.num_columns()?, table.num_columns()?);
+        assert_snapshot!(pretty_table(&*unsafe { sorted_table.view() }?)?);
 
         Ok(())
     }
@@ -2129,10 +2330,10 @@ mod tests {
             stream_view,
             resource_ref,
         )?;
-        let table_view = table.view();
+        let table_view = unsafe { table.view() }?;
 
-        let col1 = table_view.column(1);
-        let col2 = table_view.column(2);
+        let col1 = table_view.column(1)?;
+        let col2 = table_view.column(2)?;
 
         let output_type = ffi::new_data_type(TypeId::Float64 as i32);
         let result = ffi::binary_operation_col_col(
@@ -2144,9 +2345,12 @@ mod tests {
             resource_ref,
         )?;
 
-        assert_eq!(result.size(), col1.size());
-        assert_eq!(result.size(), col2.size());
-        assert_snapshot!(pretty_column(&result.view(), DataType::Float64)?);
+        assert_eq!(result.size()?, col1.size()?);
+        assert_eq!(result.size()?, col2.size()?);
+        assert_snapshot!(pretty_column(
+            &*unsafe { result.view() }?,
+            DataType::Float64
+        )?);
 
         Ok(())
     }
@@ -2160,10 +2364,10 @@ mod tests {
             stream_view,
             resource_ref,
         )?;
-        let table_view = table.view();
+        let table_view = unsafe { table.view() }?;
 
-        let col1 = table_view.column(1);
-        let col2 = table_view.column(2);
+        let col1 = table_view.column(1)?;
+        let col2 = table_view.column(2)?;
 
         let output_type = ffi::new_data_type(TypeId::Float64 as i32);
         let result = ffi::binary_operation_col_col(
@@ -2175,8 +2379,11 @@ mod tests {
             resource_ref,
         )?;
 
-        assert_eq!(result.size(), col1.size());
-        assert_snapshot!(pretty_column(&result.view(), DataType::Float64)?);
+        assert_eq!(result.size()?, col1.size()?);
+        assert_snapshot!(pretty_column(
+            &*unsafe { result.view() }?,
+            DataType::Float64
+        )?);
 
         Ok(())
     }
@@ -2239,9 +2446,33 @@ mod tests {
     }
 
     #[test]
+    fn arrow_device_type_matches_c_device_interface() -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            [
+                ArrowDeviceType::Cpu as i32,
+                ArrowDeviceType::Cuda as i32,
+                ArrowDeviceType::CudaHost as i32,
+                ArrowDeviceType::OpenCL as i32,
+                ArrowDeviceType::Vulkan as i32,
+                ArrowDeviceType::Metal as i32,
+                ArrowDeviceType::Vpi as i32,
+                ArrowDeviceType::Rocm as i32,
+                ArrowDeviceType::RocmHost as i32,
+                ArrowDeviceType::ExtDev as i32,
+                ArrowDeviceType::CudaManaged as i32,
+                ArrowDeviceType::OneAPI as i32,
+                ArrowDeviceType::WebGPU as i32,
+                ArrowDeviceType::Hexagon as i32,
+            ],
+            [1, 2, 3, 4, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_reduce_uses_full_output_data_type() -> Result<(), Box<dyn std::error::Error>> {
         let table = table_from_decimal128_column("amount", vec![12345, 67890], 2)?;
-        let column = table.view().column(0);
+        let column = unsafe { table.view() }?.column(0)?;
         let output_type = ffi::new_data_type_with_scale(TypeId::Decimal128 as i32, -2);
         let stream = ffi::get_default_stream();
         let resource = ffi::get_current_device_resource_ref();
@@ -2254,9 +2485,9 @@ mod tests {
             stream_view,
             resource_ref,
         )?;
-        let result_type = result.data_type();
+        let result_type = result.data_type()?;
 
-        assert!(result.is_valid());
+        assert!(result.is_valid(stream_view)?);
         assert_eq!(result_type.id(), TypeId::Decimal128 as i32);
         assert_eq!(result_type.scale(), -2);
 
@@ -2266,11 +2497,16 @@ mod tests {
     #[test]
     fn test_reduce_with_init() -> Result<(), Box<dyn std::error::Error>> {
         let table = table_from_i32_columns(&[("values", vec![1, 2, 3])])?;
-        let values = table.view().column(0);
+        let values = unsafe { table.view() }?.column(0)?;
         let init_table = table_from_i32_columns(&[("init", vec![10])])?;
         let (stream, resource) = default_stream_and_resource();
         let (stream_view, resource_ref) = expect_stream_and_resource(&stream, &resource);
-        let init = ffi::get_element(&init_table.view().column(0), 0, stream_view, resource_ref);
+        let init = ffi::get_element(
+            &*unsafe { init_table.view() }?.column(0)?,
+            0,
+            stream_view,
+            resource_ref,
+        )?;
         let output_type = ffi::new_data_type(TypeId::Int32 as i32);
 
         let result = ffi::reduce_with_init(
@@ -2283,7 +2519,7 @@ mod tests {
         )?;
         let result_column = ffi::make_column_from_scalar(&result, 1, stream_view, resource_ref)?;
 
-        assert_snapshot!(pretty_column(&result_column.view(), DataType::Int32)?, @r"
+        assert_snapshot!(pretty_column(&*unsafe { result_column.view() }?, DataType::Int32)?, @r"
         +------+
         | test |
         +------+
@@ -2297,7 +2533,7 @@ mod tests {
     #[test]
     fn test_count_aggregation_respects_null_policy() -> Result<(), Box<dyn std::error::Error>> {
         let table = table_from_nullable_i32_column("values", vec![Some(1), None, Some(3), None])?;
-        let values = table.view().column(0);
+        let values = unsafe { table.view() }?.column(0)?;
         let output_type = ffi::new_data_type(TypeId::Int32 as i32);
         let (stream, resource) = default_stream_and_resource();
         let (stream_view, resource_ref) = expect_stream_and_resource(&stream, &resource);
@@ -2320,14 +2556,14 @@ mod tests {
         let exclude_column = ffi::make_column_from_scalar(&exclude, 1, stream_view, resource_ref)?;
         let include_column = ffi::make_column_from_scalar(&include, 1, stream_view, resource_ref)?;
 
-        assert_snapshot!(pretty_column(&exclude_column.view(), DataType::Int32)?, @r"
+        assert_snapshot!(pretty_column(&*unsafe { exclude_column.view() }?, DataType::Int32)?, @r"
         +------+
         | test |
         +------+
         | 2    |
         +------+
         ");
-        assert_snapshot!(pretty_column(&include_column.view(), DataType::Int32)?, @r"
+        assert_snapshot!(pretty_column(&*unsafe { include_column.view() }?, DataType::Int32)?, @r"
         +------+
         | test |
         +------+
@@ -2358,10 +2594,10 @@ mod tests {
         let left =
             table_from_i32_columns(&[("key", vec![1, 2, 2, 3]), ("val", vec![10, 20, 25, 30])])?;
         let right = table_from_i32_columns(&[("key", vec![2, 2, 3]), ("val", vec![15, 30, 35])])?;
-        let left_view = left.view();
-        let right_view = right.view();
-        let left_keys = left_view.select(&[0]);
-        let right_keys = right_view.select(&[0]);
+        let left_view = unsafe { left.view() }?;
+        let right_view = unsafe { right.view() }?;
+        let left_keys = left_view.select(&[0])?;
+        let right_keys = right_view.select(&[0])?;
         let stream = ffi::get_default_stream();
         let resource = ffi::get_current_device_resource_ref();
         let (stream_view, resource_ref) = expect_stream_and_resource(&stream, &resource);
@@ -2374,7 +2610,7 @@ mod tests {
         )?;
         let left_indices = indices.pin_mut().release_left();
         let right_indices = indices.pin_mut().release_right();
-        let left_indices_view = left_indices.view();
+        let left_indices_view = unsafe { left_indices.view() };
 
         let mut predicate = ffi::ast_expression_tree_create();
         let left_val = ffi::ast_expression_tree_add_column_reference(
@@ -2394,8 +2630,8 @@ mod tests {
             right_val,
         )?;
 
-        let left_values = left_view.select(&[1]);
-        let right_values = right_view.select(&[1]);
+        let left_values = left_view.select(&[1])?;
+        let right_values = right_view.select(&[1])?;
         let mut filtered = ffi::filter_join_indices(
             &left_values,
             &right_values,
@@ -2414,7 +2650,7 @@ mod tests {
         let filtered_right = filtered.pin_mut().release_right();
 
         assert_eq!(left_indices.size(), 5);
-        assert_eq!(left_indices_view.size(), 5);
+        assert_eq!(left_indices_view.size()?, 5);
         assert_eq!(right_indices.size(), 5);
         assert_eq!(filtered_left.size(), 3);
         assert_eq!(filtered_right.size(), 3);
@@ -2431,10 +2667,10 @@ mod tests {
             stream_view,
             resource_ref,
         )?;
-        let table_view = table.view();
+        let table_view = unsafe { table.view() }?;
 
-        let min_temp = table_view.column(1);
-        let max_temp = table_view.column(2);
+        let min_temp = table_view.column(1)?;
+        let max_temp = table_view.column(2)?;
 
         let output_type = ffi::new_data_type(TypeId::Bool8 as i32);
         let boolean_mask = ffi::binary_operation_col_col(
@@ -2446,15 +2682,15 @@ mod tests {
             resource_ref,
         )?;
 
-        let boolean_mask_view = boolean_mask.view();
+        let boolean_mask_view = unsafe { boolean_mask.view() }?;
         let filtered_table =
             ffi::apply_boolean_mask(&table_view, &boolean_mask_view, stream_view, resource_ref)?;
 
-        assert!(filtered_table.num_rows() < table.num_rows());
-        assert_eq!(filtered_table.num_columns(), table.num_columns());
+        assert!(filtered_table.num_rows()? < table.num_rows()?);
+        assert_eq!(filtered_table.num_columns()?, table.num_columns()?);
 
-        let filtered_view = filtered_table.view();
-        let filtered_col = filtered_view.column(1);
+        let filtered_view = unsafe { filtered_table.view() }?;
+        let filtered_col = filtered_view.column(1)?;
         assert_snapshot!(pretty_column(&filtered_col, DataType::Float64)?);
 
         Ok(())
@@ -2470,19 +2706,19 @@ mod tests {
             stream_view,
             resource_ref,
         )?;
-        let table_view = table.view();
+        let table_view = unsafe { table.view() }?;
 
         let column_order: &[i32] = &[];
         let null_precedence: &[i32] = &[];
         let groupby = ffi::groupby_create(
-            &table_view.select(&[21]),
+            &*table_view.select(&[21])?,
             NullPolicy::Exclude as i32,
             Sorted::No as i32,
             column_order,
             null_precedence,
         );
 
-        let value_column = table_view.column(1);
+        let value_column = table_view.column(1)?;
         let mut request = ffi::aggregation_request_create(&value_column);
         request.pin_mut().add(ffi::make_max_aggregation_groupby());
 
@@ -2495,8 +2731,8 @@ mod tests {
 
         assert_eq!(aggregation_result.len(), 1);
         assert_eq!(
-            aggregation_result.pin_mut().release(0).size(),
-            keys.num_rows()
+            aggregation_result.pin_mut().release(0).size()?,
+            keys.num_rows()?
         );
 
         Ok(())
@@ -2511,9 +2747,9 @@ mod tests {
             stream_view,
             resource_ref,
         )?;
-        let table_view = table.view();
+        let table_view = unsafe { table.view() }?;
 
-        let keys_view = table_view.select(&[0]);
+        let keys_view = table_view.select(&[0])?;
         let column_order: &[i32] = &[];
         let null_precedence: &[i32] = &[];
         let groupby = ffi::groupby_create(
@@ -2524,7 +2760,7 @@ mod tests {
             null_precedence,
         );
 
-        let value_column = table_view.column(1);
+        let value_column = table_view.column(1)?;
         let mut agg_request = ffi::aggregation_request_create(&value_column);
         agg_request
             .pin_mut()
@@ -2549,11 +2785,11 @@ mod tests {
         let max_column = agg_result.pin_mut().release(2);
 
         let keys = groupby_result.pin_mut().release_keys();
-        assert!(keys.num_rows() > 0);
+        assert!(keys.num_rows()? > 0);
 
-        assert_eq!(sum_column.size(), keys.num_rows());
-        assert_eq!(min_column.size(), keys.num_rows());
-        assert_eq!(max_column.size(), keys.num_rows());
+        assert_eq!(sum_column.size()?, keys.num_rows()?);
+        assert_eq!(min_column.size()?, keys.num_rows()?);
+        assert_eq!(max_column.size()?, keys.num_rows()?);
 
         Ok(())
     }
@@ -2568,18 +2804,18 @@ mod tests {
             stream_view,
             resource_ref,
         )?;
-        let table_view = table.view();
-        let original_col = table_view.column(1);
+        let table_view = unsafe { table.view() }?;
+        let original_col = table_view.column(1)?;
 
-        let original_size = original_col.size();
+        let original_size = original_col.size()?;
         assert!(original_size > 10, "Need at least 10 rows for testing");
 
         let sliced_col = ffi::slice_column(&original_col, 5, 5, stream_view)?;
 
-        assert_eq!(sliced_col.size(), 5);
+        assert_eq!(sliced_col.size()?, 5);
 
-        let original_dtype = original_col.data_type();
-        let sliced_dtype = sliced_col.data_type();
+        let original_dtype = original_col.data_type()?;
+        let sliced_dtype = sliced_col.data_type()?;
         assert_eq!(original_dtype.id(), sliced_dtype.id());
 
         assert_snapshot!(pretty_column(&sliced_col, DataType::Float64)?, @r"
@@ -2606,12 +2842,12 @@ mod tests {
             stream_view,
             resource_ref,
         )?;
-        let table_view = table.view();
-        let original_col = table_view.column(2);
+        let table_view = unsafe { table.view() }?;
+        let original_col = table_view.column(2)?;
 
         let sliced_col = ffi::slice_column(&original_col, 0, 10, stream_view)?;
 
-        assert_eq!(sliced_col.size(), 10);
+        assert_eq!(sliced_col.size()?, 10);
         assert_snapshot!(pretty_column(&sliced_col, DataType::Float64)?, @r"
         +------+
         | test |
@@ -2655,7 +2891,9 @@ mod tests {
     #[test]
     fn test_cuda_stream_view_bindings() -> Result<(), Box<dyn std::error::Error>> {
         let stream = ffi::cuda_stream_create()?;
-        let view = ffi::cuda_stream_view(stream.as_ref().expect("CudaStream should not be null"));
+        let view = unsafe {
+            ffi::cuda_stream_view(stream.as_ref().expect("CudaStream should not be null"))
+        };
         view.synchronize()?;
 
         let default_view = ffi::get_default_stream();
@@ -2682,10 +2920,12 @@ mod tests {
     fn test_cuda_event_bindings() -> Result<(), Box<dyn std::error::Error>> {
         let producer = ffi::cuda_stream_create_with_flags(CUDA_STREAM_FLAG_NON_BLOCKING)?;
         let consumer = ffi::cuda_stream_create_with_flags(CUDA_STREAM_FLAG_NON_BLOCKING)?;
-        let producer_view =
-            ffi::cuda_stream_view(producer.as_ref().expect("CudaStream should not be null"));
-        let consumer_view =
-            ffi::cuda_stream_view(consumer.as_ref().expect("CudaStream should not be null"));
+        let producer_view = unsafe {
+            ffi::cuda_stream_view(producer.as_ref().expect("CudaStream should not be null"))
+        };
+        let consumer_view = unsafe {
+            ffi::cuda_stream_view(consumer.as_ref().expect("CudaStream should not be null"))
+        };
         let producer_ref = ffi::cuda_stream_ref_from_view(
             producer_view
                 .as_ref()
@@ -2737,8 +2977,90 @@ mod tests {
             resource_ref,
         )?;
 
-        assert!(table.num_rows() > 0);
-        assert!(table.num_columns() > 0);
+        assert!(table.num_rows()? > 0);
+        assert!(table.num_columns()? > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn column_view_metadata_matches_cudf() -> Result<(), Box<dyn std::error::Error>> {
+        let table = table_from_nullable_i32_column("a", vec![Some(1), None, Some(3)])?;
+        let table_view = unsafe { table.view() }?;
+        let column = table_view.column(0)?;
+        let dtype = column.data_type()?;
+
+        assert!(column.nullable()?);
+        assert_eq!(column.num_children()?, 0);
+        assert_ne!(column.null_mask()?, 0);
+        assert!(ffi::is_fixed_width(&dtype));
+        assert_eq!(ffi::size_of(&dtype)?, std::mem::size_of::<i32>());
+        let string_type = ffi::new_data_type(TypeId::String as i32);
+        assert!(!ffi::is_fixed_width(&string_type));
+        assert!(ffi::size_of(&string_type).is_err());
+        assert_eq!(ffi::bitmask_allocation_size_bytes(3, 64), 64);
+        assert!(
+            unsafe { table.get_column(0) }?.alloc_size()? >= 3 * std::mem::size_of::<i32>() + 64
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn arrow_metadata_preserves_all_upstream_fields() -> Result<(), Box<dyn std::error::Error>> {
+        let mut metadata = ffi::make_column_metadata_with_name("amount");
+        metadata.pin_mut().set_timezone("UTC");
+        metadata.pin_mut().set_precision(12);
+        let child = ffi::make_column_metadata_with_name("element");
+        metadata.pin_mut().push_child(&child);
+
+        assert_eq!(metadata.name(), "amount");
+        assert_eq!(metadata.timezone(), "UTC");
+        assert!(metadata.has_precision());
+        assert_eq!(metadata.precision()?, 12);
+        assert_eq!(metadata.children_len(), 1);
+        assert_eq!(metadata.child(0)?.name(), "element");
+        metadata.pin_mut().clear_precision();
+        assert!(!metadata.has_precision());
+        assert!(metadata.precision().is_err());
+
+        let mut vector = ffi::make_column_metadata_vector();
+        vector.pin_mut().push(&metadata);
+        assert_eq!(vector.len(), 1);
+        assert_eq!(vector.get(0)?.name(), "amount");
+
+        let table = table_from_i32_columns(&[("ignored", vec![1, 2, 3])])?;
+        let table_view = unsafe { table.view() }?;
+        let mut table_metadata = ffi::get_table_metadata(&table_view)?;
+        let schema_metadata = ffi::make_column_metadata_with_name("renamed");
+        table_metadata.pin_mut().set(0, &schema_metadata)?;
+        let mut ffi_schema = FFI_ArrowSchema::empty();
+        unsafe {
+            ffi::to_arrow_schema(
+                &table_view,
+                &table_metadata,
+                &mut ffi_schema as *mut FFI_ArrowSchema as *mut u8,
+            )?;
+        }
+        let schema = Schema::try_from(&ffi_schema)?;
+        assert_eq!(schema.field(0).name(), "renamed");
+        Ok(())
+    }
+
+    #[test]
+    fn memory_configuration_bindings_preserve_upstream_shapes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let memory = ffi::available_device_memory()?;
+        assert!(memory.total_bytes() > 0);
+        assert!(memory.free_bytes() <= memory.total_bytes());
+
+        assert!(!ffi::make_pinned_mr_options().is_null());
+        assert!(!ffi::make_pinned_mr_options_with_pool_size(1 << 20).is_null());
+
+        let upstream = ffi::make_cuda_memory_resource();
+        let default_maximum = unsafe { ffi::make_pool_memory_resource(&upstream, 256) }?;
+        assert!(!unsafe { ffi::make_device_async_resource_ref(&default_maximum) }.is_null());
+        let explicit_maximum =
+            unsafe { ffi::make_pool_memory_resource_with_maximum(&upstream, 256, 256) }?;
+        assert!(!unsafe { ffi::make_device_async_resource_ref(&explicit_maximum) }.is_null());
         Ok(())
     }
 
@@ -2784,7 +3106,7 @@ mod tests {
         let mr = ffi::get_current_device_resource_ref();
         let (stream_view, resource_ref) = expect_stream_and_resource(&stream, &mr);
         Ok(unsafe {
-            ffi::table_from_arrow_host(schema_ptr, device_array_ptr, stream_view, resource_ref)
+            ffi::from_arrow_host(schema_ptr, device_array_ptr, stream_view, resource_ref)
         }?)
     }
 
@@ -2807,7 +3129,7 @@ mod tests {
         let mr = ffi::get_current_device_resource_ref();
         let (stream_view, resource_ref) = expect_stream_and_resource(&stream, &mr);
         Ok(unsafe {
-            ffi::table_from_arrow_host(schema_ptr, device_array_ptr, stream_view, resource_ref)
+            ffi::from_arrow_host(schema_ptr, device_array_ptr, stream_view, resource_ref)
         }?)
     }
 
@@ -2832,7 +3154,7 @@ mod tests {
         let mr = ffi::get_current_device_resource_ref();
         let (stream_view, resource_ref) = expect_stream_and_resource(&stream, &mr);
         Ok(unsafe {
-            ffi::table_from_arrow_host(schema_ptr, device_array_ptr, stream_view, resource_ref)
+            ffi::from_arrow_host(schema_ptr, device_array_ptr, stream_view, resource_ref)
         }?)
     }
 
@@ -2855,46 +3177,52 @@ mod tests {
         Ok(result.pin_mut().release_table())
     }
 
-    fn pretty_table(table_view: &ffi::TableView) -> Result<impl Display + use<>, ArrowError> {
-        let mut array = FFI_ArrowArray::empty();
+    fn pretty_table(
+        table_view: &ffi::TableView,
+    ) -> Result<impl Display + use<>, Box<dyn std::error::Error>> {
+        let mut device_array = ArrowDeviceArray::new_cpu();
         let mut schema = FFI_ArrowSchema::empty();
         let stream = ffi::get_default_stream();
         let resource = ffi::get_current_device_resource_ref();
         let (stream_view, resource_ref) = expect_stream_and_resource(&stream, &resource);
 
-        let data = unsafe {
-            table_view.to_arrow_array(
-                &mut array as *mut FFI_ArrowArray as *mut u8,
+        let metadata = ffi::get_table_metadata(table_view)?;
+        unsafe {
+            ffi::to_arrow_host_table(
+                table_view,
+                &mut device_array as *mut ArrowDeviceArray as *mut u8,
                 stream_view,
                 resource_ref,
-            );
-            table_view.to_arrow_schema(&mut schema as *mut FFI_ArrowSchema as *mut u8);
-
-            from_ffi(array, &schema).expect("ffi data should be valid")
-        };
+            )?;
+            ffi::to_arrow_schema(
+                table_view,
+                &metadata,
+                &mut schema as *mut FFI_ArrowSchema as *mut u8,
+            )?;
+        }
+        let data = unsafe { from_ffi(device_array.array, &schema)? };
 
         let record = RecordBatch::from(StructArray::from(data));
 
-        pretty_format_batches(&[record])
+        Ok(pretty_format_batches(&[record])?)
     }
 
     fn pretty_column(
         column_view: &ColumnView,
         data_type: DataType,
-    ) -> Result<impl Display + use<>, ArrowError> {
+    ) -> Result<impl Display + use<>, Box<dyn std::error::Error>> {
         let mut device_array = ArrowDeviceArray::new_cpu();
         let stream = ffi::get_default_stream();
         let resource = ffi::get_current_device_resource_ref();
         let (stream_view, resource_ref) = expect_stream_and_resource(&stream, &resource);
 
-        let data = unsafe {
+        unsafe {
             let device_array_ptr = &mut device_array as *mut ArrowDeviceArray as *mut u8;
-            column_view.to_arrow_array(device_array_ptr, stream_view, resource_ref);
-
-            from_ffi_and_data_type(device_array.array, data_type).expect("ffi data should be valid")
-        };
+            ffi::to_arrow_host_column(column_view, device_array_ptr, stream_view, resource_ref)?;
+        }
+        let data = unsafe { from_ffi_and_data_type(device_array.array, data_type)? };
 
         let array = make_array(data);
-        pretty_format_columns("test", &[array])
+        Ok(pretty_format_columns("test", &[array])?)
     }
 }

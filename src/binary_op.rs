@@ -140,7 +140,7 @@ pub fn cudf_binary_op(
         }
     }?;
     Ok(CuDFColumnViewOrScalar::ColumnView(
-        CuDFColumn::new(result).into_view(),
+        CuDFColumn::try_from_inner(result)?.into_view(),
     ))
 }
 
@@ -159,8 +159,8 @@ mod tests {
         let array1 = Decimal128Array::from(values1).with_precision_and_scale(38, 2)?;
         let array2 = Decimal128Array::from(values2).with_precision_and_scale(38, 2)?;
 
-        let col1 = CuDFColumn::from_arrow_host(&array1)?;
-        let col2 = CuDFColumn::from_arrow_host(&array2)?;
+        let col1 = CuDFColumn::try_from_arrow_host(&array1)?;
+        let col2 = CuDFColumn::try_from_arrow_host(&array2)?;
 
         // Add the two decimal columns
         let result = cudf_binary_op(
@@ -200,8 +200,8 @@ mod tests {
         let price_array = Decimal128Array::from(prices).with_precision_and_scale(38, 2)?;
         let qty_array = Decimal128Array::from(quantities).with_precision_and_scale(38, 0)?;
 
-        let col_price = CuDFColumn::from_arrow_host(&price_array)?;
-        let col_qty = CuDFColumn::from_arrow_host(&qty_array)?;
+        let col_price = CuDFColumn::try_from_arrow_host(&price_array)?;
+        let col_qty = CuDFColumn::try_from_arrow_host(&qty_array)?;
 
         // Multiply: result should have scale = 2 + 0 = 2
         let result = cudf_binary_op(

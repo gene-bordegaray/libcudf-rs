@@ -7,6 +7,7 @@
 #include <cuda_runtime_api.h>
 #include <rmm/cuda_stream.hpp>
 #include <rmm/cuda_stream_view.hpp>
+#include "rust/cxx.h"
 
 namespace libcudf_bridge {
     struct CudaEvent;
@@ -117,4 +118,13 @@ namespace libcudf_bridge {
 
     /// Set the current CUDA device ordinal.
     void cuda_set_device(int32_t device_id);
+
+    /// Direct wrapper for cudaMemcpy. Pointer values are integer-encoded for cxx.
+    int32_t cuda_memcpy(uintptr_t destination,
+                        uintptr_t source,
+                        size_t count,
+                        int32_t kind);
+
+    /// Direct wrapper for cudaGetErrorString.
+    rust::String cuda_get_error_string(int32_t error);
 } // namespace libcudf_bridge

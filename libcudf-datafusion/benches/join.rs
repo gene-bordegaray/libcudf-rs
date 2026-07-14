@@ -22,7 +22,7 @@ fn make_left(n: usize, right_key_range: usize) -> CuDFTable {
     let keys: Int64Array = (0..n).map(|i| (i % right_key_range) as i64).collect();
     let a: Int32Array = (0..n).map(|i| i as i32).collect();
     let b: Int32Array = (0..n).map(|i| (i * 2) as i32).collect();
-    CuDFTable::from_arrow_host(
+    CuDFTable::try_from_arrow_host(
         RecordBatch::try_new(schema, vec![Arc::new(keys), Arc::new(a), Arc::new(b)]).unwrap(),
     )
     .unwrap()
@@ -37,7 +37,7 @@ fn make_right(m: usize) -> CuDFTable {
     let keys: Int64Array = (0..m).map(|i| i as i64).collect();
     let x: Int32Array = (0..m).map(|i| i as i32).collect();
     let y: Int32Array = (0..m).map(|i| (i * 3) as i32).collect();
-    CuDFTable::from_arrow_host(
+    CuDFTable::try_from_arrow_host(
         RecordBatch::try_new(schema, vec![Arc::new(keys), Arc::new(x), Arc::new(y)]).unwrap(),
     )
     .unwrap()

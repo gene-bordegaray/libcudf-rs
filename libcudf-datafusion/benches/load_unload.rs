@@ -55,7 +55,7 @@ fn make_cpu_batches(total_rows: usize) -> Vec<RecordBatch> {
 fn load_plan(batches: Vec<RecordBatch>) -> Arc<dyn ExecutionPlan> {
     let schema = batches[0].schema();
     let mem = Arc::new(TestMemoryExec::try_new(&[batches], schema, None).unwrap());
-    Arc::new(CuDFLoadExec::try_new(mem).unwrap())
+    Arc::new(CuDFLoadExec::new(mem))
 }
 
 fn unload_plan(gpu_batches: Vec<RecordBatch>) -> Arc<dyn ExecutionPlan> {

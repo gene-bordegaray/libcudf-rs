@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <cudf/types.hpp>
@@ -14,6 +15,9 @@ namespace libcudf_bridge {
 
         /// Construct from a type_id and scale (for fixed_point types)
         DataType(int32_t type_id, int32_t scale);
+
+        /// Wrap an upstream data_type value.
+        explicit DataType(cudf::data_type type);
 
         /// Get the type_id
         int32_t id() const;
@@ -30,5 +34,16 @@ namespace libcudf_bridge {
 
     /// Create a DataType from a type_id and scale (for decimals)
     std::unique_ptr<DataType> new_data_type_with_scale(int32_t type_id, int32_t scale);
+
+    /// Return whether `type` has a fixed-width representation.
+    bool is_fixed_width(const DataType& type);
+
+    /// Return the byte width of a fixed-width `type`.
+    std::size_t size_of(const DataType& type);
+
+    /// Return the padded allocation size for a null mask.
+    std::size_t bitmask_allocation_size_bytes(
+        std::int32_t number_of_bits,
+        std::size_t padding_boundary);
 
 } // namespace libcudf_bridge

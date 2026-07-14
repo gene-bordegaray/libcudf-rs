@@ -16,7 +16,10 @@ use std::sync::Arc;
 ///
 /// This is a safe wrapper around cuDF's table type.
 pub struct CuDFTable {
+    view: Arc<UniquePtr<ffi::TableView>>,
     pub(crate) inner: UniquePtr<ffi::Table>,
+    num_rows: usize,
+    column_device_memory_sizes: Vec<usize>,
 }
 
 /// Result of reading Parquet with cuDF, including metadata needed for schema adaptation.
@@ -54,8 +57,20 @@ where
 
 impl CuDFTable {
     /// Create a CuDFTable from a raw FFI table (internal use)
-    pub(crate) fn from_inner(inner: UniquePtr<ffi::Table>) -> Self {
-        Self { inner }
+    pub(crate) fn try_from_inner(inner: UniquePtr<ffi::Table>) -> Result<Self, CuDFError> {
+        if inner.is_null() {
+            return Err(CuDFError::NullHandle("table"));
+        }
+        let num_rows = crate::errors::cudf_size_to_usize(inner.num_rows()?, "table row count")?;
+        let column_device_memory_sizes = table_column_device_memory_sizes(&inner)?;
+        // `inner` is stored alongside the view and therefore outlives it.
+        let view = unsafe { inner.view() }?;
+        Ok(Self {
+            inner,
+            view: Arc::new(view),
+            num_rows,
+            column_device_memory_sizes,
+        })
     }
     /// Create an empty table
     ///
@@ -64,27 +79,22 @@ impl CuDFTable {
     /// ```
     /// use libcudf_rs::CuDFTable;
     ///
-    /// let table = CuDFTable::default();
+    /// let table = CuDFTable::try_empty()?;
     /// assert_eq!(table.num_rows(), 0);
     /// assert_eq!(table.num_columns(), 0);
+    /// # Ok::<(), libcudf_rs::CuDFError>(())
     /// ```
-    pub(crate) fn new() -> Self {
-        Self {
-            inner: ffi::create_empty_table(),
-        }
+    pub fn try_empty() -> Result<Self, CuDFError> {
+        Self::try_from_inner(ffi::create_empty_table()?)
     }
 
-    pub(crate) fn from_ptr(inner: UniquePtr<ffi::Table>) -> Self {
-        Self { inner }
-    }
-
-    pub(crate) fn from_columns(mut columns: Vec<CuDFColumn>) -> Self {
+    pub(crate) fn try_from_columns(mut columns: Vec<CuDFColumn>) -> Result<Self, CuDFError> {
         let ptrs: Vec<_> = columns
             .iter_mut()
             .map(|col| col.inner.as_mut_ptr())
             .collect();
-        let inner = ffi::create_table_from_columns_move(&ptrs);
-        Self { inner }
+        let inner = unsafe { ffi::create_table_from_columns_move(&ptrs) }?;
+        Self::try_from_inner(inner)
     }
 
     /// Read a table from a Parquet file
@@ -106,20 +116,20 @@ impl CuDFTable {
     /// ```no_run
     /// use libcudf_rs::CuDFTable;
     ///
-    /// let table = CuDFTable::from_parquet("data.parquet")?;
+    /// let table = CuDFTable::read_parquet("data.parquet")?;
     /// # Ok::<(), libcudf_rs::CuDFError>(())
     /// ```
-    pub fn from_parquet<P: AsRef<Path>>(path: P) -> Result<Self, CuDFError> {
-        Self::from_parquet_files(std::slice::from_ref(&path))
+    pub fn read_parquet<P: AsRef<Path>>(path: P) -> Result<Self, CuDFError> {
+        Self::read_parquet_files(std::slice::from_ref(&path))
     }
 
     /// Read a table from one or more Parquet files.
-    pub fn from_parquet_files<P: AsRef<Path>>(paths: &[P]) -> Result<Self, CuDFError> {
-        Self::from_parquet_files_with_columns(paths, Option::<&[String]>::None)
+    pub fn read_parquet_files<P: AsRef<Path>>(paths: &[P]) -> Result<Self, CuDFError> {
+        Self::read_parquet_files_with_columns(paths, Option::<&[String]>::None)
     }
 
     /// Read selected columns from one or more Parquet files.
-    pub fn from_parquet_files_with_columns<P, S>(
+    pub fn read_parquet_files_with_columns<P, S>(
         paths: &[P],
         columns: Option<&[S]>,
     ) -> Result<Self, CuDFError>
@@ -127,30 +137,19 @@ impl CuDFTable {
         P: AsRef<Path>,
         S: AsRef<str>,
     {
-        Ok(Self::read_parquet_files_with_columns(paths, columns)?.table)
-    }
-
-    /// Read selected columns from one or more Parquet files with cuDF metadata.
-    pub fn read_parquet_files_with_columns<P, S>(
-        paths: &[P],
-        columns: Option<&[S]>,
-    ) -> Result<CuDFParquetReadResult, CuDFError>
-    where
-        P: AsRef<Path>,
-        S: AsRef<str>,
-    {
-        Self::read_parquet_files(CuDFParquetReadOptions {
+        Ok(Self::read_parquet_with_options(CuDFParquetReadOptions {
             paths,
             columns,
             row_groups: None,
             filter: None,
             allow_mismatched_pq_schemas: false,
             ignore_missing_columns: true,
-        })
+        })?
+        .table)
     }
 
     /// Read Parquet files with cuDF metadata.
-    pub fn read_parquet_files<P, S>(
+    pub fn read_parquet_with_options<P, S>(
         read_options: CuDFParquetReadOptions<'_, P, S>,
     ) -> Result<CuDFParquetReadResult, CuDFError>
     where
@@ -209,7 +208,7 @@ impl CuDFTable {
         P: AsRef<Path>,
         S: AsRef<str>,
     {
-        crate::config::ensure_pools_configured();
+        crate::config::ensure_pools_configured()?;
         let CuDFParquetReadOptions {
             paths,
             columns,
@@ -328,9 +327,10 @@ impl CuDFTable {
             .map(|index| result.schema_info_name(index))
             .collect();
         let inner = result.pin_mut().release_table();
-        let num_rows = inner.num_rows();
+        let table = Self::try_from_inner(inner)?;
+        let num_rows = table.num_rows();
         Ok(CuDFParquetReadResult {
-            table: Self { inner },
+            table,
             column_names,
             num_rows,
         })
@@ -359,7 +359,7 @@ impl CuDFTable {
 
         while reader.has_next() {
             let mut result = reader.read_chunk()?;
-            if !callback(Self::parquet_read_result_from_metadata(&mut result))? {
+            if !callback(Self::parquet_read_result_from_metadata(&mut result)?)? {
                 break;
             }
         }
@@ -368,17 +368,18 @@ impl CuDFTable {
 
     fn parquet_read_result_from_metadata(
         result: &mut UniquePtr<ffi::TableWithMetadata>,
-    ) -> CuDFParquetReadResult {
+    ) -> Result<CuDFParquetReadResult, CuDFError> {
         let column_names = (0..result.schema_info_count())
             .map(|index| result.schema_info_name(index))
             .collect();
         let inner = result.pin_mut().release_table();
-        let num_rows = inner.num_rows();
-        CuDFParquetReadResult {
-            table: Self { inner },
+        let table = Self::try_from_inner(inner)?;
+        let num_rows = table.num_rows();
+        Ok(CuDFParquetReadResult {
+            table,
             column_names,
             num_rows,
-        }
+        })
     }
 
     /// Write the table to a Parquet file
@@ -407,11 +408,10 @@ impl CuDFTable {
             ArrowError::InvalidArgumentError("Path contains invalid UTF-8".to_string())
         })?;
 
-        let view = self.inner.view();
         let sink = ffi::sink_info_from_file_path(path_str);
         let options = ffi::parquet_writer_options_create(
             sink.as_ref().expect("sink_info should not be null"),
-            &view,
+            &self.view,
         );
         let stream = ffi::get_default_stream();
         let _metadata = ffi::write_parquet(
@@ -447,11 +447,11 @@ impl CuDFTable {
     ///
     /// # let batch: RecordBatch = todo!();
     /// // Convert Arrow RecordBatch to cuDF table for GPU acceleration
-    /// let table = CuDFTable::from_arrow_host(batch)?;
+    /// let table = CuDFTable::try_from_arrow_host(batch)?;
     /// # Ok::<(), libcudf_rs::CuDFError>(())
     /// ```
-    pub fn from_arrow_host(batch: RecordBatch) -> Result<Self, CuDFError> {
-        crate::config::ensure_pools_configured();
+    pub fn try_from_arrow_host(batch: RecordBatch) -> Result<Self, CuDFError> {
+        crate::config::ensure_pools_configured()?;
         for col in batch.columns() {
             if is_cudf_array(col) {
                 return Err(ArrowError::InvalidArgumentError("Tried to move a RecordBatch from the host to CuDF, but a column was already in CuDF".to_string()))?;
@@ -471,7 +471,7 @@ impl CuDFTable {
         let stream = ffi::get_default_stream();
         let mr = ffi::get_current_device_resource_ref();
         let inner = unsafe {
-            ffi::table_from_arrow_host(
+            ffi::from_arrow_host(
                 schema_ptr,
                 device_array_ptr,
                 stream_ref(&stream)?,
@@ -479,7 +479,7 @@ impl CuDFTable {
             )
         }?;
 
-        Ok(Self { inner })
+        Self::try_from_inner(inner)
     }
 
     /// Get the number of rows in the table
@@ -489,11 +489,12 @@ impl CuDFTable {
     /// ```
     /// use libcudf_rs::CuDFTable;
     ///
-    /// let table = CuDFTable::default();
+    /// let table = CuDFTable::try_empty()?;
     /// assert_eq!(table.num_rows(), 0);
+    /// # Ok::<(), libcudf_rs::CuDFError>(())
     /// ```
     pub fn num_rows(&self) -> usize {
-        self.inner.num_rows()
+        self.num_rows
     }
 
     /// Get the number of columns in the table
@@ -503,11 +504,12 @@ impl CuDFTable {
     /// ```
     /// use libcudf_rs::CuDFTable;
     ///
-    /// let table = CuDFTable::default();
+    /// let table = CuDFTable::try_empty()?;
     /// assert_eq!(table.num_columns(), 0);
+    /// # Ok::<(), libcudf_rs::CuDFError>(())
     /// ```
     pub fn num_columns(&self) -> usize {
-        self.inner.num_columns()
+        self.column_device_memory_sizes.len()
     }
 
     /// Check if the table is empty
@@ -517,11 +519,17 @@ impl CuDFTable {
     /// ```
     /// use libcudf_rs::CuDFTable;
     ///
-    /// let table = CuDFTable::default();
+    /// let table = CuDFTable::try_empty()?;
     /// assert!(table.is_empty());
+    /// # Ok::<(), libcudf_rs::CuDFError>(())
     /// ```
     pub fn is_empty(&self) -> bool {
         self.num_rows() == 0
+    }
+
+    /// Return the bytes allocated for this table in device memory.
+    pub fn device_memory_size(&self) -> usize {
+        self.column_device_memory_sizes.iter().sum()
     }
 
     /// Get a non-owning view of this table
@@ -529,26 +537,29 @@ impl CuDFTable {
     /// The returned view borrows from this table and remains valid as long as
     /// the table exists.
     pub fn view(self: Arc<Self>) -> CuDFTableView {
-        CuDFTableView::new_with_ref(self.inner.view(), Some(self))
+        let view = Arc::clone(&self.view);
+        let num_rows = self.num_rows;
+        let sizes = self.column_device_memory_sizes.clone();
+        CuDFTableView::from_shared_view(view, Some(self), num_rows, sizes)
     }
 
     /// Get a non-owning view of this table
     pub fn into_view(self) -> CuDFTableView {
-        CuDFTableView::new_with_ref(self.inner.view(), Some(Arc::new(self)))
+        Arc::new(self).view()
     }
 
     /// Take ownership of the table's columns
     ///
     /// This consumes the table structure and returns its columns as a collection
     /// that can be individually released.
-    pub fn into_columns(mut self) -> Vec<CuDFColumn> {
-        let mut columns = self.inner.pin_mut().release();
+    pub fn into_columns(mut self) -> Result<Vec<CuDFColumn>, CuDFError> {
+        let mut columns = self.inner.pin_mut().release()?;
         let mut result = Vec::with_capacity(columns.len());
         for i in 0..columns.len() {
             let col = columns.pin_mut().release(i);
-            result.push(CuDFColumn::new(col));
+            result.push(CuDFColumn::try_from_inner(col));
         }
-        result
+        result.into_iter().collect()
     }
 
     /// Concatenate multiple table views into a single table
@@ -568,36 +579,40 @@ impl CuDFTable {
     /// ```no_run
     /// use libcudf_rs::CuDFTable;
     ///
-    /// let table1 = CuDFTable::from_parquet("data1.parquet")?;
-    /// let table2 = CuDFTable::from_parquet("data2.parquet")?;
+    /// let table1 = CuDFTable::read_parquet("data1.parquet")?;
+    /// let table2 = CuDFTable::read_parquet("data2.parquet")?;
     ///
     /// let views = vec![table1.into_view(), table2.into_view()];
     /// let concatenated = CuDFTable::concat(views)?;
     /// # Ok::<(), libcudf_rs::CuDFError>(())
     /// ```
     pub fn concat(views: Vec<CuDFTableView>) -> Result<Self, CuDFError> {
-        // The CuDFTableView need to leave at least until the ffi::concat_table_views operation
-        // has finished.
-        let mut _refs = Vec::with_capacity(views.len());
         let inner_views: Vec<_> = views
-            .into_iter()
-            .map(|v| {
-                _refs.push(v._ref.clone());
-                v.into_inner()
-            })
-            .collect();
+            .iter()
+            .map(CuDFTableView::clone_inner)
+            .collect::<Result<_, _>>()?;
         let stream = ffi::get_default_stream();
         let mr = ffi::get_current_device_resource_ref();
         let inner =
             ffi::concat_table_views(&inner_views, stream_ref(&stream)?, resource_ref(&mr)?)?;
-        Ok(Self { inner })
+        Self::try_from_inner(inner)
     }
 }
 
-impl Default for CuDFTable {
-    fn default() -> Self {
-        Self::new()
-    }
+fn table_column_device_memory_sizes(
+    table: &UniquePtr<ffi::Table>,
+) -> Result<Vec<usize>, CuDFError> {
+    let num_columns =
+        crate::errors::cudf_size_to_usize(table.num_columns()?, "table column count")?;
+    (0..num_columns)
+        .map(|index| {
+            let index = i32::try_from(index).map_err(|_| {
+                ArrowError::ComputeError("cuDF table column index overflowed i32".into())
+            })?;
+            let column = unsafe { table.get_column(index) }?;
+            Ok(column.alloc_size()?)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -607,17 +622,12 @@ mod tests {
     use arrow::datatypes::*;
 
     #[test]
-    fn test_empty_table() {
-        let table = CuDFTable::new();
+    fn test_empty_table() -> Result<(), Box<dyn std::error::Error>> {
+        let table = CuDFTable::try_empty()?;
         assert_eq!(table.num_rows(), 0);
         assert_eq!(table.num_columns(), 0);
         assert!(table.is_empty());
-    }
-
-    #[test]
-    fn test_default_table() {
-        let table = CuDFTable::default();
-        assert!(table.is_empty());
+        Ok(())
     }
 
     #[test]
@@ -669,7 +679,8 @@ mod tests {
         let batch =
             RecordBatch::try_new(Arc::new(schema), arrays).expect("Failed to create RecordBatch");
 
-        let table = CuDFTable::from_arrow_host(batch.clone()).expect("Failed to convert to cuDF");
+        let table =
+            CuDFTable::try_from_arrow_host(batch.clone()).expect("Failed to convert to cuDF");
 
         assert_eq!(table.num_rows(), 5);
         assert_eq!(table.num_columns(), 14);
@@ -729,7 +740,7 @@ mod tests {
         )
         .expect("Failed to create RecordBatch");
 
-        let table = CuDFTable::from_arrow_host(batch).expect("Failed to convert to cuDF");
+        let table = CuDFTable::try_from_arrow_host(batch).expect("Failed to convert to cuDF");
         assert_eq!(table.num_rows(), 0);
         assert_eq!(table.num_columns(), 2);
 
@@ -743,7 +754,7 @@ mod tests {
 
     #[test]
     fn test_arrow_parquet_roundtrip() {
-        let table = CuDFTable::from_parquet("testdata/weather/result-000000.parquet")
+        let table = CuDFTable::read_parquet("testdata/weather/result-000000.parquet")
             .expect("Failed to read parquet");
 
         let batch = table
@@ -754,7 +765,7 @@ mod tests {
         let original_rows = batch.num_rows();
         let original_cols = batch.num_columns();
 
-        let table2 = CuDFTable::from_arrow_host(batch).expect("Failed to convert from Arrow");
+        let table2 = CuDFTable::try_from_arrow_host(batch).expect("Failed to convert from Arrow");
 
         assert_eq!(table2.num_rows(), original_rows);
         assert_eq!(table2.num_columns(), original_cols);
@@ -762,7 +773,7 @@ mod tests {
 
     #[test]
     fn test_parquet_file_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
-        let table = CuDFTable::from_parquet("testdata/weather/result-000000.parquet")?;
+        let table = CuDFTable::read_parquet("testdata/weather/result-000000.parquet")?;
         let output = std::env::temp_dir().join(format!(
             "libcudf-rs-roundtrip-{}-{}.parquet",
             std::process::id(),
@@ -773,7 +784,7 @@ mod tests {
 
         let result = (|| -> Result<(), Box<dyn std::error::Error>> {
             table.to_parquet(&output)?;
-            let roundtrip = CuDFTable::from_parquet(&output)?;
+            let roundtrip = CuDFTable::read_parquet(&output)?;
 
             assert_eq!(roundtrip.num_rows(), table.num_rows());
             assert_eq!(roundtrip.num_columns(), table.num_columns());
@@ -788,7 +799,7 @@ mod tests {
     fn test_read_all_weather_files() {
         for i in 0..3 {
             let filename = format!("testdata/weather/result-{:06}.parquet", i);
-            let table = CuDFTable::from_parquet(&filename)
+            let table = CuDFTable::read_parquet(&filename)
                 .unwrap_or_else(|_| panic!("Failed to read {}", filename));
 
             assert!(table.num_rows() > 0);
@@ -804,7 +815,7 @@ mod tests {
         ];
         let columns = vec!["MinTemp".to_string(), "MaxTemp".to_string()];
 
-        let projected = CuDFTable::from_parquet_files_with_columns(&files, Some(&columns))?;
+        let projected = CuDFTable::read_parquet_files_with_columns(&files, Some(&columns))?;
 
         assert!(projected.num_rows() > 0);
         assert_eq!(projected.num_columns(), columns.len());

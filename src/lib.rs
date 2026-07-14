@@ -9,7 +9,7 @@
 //! use libcudf_rs::CuDFTable;
 //!
 //! // Read a Parquet file
-//! let table = CuDFTable::from_parquet("data.parquet").expect("Failed to read Parquet");
+//! let table = CuDFTable::read_parquet("data.parquet").expect("Failed to read Parquet");
 //! println!("Loaded table with {} rows and {} columns",
 //!          table.num_rows(), table.num_columns());
 //!

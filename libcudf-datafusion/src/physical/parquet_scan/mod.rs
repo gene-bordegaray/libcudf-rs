@@ -258,7 +258,7 @@ impl ExecutionPlan for CuDFParquetScanExec {
         builder.spawn_blocking(move || {
             for file_batch in scan_partition.batches() {
                 let mut compute_timer = Some(metrics.baseline.elapsed_compute().timer());
-                let result: datafusion::common::Result<_> = (|| {
+                let result: datafusion::common::Result<_> = {
                     metrics.record_file_batch(file_batch);
 
                     let mut read_timer = Some(metrics.read_time.timer());
@@ -286,8 +286,8 @@ impl ExecutionPlan for CuDFParquetScanExec {
                     if let Some(timer) = read_timer.take() {
                         timer.done();
                     }
-                    Ok(continued?)
-                })();
+                    continued
+                };
                 if let Some(timer) = compute_timer.take() {
                     timer.done();
                 }
@@ -590,7 +590,7 @@ mod tests {
     ) -> Result<CuDFAstExpression, Box<dyn std::error::Error>> {
         let mut filter = CuDFAstExpression::new();
         let column = filter.column_name_reference(column)?;
-        let value = CuDFScalar::from_arrow_host(Scalar::new(&Int32Array::from(vec![value])))?;
+        let value = CuDFScalar::try_from_arrow_host(Scalar::new(&Int32Array::from(vec![value])))?;
         let value = filter.literal(value)?;
         filter.binary_operation(CuDFAstOperator::Greater, column, value)?;
         Ok(filter)

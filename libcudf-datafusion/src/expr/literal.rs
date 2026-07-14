@@ -33,10 +33,10 @@ impl Hash for CuDFLiteral {
 }
 
 impl CuDFLiteral {
-    pub fn from_host(inner: Literal) -> datafusion::common::Result<Self> {
+    pub fn try_from_datafusion(inner: Literal) -> datafusion::common::Result<Self> {
         let value = normalize_scalar_for_cudf(inner.value().clone())?;
         let host_scalar = value.to_scalar()?;
-        let scalar = CuDFScalar::from_arrow_host(host_scalar).map_err(cudf_to_df)?;
+        let scalar = CuDFScalar::try_from_arrow_host(host_scalar).map_err(cudf_to_df)?;
         Ok(Self {
             inner,
             scalar: Arc::new(scalar),
@@ -97,17 +97,20 @@ mod tests {
 
     #[test]
     fn test_string_view_literals_lower_to_cudf_string() -> Result<(), Box<dyn std::error::Error>> {
-        let literal = CuDFLiteral::from_host(Literal::new(ScalarValue::Utf8View(Some(
+        let literal = CuDFLiteral::try_from_datafusion(Literal::new(ScalarValue::Utf8View(Some(
             "needle".to_string(),
         ))))?;
         assert_eq!(literal.scalar.data_type(), &DataType::Utf8);
 
-        let literal = CuDFLiteral::from_host(Literal::new(ScalarValue::BinaryView(Some(
-            b"needle".to_vec(),
-        ))))?;
+        let literal = CuDFLiteral::try_from_datafusion(Literal::new(ScalarValue::BinaryView(
+            Some(b"needle".to_vec()),
+        )))?;
         assert_eq!(literal.scalar.data_type(), &DataType::Utf8);
 
-        let err = CuDFLiteral::from_host(Literal::new(ScalarValue::BinaryView(Some(vec![0xff]))))
+        let err =
+            CuDFLiteral::try_from_datafusion(Literal::new(ScalarValue::BinaryView(Some(vec![
+                0xff,
+            ]))))
             .expect_err("invalid BinaryView literal should not lower to cuDF");
         assert!(matches!(err, DataFusionError::NotImplemented(_)));
         Ok(())

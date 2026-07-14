@@ -91,19 +91,32 @@ impl ParquetBatchReader {
     }
 }
 
-fn read_parquet_chunks<P>(
-    paths: &[P],
-    row_groups: Option<&[Vec<i32>]>,
-    read_columns: Option<&[String]>,
-    filter: Option<&CuDFAstExpression>,
+struct ParquetChunkReadArgs<'a, P> {
+    paths: &'a [P],
+    row_groups: Option<&'a [Vec<i32>]>,
+    read_columns: Option<&'a [String]>,
+    filter: Option<&'a CuDFAstExpression>,
     chunk_read_limit: usize,
     pass_read_limit: usize,
-    schema: &SchemaRef,
+    schema: &'a SchemaRef,
+}
+
+fn read_parquet_chunks<P>(
+    args: ParquetChunkReadArgs<'_, P>,
     emit: &mut impl FnMut(ReadBatch) -> datafusion::common::Result<bool>,
 ) -> datafusion::common::Result<ChunkReadOutcome>
 where
     P: AsRef<Path>,
 {
+    let ParquetChunkReadArgs {
+        paths,
+        row_groups,
+        read_columns,
+        filter,
+        chunk_read_limit,
+        pass_read_limit,
+        schema,
+    } = args;
     let mut emitted = false;
     let mut continued = true;
     let mut callback_error = None;
@@ -172,13 +185,15 @@ fn read_parquet_sources_together(
     let row_groups = explicit_row_groups_for_batch(batch)?;
 
     match read_parquet_chunks(
-        &files,
-        row_groups.as_deref(),
-        read_columns,
-        filter,
-        chunk_read_limit,
-        pass_read_limit,
-        schema,
+        ParquetChunkReadArgs {
+            paths: &files,
+            row_groups: row_groups.as_deref(),
+            read_columns,
+            filter,
+            chunk_read_limit,
+            pass_read_limit,
+            schema,
+        },
         emit,
     )? {
         ChunkReadOutcome::Finished { emitted, continued } => {
@@ -317,13 +332,15 @@ fn read_parquet_source(
         .indices()
         .map(|indices| vec![indices.to_vec()]);
     match read_parquet_chunks(
-        std::slice::from_ref(&source.path),
-        row_groups.as_deref(),
-        read_columns,
-        filter,
-        chunk_read_limit,
-        pass_read_limit,
-        schema,
+        ParquetChunkReadArgs {
+            paths: std::slice::from_ref(&source.path),
+            row_groups: row_groups.as_deref(),
+            read_columns,
+            filter,
+            chunk_read_limit,
+            pass_read_limit,
+            schema,
+        },
         emit,
     )? {
         ChunkReadOutcome::Finished { emitted, continued } => {
@@ -378,7 +395,7 @@ fn align_parquet_read(
     read: CuDFParquetReadResult,
     schema: &SchemaRef,
 ) -> datafusion::common::Result<ReadBatch> {
-    let columns = read.table.into_columns();
+    let columns = read.table.into_columns().map_err(cudf_to_df)?;
     if read.column_names.len() != columns.len() {
         return plan_err!(
             "cuDF returned {} parquet column names for {} columns",
@@ -414,8 +431,8 @@ fn null_column(
     num_rows: usize,
 ) -> datafusion::common::Result<CuDFColumn> {
     let scalar = normalize_scalar_for_cudf(ScalarValue::try_new_null(data_type)?)?;
-    let scalar = CuDFScalar::from_arrow_host(scalar.to_scalar()?).map_err(cudf_to_df)?;
-    CuDFColumn::from_scalar(&scalar, num_rows).map_err(cudf_to_df)
+    let scalar = CuDFScalar::try_from_arrow_host(scalar.to_scalar()?).map_err(cudf_to_df)?;
+    CuDFColumn::try_from_scalar(&scalar, num_rows).map_err(cudf_to_df)
 }
 
 fn parquet_batch_row_count(batch: &FileBatch) -> datafusion::common::Result<usize> {

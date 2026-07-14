@@ -3,11 +3,11 @@ use crate::device_resource::resource_ref;
 use crate::stream::stream_ref;
 use crate::{CuDFColumnView, CuDFError};
 use arrow::array::{Array, ArrayRef, RecordBatch, RecordBatchOptions, StructArray};
-use arrow::ffi::{from_ffi, FFI_ArrowArray};
+use arrow::ffi::from_ffi;
 use arrow_schema::ffi::FFI_ArrowSchema;
 use arrow_schema::{ArrowError, Schema, SchemaRef};
 use cxx::UniquePtr;
-use libcudf_sys::ffi;
+use libcudf_sys::{ffi, ArrowDeviceArray};
 use std::sync::Arc;
 
 /// A non-owning view of a GPU table
@@ -15,25 +15,39 @@ use std::sync::Arc;
 /// This is a safe wrapper around cuDF's table_view type.
 /// Views provide a lightweight way to reference table data without ownership.
 pub struct CuDFTableView {
-    // Keep the table alive so view remains valid
-    pub(crate) _ref: Option<Arc<dyn CuDFRef>>,
-    inner: UniquePtr<ffi::TableView>,
+    inner: Arc<UniquePtr<ffi::TableView>>,
+    // Keep cuDF owners alive until after the non-owning view is dropped.
+    pub(crate) keepalive: Option<Arc<dyn CuDFRef>>,
+    num_rows: usize,
+    column_device_memory_sizes: Vec<usize>,
 }
 
 impl CuDFTableView {
-    pub(crate) fn new_with_ref(
-        inner: UniquePtr<ffi::TableView>,
-        _ref: Option<Arc<dyn CuDFRef>>,
+    pub(crate) fn from_shared_view(
+        inner: Arc<UniquePtr<ffi::TableView>>,
+        keepalive: Option<Arc<dyn CuDFRef>>,
+        num_rows: usize,
+        column_device_memory_sizes: Vec<usize>,
     ) -> Self {
-        Self { _ref, inner }
+        Self {
+            inner,
+            keepalive,
+            num_rows,
+            column_device_memory_sizes,
+        }
     }
 
-    pub fn inner(&self) -> &UniquePtr<ffi::TableView> {
+    pub(crate) fn inner(&self) -> &UniquePtr<ffi::TableView> {
         &self.inner
     }
 
-    pub(crate) fn into_inner(self) -> UniquePtr<ffi::TableView> {
-        self.inner
+    pub(crate) fn clone_inner(&self) -> Result<UniquePtr<ffi::TableView>, CuDFError> {
+        let inner = self
+            .inner
+            .as_ref()
+            .as_ref()
+            .ok_or(CuDFError::NullHandle("table view"))?;
+        Ok(ffi::table_view_clone(inner)?)
     }
 
     /// Create a table view from a slice of column view references
@@ -57,27 +71,39 @@ impl CuDFTableView {
     /// // Create column views
     /// let col1 = Int32Array::from(vec![1, 2, 3]);
     /// let col2 = Int32Array::from(vec![4, 5, 6]);
-    /// let view1 = CuDFColumn::from_arrow_host(&col1)?.into_view();
-    /// let view2 = CuDFColumn::from_arrow_host(&col2)?.into_view();
+    /// let view1 = CuDFColumn::try_from_arrow_host(&col1)?.into_view();
+    /// let view2 = CuDFColumn::try_from_arrow_host(&col2)?.into_view();
     ///
     /// // Create a table view from the column views
-    /// let table_view = CuDFTableView::from_column_views(vec![view1, view2])?;
+    /// let table_view = CuDFTableView::try_from_column_views(vec![view1, view2])?;
     /// assert_eq!(table_view.num_columns(), 2);
     /// assert_eq!(table_view.num_rows(), 3);
     /// # Ok::<(), libcudf_rs::CuDFError>(())
     /// ```
-    pub fn from_column_views(column_views: Vec<CuDFColumnView>) -> Result<Self, CuDFError> {
+    pub fn try_from_column_views(column_views: Vec<CuDFColumnView>) -> Result<Self, CuDFError> {
         let mut view_ptrs: Vec<*const ffi::ColumnView> = Vec::with_capacity(column_views.len());
-        let mut _refs = Vec::with_capacity(column_views.len());
+        let mut keepalives = Vec::with_capacity(column_views.len());
+        let column_device_memory_sizes = column_views
+            .iter()
+            .map(CuDFColumnView::device_memory_size)
+            .collect();
         for view in column_views {
-            view_ptrs.push(view.inner().as_ref().unwrap() as _);
-            _refs.push(Arc::new(view) as Arc<dyn CuDFRef>)
+            let inner = view
+                .inner()
+                .as_ref()
+                .ok_or(CuDFError::NullHandle("column view"))?;
+            view_ptrs.push(inner as _);
+            keepalives.push(Arc::new(view) as Arc<dyn CuDFRef>)
         }
 
-        let inner = ffi::create_table_view_from_column_views(&view_ptrs);
+        let inner = unsafe { ffi::create_table_view_from_column_views(&view_ptrs) }?;
+        let num_rows =
+            crate::errors::cudf_size_to_usize(inner.num_rows()?, "table-view row count")?;
         Ok(Self {
-            _ref: Some(Arc::new(_refs)),
-            inner,
+            inner: Arc::new(inner),
+            keepalive: Some(Arc::new(keepalives)),
+            num_rows,
+            column_device_memory_sizes,
         })
     }
 
@@ -88,12 +114,13 @@ impl CuDFTableView {
     /// ```
     /// use libcudf_rs::CuDFTable;
     ///
-    /// let table = CuDFTable::default();
+    /// let table = CuDFTable::try_empty()?;
     /// let view = table.into_view();
     /// assert_eq!(view.num_rows(), 0);
+    /// # Ok::<(), libcudf_rs::CuDFError>(())
     /// ```
     pub fn num_rows(&self) -> usize {
-        self.inner.num_rows()
+        self.num_rows
     }
 
     /// Get the number of columns in the table view
@@ -103,12 +130,13 @@ impl CuDFTableView {
     /// ```
     /// use libcudf_rs::CuDFTable;
     ///
-    /// let table = CuDFTable::default();
+    /// let table = CuDFTable::try_empty()?;
     /// let view = table.into_view();
     /// assert_eq!(view.num_columns(), 0);
+    /// # Ok::<(), libcudf_rs::CuDFError>(())
     /// ```
     pub fn num_columns(&self) -> usize {
-        self.inner.num_columns()
+        self.column_device_memory_sizes.len()
     }
 
     /// Check if the table view is empty
@@ -118,9 +146,10 @@ impl CuDFTableView {
     /// ```
     /// use libcudf_rs::CuDFTable;
     ///
-    /// let table = CuDFTable::default();
+    /// let table = CuDFTable::try_empty()?;
     /// let view = table.into_view();
     /// assert!(view.is_empty());
+    /// # Ok::<(), libcudf_rs::CuDFError>(())
     /// ```
     pub fn is_empty(&self) -> bool {
         self.num_rows() == 0
@@ -131,9 +160,23 @@ impl CuDFTableView {
     /// # Arguments
     ///
     /// * `index` - The column index (0-based)
-    pub fn column(&self, index: i32) -> CuDFColumnView {
-        let inner = self.inner.column(index);
-        CuDFColumnView::new_with_ref(inner, Some(Arc::new(self.clone())))
+    pub fn column(&self, index: i32) -> Result<CuDFColumnView, CuDFError> {
+        let usize_index = usize::try_from(index).map_err(|_| {
+            ArrowError::InvalidArgumentError(format!("negative column index {index}"))
+        })?;
+        if usize_index >= self.num_columns() {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "column index {index} out of bounds for {} columns",
+                self.num_columns()
+            ))
+            .into());
+        }
+        let inner = self.inner.column(index)?;
+        CuDFColumnView::try_from_inner_with_device_size(
+            inner,
+            Some(Arc::new(self.clone())),
+            self.column_device_memory_sizes.get(usize_index).copied(),
+        )
     }
 
     /// Convert the CuDF table allocated on the GPU to an Arrow RecordBatch allocated on the host.
@@ -152,7 +195,7 @@ impl CuDFTableView {
     /// ```no_run
     /// use libcudf_rs::CuDFTable;
     ///
-    /// let table = CuDFTable::from_parquet("data.parquet")?;
+    /// let table = CuDFTable::read_parquet("data.parquet")?;
     /// // Perform GPU operations...
     ///
     /// // Convert back to Arrow for further processing
@@ -161,22 +204,28 @@ impl CuDFTableView {
     /// ```
     pub fn to_arrow_host(&self) -> Result<RecordBatch, CuDFError> {
         let mut ffi_schema = FFI_ArrowSchema::empty();
-        let mut ffi_array = FFI_ArrowArray::empty();
+        let mut device_array = ArrowDeviceArray::new_cpu();
 
         unsafe {
-            self.inner
-                .to_arrow_schema(&mut ffi_schema as *mut FFI_ArrowSchema as *mut u8);
+            let metadata = ffi::get_table_metadata(self.inner())?;
+            ffi::to_arrow_schema(
+                self.inner(),
+                &metadata,
+                &mut ffi_schema as *mut FFI_ArrowSchema as *mut u8,
+            )?;
             let stream = ffi::get_default_stream();
             let mr = ffi::get_current_device_resource_ref();
-            self.inner.to_arrow_array(
-                &mut ffi_array as *mut FFI_ArrowArray as *mut u8,
+            ffi::to_arrow_host_table(
+                self.inner(),
+                &mut device_array as *mut ArrowDeviceArray as *mut u8,
                 stream_ref(&stream)?,
                 resource_ref(&mr)?,
-            );
+            )?;
+            stream_ref(&stream)?.synchronize()?;
         }
 
         let schema = Arc::new(Schema::try_from(&ffi_schema)?);
-        let array_data = unsafe { from_ffi(ffi_array, &ffi_schema)? };
+        let array_data = unsafe { from_ffi(device_array.array, &ffi_schema)? };
         let struct_array = StructArray::from(array_data);
 
         // Carry the row count explicitly so zero-column batches (e.g. produced by
@@ -194,8 +243,12 @@ impl CuDFTableView {
         // Extract schema information
         let mut ffi_schema = FFI_ArrowSchema::empty();
         unsafe {
-            self.inner
-                .to_arrow_schema(&mut ffi_schema as *mut FFI_ArrowSchema as *mut u8);
+            let metadata = ffi::get_table_metadata(self.inner())?;
+            ffi::to_arrow_schema(
+                self.inner(),
+                &metadata,
+                &mut ffi_schema as *mut FFI_ArrowSchema as *mut u8,
+            )?;
         }
         Ok(Schema::try_from(&ffi_schema)?)
     }
@@ -207,8 +260,11 @@ impl CuDFTableView {
     pub fn to_record_batch(&self) -> Result<RecordBatch, CuDFError> {
         // Create CuDFColumnView for each column (keeps data on GPU)
         let columns: Vec<ArrayRef> = (0..self.num_columns())
-            .map(|i| Arc::new(self.column(i as i32)) as _)
-            .collect();
+            .map(|i| {
+                self.column(i as i32)
+                    .map(|column| Arc::new(column) as ArrayRef)
+            })
+            .collect::<Result<_, _>>()?;
 
         let options = RecordBatchOptions::new().with_row_count(Some(self.num_rows()));
         Ok(RecordBatch::try_new_with_options(
@@ -236,8 +292,11 @@ impl CuDFTableView {
             )));
         }
         let columns: Vec<ArrayRef> = (0..self.num_columns())
-            .map(|i| Arc::new(self.column(i as i32)) as _)
-            .collect();
+            .map(|i| {
+                self.column(i as i32)
+                    .map(|column| Arc::new(column) as ArrayRef)
+            })
+            .collect::<Result<_, _>>()?;
         record_batch_with_schema(columns, schema, self.num_rows()).map_err(CuDFError::ArrowError)
     }
 
@@ -245,7 +304,7 @@ impl CuDFTableView {
     ///
     /// This expects the RecordBatch to already contain CuDF arrays allocated on GPU.
     /// The columns will be extracted and composed into a table view.
-    pub fn from_record_batch(batch: &RecordBatch) -> Result<Self, CuDFError> {
+    pub fn try_from_record_batch(batch: &RecordBatch) -> Result<Self, CuDFError> {
         let column_views: Result<Vec<_>, _> = batch
             .columns()
             .iter()
@@ -260,7 +319,7 @@ impl CuDFTableView {
             .collect();
         let column_views = column_views?;
 
-        Self::from_column_views(column_views)
+        Self::try_from_column_views(column_views)
     }
 }
 
@@ -298,8 +357,10 @@ pub fn record_batch_with_schema(
 impl Clone for CuDFTableView {
     fn clone(&self) -> Self {
         Self {
-            _ref: self._ref.clone(),
-            inner: self.inner.clone(),
+            inner: Arc::clone(&self.inner),
+            keepalive: self.keepalive.clone(),
+            num_rows: self.num_rows,
+            column_device_memory_sizes: self.column_device_memory_sizes.clone(),
         }
     }
 }

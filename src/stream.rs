@@ -37,46 +37,45 @@ pub struct CuDFStream {
 }
 
 impl CuDFStream {
-    /// Try to create a stream using the sync-default creation flag.
-    pub fn try_new() -> Result<Self> {
-        Ok(Self {
-            inner: libcudf_sys::ffi::cuda_stream_create()?,
-        })
+    fn try_from_inner(inner: UniquePtr<ffi::CudaStream>) -> Result<Self> {
+        if inner.is_null() {
+            return Err(CuDFError::NullHandle("CUDA stream"));
+        }
+        Ok(Self { inner })
     }
 
-    /// Create a stream using the sync-default creation flag.
-    pub fn new() -> Self {
-        Self::try_new().expect("failed to create CUDA stream")
+    /// Try to create a stream using the sync-default creation flag.
+    pub fn try_new() -> Result<Self> {
+        Self::try_from_inner(ffi::cuda_stream_create()?)
     }
 
     /// Try to create a stream with explicit creation flags.
     pub fn try_with_flags(flags: CuDFStreamFlags) -> Result<Self> {
-        Ok(Self {
-            inner: libcudf_sys::ffi::cuda_stream_create_with_flags(flags.into())?,
-        })
-    }
-
-    /// Create a stream with explicit creation flags.
-    pub fn with_flags(flags: CuDFStreamFlags) -> Self {
-        Self::try_with_flags(flags).expect("failed to create CUDA stream")
+        Self::try_from_inner(ffi::cuda_stream_create_with_flags(flags.into())?)
     }
 
     /// Block until all work submitted to this stream has completed.
     pub fn synchronize(&self) -> Result<()> {
-        self.inner().synchronize()?;
+        self.inner()?.synchronize()?;
         Ok(())
     }
 
-    /// Returns an owned [ffi::CudaStreamView] for this stream.
+    /// Returns a non-owning [ffi::CudaStreamView] for this stream.
+    ///
+    /// # Safety
+    ///
+    /// The returned view must not outlive `self`.
     #[allow(dead_code)]
-    pub(crate) fn view(&self) -> UniquePtr<ffi::CudaStreamView> {
-        ffi::cuda_stream_view(self.inner())
+    pub(crate) unsafe fn view(&self) -> Result<UniquePtr<ffi::CudaStreamView>> {
+        Ok(unsafe { ffi::cuda_stream_view(self.inner()?) })
     }
 
     /// Get a reference to the underlying FFI stream handle.
     #[allow(dead_code)]
-    pub(crate) fn inner(&self) -> &libcudf_sys::ffi::CudaStream {
-        self.inner.as_ref().expect("CudaStream should not be null")
+    pub(crate) fn inner(&self) -> Result<&ffi::CudaStream> {
+        self.inner
+            .as_ref()
+            .ok_or(CuDFError::NullHandle("CUDA stream"))
     }
 }
 
@@ -88,10 +87,4 @@ pub(crate) fn stream_ref(stream: &UniquePtr<ffi::CudaStreamView>) -> Result<&ffi
     stream
         .as_ref()
         .ok_or(CuDFError::NullHandle("CUDA stream view"))
-}
-
-impl Default for CuDFStream {
-    fn default() -> Self {
-        Self::new()
-    }
 }

@@ -21,6 +21,12 @@ namespace libcudf_bridge {
             static_cast<uint32_t>(cuda::event_flags::blocking_sync) == cudaEventBlockingSync);
         static_assert(
             static_cast<uint32_t>(cuda::event_flags::interprocess) == cudaEventInterprocess);
+        static_assert(static_cast<int32_t>(cudaMemcpyHostToHost) == 0);
+        static_assert(static_cast<int32_t>(cudaMemcpyHostToDevice) == 1);
+        static_assert(static_cast<int32_t>(cudaMemcpyDeviceToHost) == 2);
+        static_assert(static_cast<int32_t>(cudaMemcpyDeviceToDevice) == 3);
+        static_assert(static_cast<int32_t>(cudaMemcpyDefault) == 4);
+        static_assert(static_cast<int32_t>(cudaSuccess) == 0);
 
         [[nodiscard]] rmm::cuda_stream::flags to_rmm_flags(const uint32_t flags) {
             return static_cast<rmm::cuda_stream::flags>(flags);
@@ -160,5 +166,21 @@ namespace libcudf_bridge {
 
     void cuda_set_device(const int32_t device_id) {
         RMM_CUDA_TRY(cudaSetDevice(device_id));
+    }
+
+    int32_t cuda_memcpy(
+        const uintptr_t destination,
+        const uintptr_t source,
+        const size_t count,
+        const int32_t kind) {
+        return static_cast<int32_t>(cudaMemcpy(
+            reinterpret_cast<void*>(destination),
+            reinterpret_cast<void const*>(source),
+            count,
+            static_cast<cudaMemcpyKind>(kind)));
+    }
+
+    rust::String cuda_get_error_string(const int32_t error) {
+        return rust::String(cudaGetErrorString(static_cast<cudaError_t>(error)));
     }
 } // namespace libcudf_bridge

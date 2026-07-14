@@ -17,7 +17,7 @@ fn bench_arrow_roundtrip(c: &mut Criterion) {
         group.throughput(Throughput::Bytes((bytes * 2) as u64)); // Both conversions
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &_size| {
             b.iter(|| {
-                let table = CuDFTable::from_arrow_host(black_box(batch.clone())).unwrap();
+                let table = CuDFTable::try_from_arrow_host(black_box(batch.clone())).unwrap();
                 let result = table.into_view().to_arrow_host().unwrap();
                 black_box(result)
             });

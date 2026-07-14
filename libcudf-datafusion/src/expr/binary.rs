@@ -37,7 +37,7 @@ impl Hash for CuDFBinaryExpr {
 }
 
 impl CuDFBinaryExpr {
-    pub fn from_host(expr: BinaryExpr) -> Result<Self, DataFusionError> {
+    pub fn try_from_datafusion(expr: BinaryExpr) -> Result<Self, DataFusionError> {
         let left = expr_to_cudf_expr(expr.left().as_ref())?;
         let right = expr_to_cudf_expr(expr.right().as_ref())?;
         let op = map_op(expr.op()).ok_or_else(|| {
@@ -104,7 +104,7 @@ impl PhysicalExpr for CuDFBinaryExpr {
             *self.inner.op(),
             Arc::clone(&children[1]),
         );
-        Ok(Arc::new(Self::from_host(expr)?))
+        Ok(Arc::new(Self::try_from_datafusion(expr)?))
     }
 
     delegate! {
