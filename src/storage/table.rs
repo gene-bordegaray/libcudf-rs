@@ -1,7 +1,6 @@
 use crate::cudf_array::is_cudf_array;
 use crate::device_resource::resource_ref;
 use crate::stream::stream_ref;
-use crate::table_view::CuDFTableView;
 use crate::{CuDFAstExpression, CuDFColumn, CuDFError};
 use arrow::array::{Array, ArrayData, StructArray};
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
@@ -12,14 +11,20 @@ use libcudf_sys::{ffi, ArrowDeviceArray};
 use std::path::Path;
 use std::sync::Arc;
 
-/// A GPU-accelerated table (similar to a DataFrame)
-///
-/// This is a safe wrapper around cuDF's table type.
-pub struct CuDFTable {
+use super::table_view::{CuDFTableView, TableOwner};
+
+pub(crate) struct TableStorage {
     view: Arc<UniquePtr<ffi::TableView>>,
     pub(crate) inner: UniquePtr<ffi::Table>,
     num_rows: usize,
     column_device_memory_sizes: Vec<usize>,
+}
+
+/// A GPU-accelerated table (similar to a DataFrame)
+///
+/// This is a safe wrapper around cuDF's table type.
+pub struct CuDFTable {
+    storage: Arc<TableStorage>,
 }
 
 /// Result of reading Parquet with cuDF, including metadata needed for schema adaptation.
@@ -66,10 +71,12 @@ impl CuDFTable {
         // `inner` is stored alongside the view and therefore outlives it.
         let view = unsafe { inner.view() }?;
         Ok(Self {
-            inner,
-            view: Arc::new(view),
-            num_rows,
-            column_device_memory_sizes,
+            storage: Arc::new(TableStorage {
+                inner,
+                view: Arc::new(view),
+                num_rows,
+                column_device_memory_sizes,
+            }),
         })
     }
     /// Create an empty table
@@ -88,11 +95,12 @@ impl CuDFTable {
         Self::try_from_inner(ffi::create_empty_table()?)
     }
 
-    pub(crate) fn try_from_columns(mut columns: Vec<CuDFColumn>) -> Result<Self, CuDFError> {
-        let ptrs: Vec<_> = columns
-            .iter_mut()
-            .map(|col| col.inner.as_mut_ptr())
-            .collect();
+    pub(crate) fn try_from_columns(columns: Vec<CuDFColumn>) -> Result<Self, CuDFError> {
+        let columns = columns
+            .into_iter()
+            .map(CuDFColumn::try_into_inner)
+            .collect::<Result<Vec<_>, _>>()?;
+        let ptrs: Vec<_> = columns.iter().map(UniquePtr::as_mut_ptr).collect();
         let inner = unsafe { ffi::create_table_from_columns_move(&ptrs) }?;
         Self::try_from_inner(inner)
     }
@@ -412,7 +420,7 @@ impl CuDFTable {
         let sink = sink
             .as_ref()
             .ok_or(CuDFError::NullHandle("Parquet sink info"))?;
-        let options = ffi::parquet_writer_options_create(sink, &self.view)?;
+        let options = ffi::parquet_writer_options_create(sink, &self.storage.view)?;
         let stream = ffi::get_default_stream();
         let _metadata = ffi::write_parquet(
             options
@@ -494,7 +502,7 @@ impl CuDFTable {
     /// # Ok::<(), libcudf_rs::CuDFError>(())
     /// ```
     pub fn num_rows(&self) -> usize {
-        self.num_rows
+        self.storage.num_rows
     }
 
     /// Get the number of columns in the table
@@ -509,7 +517,7 @@ impl CuDFTable {
     /// # Ok::<(), libcudf_rs::CuDFError>(())
     /// ```
     pub fn num_columns(&self) -> usize {
-        self.column_device_memory_sizes.len()
+        self.storage.column_device_memory_sizes.len()
     }
 
     /// Check if the table is empty
@@ -529,7 +537,7 @@ impl CuDFTable {
 
     /// Return the bytes allocated for this table in device memory.
     pub fn device_memory_size(&self) -> usize {
-        self.column_device_memory_sizes.iter().sum()
+        self.storage.column_device_memory_sizes.iter().sum()
     }
 
     /// Get a non-owning view of this table
@@ -537,10 +545,13 @@ impl CuDFTable {
     /// The returned view borrows from this table and remains valid as long as
     /// the table exists.
     pub fn view(self: Arc<Self>) -> CuDFTableView {
-        let view = Arc::clone(&self.view);
-        let num_rows = self.num_rows;
-        let sizes = self.column_device_memory_sizes.clone();
-        CuDFTableView::from_shared_view(view, Some(self), num_rows, sizes)
+        let storage = Arc::clone(&self.storage);
+        CuDFTableView::from_shared_view(
+            Arc::clone(&storage.view),
+            TableOwner::Table(storage),
+            self.storage.num_rows,
+            self.storage.column_device_memory_sizes.clone(),
+        )
     }
 
     /// Get a non-owning view of this table
@@ -552,8 +563,13 @@ impl CuDFTable {
     ///
     /// This consumes the table structure and returns its columns as a collection
     /// that can be individually released.
-    pub fn into_columns(mut self) -> Result<Vec<CuDFColumn>, CuDFError> {
-        let mut columns = self.inner.pin_mut().release()?;
+    pub fn into_columns(self) -> Result<Vec<CuDFColumn>, CuDFError> {
+        let mut storage = Arc::try_unwrap(self.storage).map_err(|_| {
+            ArrowError::ComputeError(
+                "cannot consume a cuDF table while a view still owns it".into(),
+            )
+        })?;
+        let mut columns = storage.inner.pin_mut().release()?;
         let mut result = Vec::with_capacity(columns.len());
         for i in 0..columns.len() {
             let col = columns.pin_mut().release(i);

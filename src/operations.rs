@@ -1,11 +1,10 @@
 use crate::data_type::arrow_type_to_cudf_data_type;
 use crate::device_resource::resource_ref;
 use crate::stream::stream_ref;
-use crate::{CuDFColumn, CuDFColumnView, CuDFError, CuDFRef, CuDFTable, CuDFTableView};
+use crate::{CuDFColumn, CuDFColumnView, CuDFError, CuDFTable, CuDFTableView};
 use arrow::array::Array;
 use arrow_schema::{ArrowError, DataType};
 use libcudf_sys::{ffi, OutOfBoundsPolicy};
-use std::sync::Arc;
 
 /// Gather rows from a table based on a gather map
 ///
@@ -205,7 +204,7 @@ pub fn slice_column(
     }
     // SAFETY: the result keeps `column` alive for the lifetime of the view.
     let inner = unsafe { views.get(0) }?;
-    CuDFColumnView::try_from_inner(inner, Some(Arc::new(column.clone()) as Arc<dyn CuDFRef>))
+    CuDFColumnView::try_from_inner(inner, column.owner().clone())
 }
 
 /// Cast a column to a different data type on the GPU
@@ -247,6 +246,7 @@ mod tests {
     use super::*;
     use arrow::array::*;
     use arrow_schema::{Field, Schema};
+    use std::sync::Arc;
 
     #[test]
     fn gather_nullifies_out_of_bounds_indices() -> Result<(), Box<dyn std::error::Error>> {

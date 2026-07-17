@@ -1,4 +1,3 @@
-use crate::cudf_reference::CuDFRef;
 use crate::device_resource::resource_ref;
 use crate::stream::stream_ref;
 use crate::{CuDFColumnView, CuDFError};
@@ -10,6 +9,25 @@ use cxx::UniquePtr;
 use libcudf_sys::{ffi, ArrowDeviceArray};
 use std::sync::Arc;
 
+use super::column_view::ColumnOwner;
+use super::table::TableStorage;
+
+#[allow(dead_code)]
+#[derive(Clone)]
+pub(crate) enum TableOwner {
+    Table(Arc<TableStorage>),
+    Columns(Arc<[CuDFColumnView]>),
+}
+
+impl TableOwner {
+    fn column_owner(&self, index: usize) -> ColumnOwner {
+        match self {
+            Self::Table(storage) => ColumnOwner::Table(Arc::clone(storage)),
+            Self::Columns(columns) => columns[index].owner().clone(),
+        }
+    }
+}
+
 /// A non-owning view of a GPU table
 ///
 /// This is a safe wrapper around cuDF's table_view type.
@@ -17,7 +35,7 @@ use std::sync::Arc;
 pub struct CuDFTableView {
     inner: Arc<UniquePtr<ffi::TableView>>,
     // Keep cuDF owners alive until after the non-owning view is dropped.
-    pub(crate) keepalive: Option<Arc<dyn CuDFRef>>,
+    owner: TableOwner,
     num_rows: usize,
     column_device_memory_sizes: Vec<usize>,
 }
@@ -25,13 +43,13 @@ pub struct CuDFTableView {
 impl CuDFTableView {
     pub(crate) fn from_shared_view(
         inner: Arc<UniquePtr<ffi::TableView>>,
-        keepalive: Option<Arc<dyn CuDFRef>>,
+        owner: TableOwner,
         num_rows: usize,
         column_device_memory_sizes: Vec<usize>,
     ) -> Self {
         Self {
             inner,
-            keepalive,
+            owner,
             num_rows,
             column_device_memory_sizes,
         }
@@ -39,6 +57,10 @@ impl CuDFTableView {
 
     pub(crate) fn inner(&self) -> &UniquePtr<ffi::TableView> {
         &self.inner
+    }
+
+    pub(crate) fn owner(&self) -> &TableOwner {
+        &self.owner
     }
 
     pub(crate) fn clone_inner(&self) -> Result<UniquePtr<ffi::TableView>, CuDFError> {
@@ -81,27 +103,27 @@ impl CuDFTableView {
     /// # Ok::<(), libcudf_rs::CuDFError>(())
     /// ```
     pub fn try_from_column_views(column_views: Vec<CuDFColumnView>) -> Result<Self, CuDFError> {
-        let mut view_ptrs: Vec<*const ffi::ColumnView> = Vec::with_capacity(column_views.len());
-        let mut keepalives = Vec::with_capacity(column_views.len());
+        let column_views = Arc::<[CuDFColumnView]>::from(column_views);
         let column_device_memory_sizes = column_views
             .iter()
             .map(CuDFColumnView::device_memory_size)
             .collect();
-        for view in column_views {
-            let inner = view
-                .inner()
-                .as_ref()
-                .ok_or(CuDFError::NullHandle("column view"))?;
-            view_ptrs.push(inner as _);
-            keepalives.push(Arc::new(view) as Arc<dyn CuDFRef>)
-        }
+        let view_ptrs = column_views
+            .iter()
+            .map(|view| {
+                view.inner()
+                    .as_ref()
+                    .map(|inner| inner as *const ffi::ColumnView)
+                    .ok_or(CuDFError::NullHandle("column view"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         let inner = unsafe { ffi::create_table_view_from_column_views(&view_ptrs) }?;
         let num_rows =
             crate::errors::cudf_size_to_usize(inner.num_rows()?, "table-view row count")?;
         Ok(Self {
             inner: Arc::new(inner),
-            keepalive: Some(Arc::new(keepalives)),
+            owner: TableOwner::Columns(column_views),
             num_rows,
             column_device_memory_sizes,
         })
@@ -174,7 +196,7 @@ impl CuDFTableView {
         let inner = self.inner.column(index)?;
         CuDFColumnView::try_from_inner_with_device_size(
             inner,
-            Some(Arc::new(self.clone())),
+            self.owner.column_owner(usize_index),
             self.column_device_memory_sizes.get(usize_index).copied(),
         )
     }
@@ -358,9 +380,43 @@ impl Clone for CuDFTableView {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
-            keepalive: self.keepalive.clone(),
+            owner: self.owner.clone(),
             num_rows: self.num_rows,
             column_device_memory_sizes: self.column_device_memory_sizes.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::CuDFColumn;
+    use arrow::array::Int32Array;
+
+    #[test]
+    fn columns_from_composed_table_retain_exact_storage() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let first = CuDFColumn::try_from_arrow_host(&Int32Array::from(vec![1, 2, 3]))?.into_view();
+        let second = CuDFColumn::try_from_arrow_host(&Int32Array::from(vec![4, 5, 6]))?.into_view();
+        let first_owner = first.owner().clone();
+        let table = CuDFTableView::try_from_column_views(vec![first, second])?;
+        let column = table.column(0)?;
+
+        let ColumnOwner::Column(expected) = first_owner else {
+            panic!("input should retain owning column storage");
+        };
+        let ColumnOwner::Column(actual) = column.owner() else {
+            panic!("table column should retain its original column storage");
+        };
+        assert!(Arc::ptr_eq(&expected, actual));
+
+        drop(table);
+        let host = column.to_arrow_host()?;
+        let host = host
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .ok_or("expected Int32Array")?;
+        assert_eq!(host.values(), &[1, 2, 3]);
+        Ok(())
     }
 }

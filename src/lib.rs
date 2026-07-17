@@ -19,11 +19,8 @@
 
 mod ast;
 mod binary_op;
-mod column;
-mod column_view;
 mod config;
 mod cudf_array;
-mod cudf_reference;
 mod data_type;
 mod device_resource;
 mod errors;
@@ -31,18 +28,13 @@ mod group_by;
 mod join;
 mod operations;
 mod pinned;
-mod scalar;
 mod sort;
+mod storage;
 mod stream;
-mod table;
-mod table_view;
 
 pub use ast::{CuDFAstExpression, CuDFAstNode, CuDFAstOperator, CuDFAstTableReference};
 pub use binary_op::{cudf_binary_op, CuDFBinaryOp};
-pub use column::CuDFColumn;
-pub use column_view::CuDFColumnView;
 pub use cudf_array::*;
-pub use cudf_reference::CuDFRef;
 pub use errors::{CuDFError, Result};
 pub use group_by::*;
 pub use join::{
@@ -51,11 +43,9 @@ pub use join::{
 };
 pub use operations::{apply_boolean_mask, cast, gather, gather_unchecked, slice_column};
 pub use pinned::{pin_record_batch, synchronize_default_stream, PinnedHostBuffer};
-pub use scalar::CuDFScalar;
 pub use sort::{sort, sort_by_all, stable_sorted_order, SortOrder};
+pub use storage::*;
 pub use stream::{CuDFStream, CuDFStreamFlags};
-pub use table::*;
-pub use table_view::*;
 
 /// Get cuDF version information
 ///

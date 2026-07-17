@@ -10,13 +10,19 @@ use cxx::UniquePtr;
 use libcudf_sys::ffi;
 use std::sync::Arc;
 
+use super::column_view::{column_view_metadata, ColumnOwner, ColumnViewMetadata};
+
+pub(crate) struct ColumnStorage {
+    view: Arc<UniquePtr<ffi::ColumnView>>,
+    pub(crate) inner: UniquePtr<ffi::Column>,
+    metadata: ColumnViewMetadata,
+}
+
 /// A GPU-accelerated column (similar to an Arrow Array)
 ///
 /// This is a safe wrapper around cuDF's column type.
 pub struct CuDFColumn {
-    view: Arc<UniquePtr<ffi::ColumnView>>,
-    pub(crate) inner: UniquePtr<libcudf_sys::ffi::Column>,
-    metadata: crate::column_view::ColumnViewMetadata,
+    storage: Arc<ColumnStorage>,
 }
 
 impl CuDFColumn {
@@ -29,21 +35,34 @@ impl CuDFColumn {
         let device_memory_size = inner.alloc_size()?;
         // `inner` is stored alongside the view and therefore outlives it.
         let view = unsafe { inner.view() }?;
-        let metadata = crate::column_view::column_view_metadata(&view, Some(device_memory_size))?;
+        let metadata = column_view_metadata(&view, Some(device_memory_size))?;
         Ok(Self {
-            inner,
-            view: Arc::new(view),
-            metadata,
+            storage: Arc::new(ColumnStorage {
+                inner,
+                view: Arc::new(view),
+                metadata,
+            }),
         })
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.metadata.len()
+        self.storage.metadata.len()
+    }
+
+    pub(crate) fn try_into_inner(self) -> Result<UniquePtr<ffi::Column>, CuDFError> {
+        Arc::try_unwrap(self.storage)
+            .map(|storage| storage.inner)
+            .map_err(|_| {
+                ArrowError::ComputeError(
+                    "cannot transfer a cuDF column while a view still owns it".into(),
+                )
+                .into()
+            })
     }
 
     /// Return the bytes allocated for this column in device memory.
     pub fn device_memory_size(&self) -> usize {
-        self.metadata.device_memory_size()
+        self.storage.metadata.device_memory_size()
     }
 
     /// Convert an Arrow array to a cuDF column
@@ -114,9 +133,12 @@ impl CuDFColumn {
     /// Return a [CuDFColumnView] pointing to this [CuDFColumn]. The current [CuDFColumn] will
     /// be kept alive at least until the [CuDFColumnView] is dropped.
     pub fn view(self: Arc<Self>) -> CuDFColumnView {
-        let view = Arc::clone(&self.view);
-        let metadata = self.metadata.clone();
-        CuDFColumnView::from_shared_view(view, Some(self), metadata)
+        let storage = Arc::clone(&self.storage);
+        CuDFColumnView::from_shared_view(
+            Arc::clone(&storage.view),
+            ColumnOwner::Column(storage),
+            self.storage.metadata.clone(),
+        )
     }
 
     /// Consumes the current [CuDFColumn], returning a [CuDFColumnView] pointing to it.

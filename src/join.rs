@@ -1,9 +1,10 @@
 use crate::data_type::arrow_type_to_cudf_data_type;
 use crate::device_resource::resource_ref;
+use crate::storage::column_view::ColumnOwner;
+use crate::storage::table_view::TableOwner;
 use crate::stream::stream_ref;
 use crate::{
-    CuDFAstExpression, CuDFColumn, CuDFColumnView, CuDFError, CuDFRef, CuDFScalar, CuDFTable,
-    CuDFTableView,
+    CuDFAstExpression, CuDFColumn, CuDFColumnView, CuDFError, CuDFScalar, CuDFTable, CuDFTableView,
 };
 use arrow::array::{Array, BooleanArray, Int32Array, Scalar};
 use arrow_schema::DataType;
@@ -41,7 +42,7 @@ pub struct CuDFFilteredHashJoinArgs<'a> {
     pub probe_out_cols: Option<&'a [usize]>,
 }
 
-struct JoinIndexVector {
+pub(crate) struct JoinIndexVector {
     inner: UniquePtr<ffi::DeviceIndexVector>,
 }
 
@@ -64,13 +65,10 @@ impl JoinIndexVector {
     }
 
     fn view(self: Arc<Self>) -> Result<CuDFColumnView, CuDFError> {
-        // `self` is retained through the `CuDFRef` stored in the returned view.
         let view = unsafe { self.inner.view() };
-        CuDFColumnView::try_from_inner(view, Some(self))
+        CuDFColumnView::try_from_inner(view, ColumnOwner::JoinIndices(self))
     }
 }
-
-impl CuDFRef for JoinIndexVector {}
 
 fn null_gather_index() -> i32 {
     ffi::join_no_match()
@@ -437,7 +435,7 @@ pub struct CuDFHashJoin {
     inner: UniquePtr<ffi::HashJoin>,
     build_rows: usize,
     matched_build_mask: Option<Arc<CuDFColumn>>,
-    _build_keepalive: Option<Arc<dyn CuDFRef>>,
+    _build_keepalive: TableOwner,
 }
 
 /// Controls whether null join-key values compare equal.
@@ -476,7 +474,7 @@ impl CuDFHashJoin {
             inner,
             build_rows: build.num_rows(),
             matched_build_mask: None,
-            _build_keepalive: build.keepalive.clone(),
+            _build_keepalive: build.owner().clone(),
         })
     }
 

@@ -1,9 +1,7 @@
-use crate::cudf_reference::CuDFRef;
 use crate::device_resource::resource_ref;
 use crate::errors::Result;
 use crate::stream::stream_ref;
-use crate::table_view::CuDFTableView;
-use crate::{CuDFColumn, CuDFColumnView, CuDFTable};
+use crate::{CuDFColumn, CuDFColumnView, CuDFTable, CuDFTableView};
 use cxx::UniquePtr;
 use libcudf_sys::ffi::{
     self, aggregation_request_create, aggregation_requests_create, make_count_aggregation_groupby,
@@ -21,7 +19,7 @@ use std::sync::Arc;
 /// multiple aggregations.
 pub struct CuDFGroupBy {
     inner: UniquePtr<ffi::GroupBy>,
-    _keepalive: Option<Arc<dyn CuDFRef>>,
+    _keepalive: Arc<CuDFTableView>,
 }
 
 impl CuDFGroupBy {
@@ -41,7 +39,7 @@ impl CuDFGroupBy {
         );
         Self {
             inner,
-            _keepalive: Some(Arc::new(view)),
+            _keepalive: Arc::new(view),
         }
     }
 
@@ -90,7 +88,7 @@ impl CuDFGroupBy {
 /// perform on it. Multiple aggregations can be added to a single request.
 pub struct AggregationRequest {
     inner: UniquePtr<ffi::AggregationRequest>,
-    keepalive: Option<Arc<dyn CuDFRef>>,
+    keepalive: Arc<CuDFColumnView>,
 }
 
 impl AggregationRequest {
@@ -102,7 +100,7 @@ impl AggregationRequest {
         let inner = aggregation_request_create(view.inner());
         Self {
             inner,
-            keepalive: Some(Arc::new(view)),
+            keepalive: Arc::new(view),
         }
     }
 

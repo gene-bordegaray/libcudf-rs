@@ -1,6 +1,6 @@
-use crate::cudf_reference::CuDFRef;
 use crate::data_type::cudf_type_to_arrow;
 use crate::device_resource::resource_ref;
+use crate::join::JoinIndexVector;
 use crate::stream::stream_ref;
 use crate::{slice_column, CuDFError};
 use arrow::array::{Array, ArrayData, ArrayRef};
@@ -13,7 +13,18 @@ use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, OnceLock};
 
+use super::column::ColumnStorage;
+use super::table::TableStorage;
+
 const CUDF_NULL_MASK_PADDING: usize = 64;
+
+#[allow(dead_code)]
+#[derive(Clone)]
+pub(crate) enum ColumnOwner {
+    Column(Arc<ColumnStorage>),
+    Table(Arc<TableStorage>),
+    JoinIndices(Arc<JoinIndexVector>),
+}
 
 #[derive(Clone)]
 pub(crate) struct ColumnViewMetadata {
@@ -48,7 +59,7 @@ impl ColumnViewMetadata {
 pub struct CuDFColumnView {
     inner: Arc<UniquePtr<ffi::ColumnView>>,
     // Keep cuDF owners alive until after the non-owning view is dropped.
-    pub(crate) keepalive: Option<Arc<dyn CuDFRef>>,
+    owner: ColumnOwner,
     metadata: ColumnViewMetadata,
     null_buf: OnceLock<Option<NullBuffer>>,
 }
@@ -59,20 +70,20 @@ impl CuDFColumnView {
     /// This is used internally to create column views that keep the source table or column alive
     pub(crate) fn try_from_inner(
         inner: UniquePtr<ffi::ColumnView>,
-        keepalive: Option<Arc<dyn CuDFRef>>,
+        owner: ColumnOwner,
     ) -> Result<Self, CuDFError> {
-        Self::try_from_inner_with_device_size(inner, keepalive, None)
+        Self::try_from_inner_with_device_size(inner, owner, None)
     }
 
     pub(crate) fn try_from_inner_with_device_size(
         inner: UniquePtr<ffi::ColumnView>,
-        keepalive: Option<Arc<dyn CuDFRef>>,
+        owner: ColumnOwner,
         device_memory_size: Option<usize>,
     ) -> Result<Self, CuDFError> {
         let metadata = column_view_metadata(&inner, device_memory_size)?;
         Ok(Self {
             inner: Arc::new(inner),
-            keepalive,
+            owner,
             metadata,
             null_buf: OnceLock::new(),
         })
@@ -80,12 +91,12 @@ impl CuDFColumnView {
 
     pub(crate) fn from_shared_view(
         inner: Arc<UniquePtr<ffi::ColumnView>>,
-        keepalive: Option<Arc<dyn CuDFRef>>,
+        owner: ColumnOwner,
         metadata: ColumnViewMetadata,
     ) -> Self {
         Self {
             inner,
-            keepalive,
+            owner,
             metadata,
             null_buf: OnceLock::new(),
         }
@@ -93,6 +104,10 @@ impl CuDFColumnView {
 
     pub(crate) fn inner(&self) -> &UniquePtr<ffi::ColumnView> {
         &self.inner
+    }
+
+    pub(crate) fn owner(&self) -> &ColumnOwner {
+        &self.owner
     }
 
     pub(crate) fn clone_inner(&self) -> Result<UniquePtr<ffi::ColumnView>, CuDFError> {
@@ -112,7 +127,7 @@ impl CuDFColumnView {
         metadata.dt = dt;
         Self {
             inner: self.inner,
-            keepalive: self.keepalive,
+            owner: self.owner,
             metadata,
             null_buf: self.null_buf,
         }
@@ -245,7 +260,7 @@ impl Clone for CuDFColumnView {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
-            keepalive: self.keepalive.clone(),
+            owner: self.owner.clone(),
             metadata: self.metadata.clone(),
             null_buf: self.null_buf.clone(),
         }
@@ -436,8 +451,9 @@ pub(crate) fn column_view_memory_sizes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::CuDFColumn;
+    use crate::{slice_column, CuDFColumn};
     use arrow::array::{Int32Array, StringArray};
+    use std::sync::Arc;
 
     #[test]
     fn test_column_view_clone() -> Result<(), Box<dyn std::error::Error>> {
@@ -458,6 +474,39 @@ mod tests {
             "Cloned view should point to the same GPU memory"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn sliced_views_retain_the_original_storage() -> Result<(), Box<dyn std::error::Error>> {
+        let column = Arc::new(CuDFColumn::try_from_arrow_host(&Int32Array::from(vec![
+            1, 2, 3, 4,
+        ]))?);
+        let view = Arc::clone(&column).view();
+        let first_slice = slice_column(&view, 1, 3)?;
+        let second_slice = slice_column(&first_slice, 1, 1)?;
+
+        let ColumnOwner::Column(original) = view.owner() else {
+            panic!("column view should retain owning column storage");
+        };
+        let ColumnOwner::Column(first) = first_slice.owner() else {
+            panic!("slice should retain owning column storage directly");
+        };
+        let ColumnOwner::Column(second) = second_slice.owner() else {
+            panic!("nested slice should retain owning column storage directly");
+        };
+        assert!(Arc::ptr_eq(original, first));
+        assert!(Arc::ptr_eq(original, second));
+
+        drop(view);
+        drop(first_slice);
+        drop(column);
+        let host = second_slice.to_arrow_host()?;
+        let host = host
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .ok_or("expected Int32Array")?;
+        assert_eq!(host.values(), &[3]);
         Ok(())
     }
 
