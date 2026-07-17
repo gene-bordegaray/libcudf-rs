@@ -1,6 +1,6 @@
 use crate::data_type::cudf_type_to_arrow;
 use crate::device_resource::resource_ref;
-use crate::join::JoinIndexVector;
+use crate::operations::join::JoinIndexVector;
 use crate::stream::stream_ref;
 use crate::{slice_column, CuDFError};
 use arrow::array::{Array, ArrayData, ArrayRef};
@@ -27,7 +27,7 @@ pub(crate) enum ColumnOwner {
 }
 
 #[derive(Clone)]
-pub(crate) struct ColumnViewMetadata {
+pub(super) struct ColumnViewMetadata {
     dt: DataType,
     len: usize,
     offset: usize,
@@ -35,16 +35,16 @@ pub(crate) struct ColumnViewMetadata {
     nullable: bool,
     buffer_memory_size: usize,
     array_memory_size: usize,
-    device_memory_size: usize,
+    retained_device_memory_size: usize,
 }
 
 impl ColumnViewMetadata {
-    pub(crate) fn len(&self) -> usize {
+    pub(super) fn len(&self) -> usize {
         self.len
     }
 
-    pub(crate) fn device_memory_size(&self) -> usize {
-        self.device_memory_size
+    pub(super) fn retained_device_memory_size(&self) -> usize {
+        self.retained_device_memory_size
     }
 }
 
@@ -72,15 +72,7 @@ impl CuDFColumnView {
         inner: UniquePtr<ffi::ColumnView>,
         owner: ColumnOwner,
     ) -> Result<Self, CuDFError> {
-        Self::try_from_inner_with_device_size(inner, owner, None)
-    }
-
-    pub(crate) fn try_from_inner_with_device_size(
-        inner: UniquePtr<ffi::ColumnView>,
-        owner: ColumnOwner,
-        device_memory_size: Option<usize>,
-    ) -> Result<Self, CuDFError> {
-        let metadata = column_view_metadata(&inner, device_memory_size)?;
+        let metadata = column_view_metadata(&inner, None)?;
         Ok(Self {
             inner: Arc::new(inner),
             owner,
@@ -89,7 +81,38 @@ impl CuDFColumnView {
         })
     }
 
-    pub(crate) fn from_shared_view(
+    pub(super) fn try_from_table_column(
+        inner: UniquePtr<ffi::ColumnView>,
+        owner: ColumnOwner,
+        array_device_memory_size: usize,
+        retained_device_memory_size: usize,
+    ) -> Result<Self, CuDFError> {
+        let mut metadata = column_view_metadata(&inner, Some(array_device_memory_size))?;
+        metadata.retained_device_memory_size = retained_device_memory_size;
+        Ok(Self {
+            inner: Arc::new(inner),
+            owner,
+            metadata,
+            null_buf: OnceLock::new(),
+        })
+    }
+
+    pub(crate) fn try_from_slice_inner(
+        inner: UniquePtr<ffi::ColumnView>,
+        owner: ColumnOwner,
+        retained_device_memory_size: usize,
+    ) -> Result<Self, CuDFError> {
+        let mut metadata = column_view_metadata(&inner, None)?;
+        metadata.retained_device_memory_size = retained_device_memory_size;
+        Ok(Self {
+            inner: Arc::new(inner),
+            owner,
+            metadata,
+            null_buf: OnceLock::new(),
+        })
+    }
+
+    pub(super) fn from_shared_view(
         inner: Arc<UniquePtr<ffi::ColumnView>>,
         owner: ColumnOwner,
         metadata: ColumnViewMetadata,
@@ -185,19 +208,34 @@ impl CuDFColumnView {
         Ok(arrow::array::make_array(array_data))
     }
 
-    /// Return the device buffer memory used by this column view.
+    /// Return cached view-local device buffer bytes for Arrow memory reporting.
+    ///
+    /// For a variable-width slice, this excludes payload bytes that cannot be
+    /// determined passively without reading device offsets.
     pub fn get_buffer_memory_size(&self) -> Result<usize, CuDFError> {
         Ok(self.metadata.buffer_memory_size)
     }
 
-    /// Return the total device memory used by this column view, including child buffers.
+    /// Return cached view-local device bytes, including visible child buffers.
+    ///
+    /// For a variable-width slice, this excludes payload bytes that cannot be
+    /// determined passively. Use [`Self::retained_device_memory_size`] for the
+    /// exact allocation kept alive by this view.
     pub fn get_array_memory_size(&self) -> Result<usize, CuDFError> {
         Ok(self.metadata.array_memory_size)
     }
 
-    /// Return the allocation retained by this view.
+    /// Return the device allocation retained by this view's owner.
+    ///
+    /// This can be larger than [`Self::get_array_memory_size`] for a slice,
+    /// because a view keeps its owner's complete allocation alive.
+    pub fn retained_device_memory_size(&self) -> usize {
+        self.metadata.retained_device_memory_size
+    }
+
+    /// Return the device allocation retained by this view's owner.
     pub fn device_memory_size(&self) -> usize {
-        self.metadata.device_memory_size
+        self.retained_device_memory_size()
     }
 
     /// Copy this view's physical null mask to host memory and cache it.
@@ -378,9 +416,9 @@ unsafe impl Array for CuDFColumnView {
     }
 }
 
-pub(crate) fn column_view_metadata(
+pub(super) fn column_view_metadata(
     inner: &UniquePtr<ffi::ColumnView>,
-    device_memory_size: Option<usize>,
+    array_device_memory_size: Option<usize>,
 ) -> Result<ColumnViewMetadata, CuDFError> {
     if inner.is_null() {
         return Err(CuDFError::NullHandle("column view"));
@@ -396,8 +434,8 @@ pub(crate) fn column_view_metadata(
     })?;
     let nullable = inner.nullable()?;
     let (mut buffer_memory_size, mut array_memory_size) = column_view_memory_sizes(inner)?;
-    let device_memory_size = device_memory_size.unwrap_or(array_memory_size);
-    if !ffi::is_fixed_width(&cudf_dtype) && device_memory_size > array_memory_size {
+    let device_memory_size = array_device_memory_size.unwrap_or(array_memory_size);
+    if offset == 0 && !ffi::is_fixed_width(&cudf_dtype) && device_memory_size > array_memory_size {
         let null_mask_size = array_memory_size.saturating_sub(buffer_memory_size);
         buffer_memory_size = device_memory_size.saturating_sub(null_mask_size);
         array_memory_size = device_memory_size;
@@ -410,11 +448,11 @@ pub(crate) fn column_view_metadata(
         nullable,
         buffer_memory_size,
         array_memory_size,
-        device_memory_size,
+        retained_device_memory_size: device_memory_size,
     })
 }
 
-pub(crate) fn column_view_memory_sizes(
+fn column_view_memory_sizes(
     inner: &UniquePtr<ffi::ColumnView>,
 ) -> Result<(usize, usize), CuDFError> {
     let Some(view) = inner.as_ref() else {
@@ -507,6 +545,53 @@ mod tests {
             .downcast_ref::<Int32Array>()
             .ok_or("expected Int32Array")?;
         assert_eq!(host.values(), &[3]);
+        Ok(())
+    }
+
+    #[test]
+    fn sliced_views_report_the_retained_allocation() -> Result<(), Box<dyn std::error::Error>> {
+        let column = CuDFColumn::try_from_arrow_host(&Int32Array::from(vec![1, 2, 3, 4]))?;
+        let retained_bytes = column.device_memory_size();
+        let slice = slice_column(&column.into_view(), 1, 1)?;
+
+        assert_eq!(slice.retained_device_memory_size(), retained_bytes);
+        assert!(slice.get_array_memory_size()? < retained_bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn variable_width_slices_keep_logical_and_retained_sizes_distinct(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let column = CuDFColumn::try_from_arrow_host(&StringArray::from(vec![
+            "a".repeat(1024),
+            "b".repeat(1024),
+            "c".repeat(1024),
+        ]))?;
+        let retained_bytes = column.device_memory_size();
+        let slice = slice_column(&column.into_view(), 1, 1)?;
+
+        assert_eq!(slice.retained_device_memory_size(), retained_bytes);
+        assert!(slice.get_array_memory_size()? < retained_bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn cached_column_metadata_is_passive() -> Result<(), Box<dyn std::error::Error>> {
+        let column = Arc::new(CuDFColumn::try_from_arrow_host(&Int32Array::from(vec![
+            Some(1),
+            None,
+            Some(3),
+        ]))?);
+
+        crate::test_activity::reset();
+        let view = Arc::clone(&column).view();
+        assert_eq!(view.len(), 3);
+        assert_eq!(view.null_count(), 1);
+        assert_eq!(
+            view.retained_device_memory_size(),
+            column.device_memory_size()
+        );
+        assert_eq!(crate::test_activity::accesses(), (0, 0));
         Ok(())
     }
 

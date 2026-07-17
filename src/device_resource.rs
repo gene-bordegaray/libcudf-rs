@@ -10,6 +10,8 @@ use crate::{CuDFError, Result};
 pub(crate) fn resource_ref(
     resource: &UniquePtr<ffi::DeviceAsyncResourceRef>,
 ) -> Result<&ffi::DeviceAsyncResourceRef> {
+    #[cfg(test)]
+    crate::test_activity::record_resource_access();
     resource
         .as_ref()
         .ok_or(CuDFError::NullHandle("current device resource ref"))

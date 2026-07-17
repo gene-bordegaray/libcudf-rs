@@ -14,7 +14,7 @@ use super::column_view::{column_view_metadata, ColumnOwner, ColumnViewMetadata};
 
 pub(crate) struct ColumnStorage {
     view: Arc<UniquePtr<ffi::ColumnView>>,
-    pub(crate) inner: UniquePtr<ffi::Column>,
+    inner: UniquePtr<ffi::Column>,
     metadata: ColumnViewMetadata,
 }
 
@@ -49,7 +49,7 @@ impl CuDFColumn {
         self.storage.metadata.len()
     }
 
-    pub(crate) fn try_into_inner(self) -> Result<UniquePtr<ffi::Column>, CuDFError> {
+    pub(super) fn try_into_inner(self) -> Result<UniquePtr<ffi::Column>, CuDFError> {
         Arc::try_unwrap(self.storage)
             .map(|storage| storage.inner)
             .map_err(|_| {
@@ -62,7 +62,7 @@ impl CuDFColumn {
 
     /// Return the bytes allocated for this column in device memory.
     pub fn device_memory_size(&self) -> usize {
-        self.storage.metadata.device_memory_size()
+        self.storage.metadata.retained_device_memory_size()
     }
 
     /// Convert an Arrow array to a cuDF column
@@ -133,6 +133,10 @@ impl CuDFColumn {
     /// Return a [CuDFColumnView] pointing to this [CuDFColumn]. The current [CuDFColumn] will
     /// be kept alive at least until the [CuDFColumnView] is dropped.
     pub fn view(self: Arc<Self>) -> CuDFColumnView {
+        self.view_from_storage()
+    }
+
+    fn view_from_storage(&self) -> CuDFColumnView {
         let storage = Arc::clone(&self.storage);
         CuDFColumnView::from_shared_view(
             Arc::clone(&storage.view),
@@ -143,7 +147,7 @@ impl CuDFColumn {
 
     /// Consumes the current [CuDFColumn], returning a [CuDFColumnView] pointing to it.
     pub fn into_view(self) -> CuDFColumnView {
-        Arc::new(self).view()
+        self.view_from_storage()
     }
 
     /// Concatenate multiple [CuDFColumnView]s into a single [CuDFColumn].

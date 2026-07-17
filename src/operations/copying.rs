@@ -204,7 +204,11 @@ pub fn slice_column(
     }
     // SAFETY: the result keeps `column` alive for the lifetime of the view.
     let inner = unsafe { views.get(0) }?;
-    CuDFColumnView::try_from_inner(inner, column.owner().clone())
+    CuDFColumnView::try_from_slice_inner(
+        inner,
+        column.owner().clone(),
+        column.retained_device_memory_size(),
+    )
 }
 
 /// Cast a column to a different data type on the GPU

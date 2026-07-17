@@ -1,15 +1,17 @@
 use crate::data_type::cudf_type_to_arrow;
-use crate::device_resource::resource_ref;
 use crate::stream::stream_ref;
-use crate::{CuDFColumn, CuDFError};
-use arrow::array::{Array, ArrayData, ArrayRef, Scalar};
-use arrow::buffer::NullBuffer;
+use crate::CuDFError;
+use arrow::array::ArrayData;
 use arrow_schema::DataType;
 use cxx::UniquePtr;
 use libcudf_sys::ffi;
-use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, RwLock};
+
+struct ScalarStorage {
+    inner: UniquePtr<ffi::Scalar>,
+    data_type: DataType,
+}
 
 /// A single value stored in GPU memory
 ///
@@ -17,8 +19,7 @@ use std::sync::{Arc, RwLock};
 /// This allows scalar values to be used in contexts that expect arrays, enabling
 /// seamless integration with operations that work on both scalars and columns.
 pub struct CuDFScalar {
-    inner: Arc<UniquePtr<ffi::Scalar>>,
-    dt: DataType,
+    storage: Arc<ScalarStorage>,
     cached_scalar: RwLock<Option<Arc<ArrayData>>>,
 }
 
@@ -29,19 +30,30 @@ impl CuDFScalar {
             return Err(CuDFError::NullHandle("scalar"));
         }
         let cudf_dtype = inner.data_type()?;
-        let dt = cudf_type_to_arrow(&cudf_dtype);
-        let dt = dt.unwrap_or(DataType::Null);
-        let cached_scalar = RwLock::new(None);
+        let data_type = cudf_type_to_arrow(&cudf_dtype).unwrap_or(DataType::Null);
         Ok(Self {
-            inner: Arc::new(inner),
-            dt,
-            cached_scalar,
+            storage: Arc::new(ScalarStorage { inner, data_type }),
+            cached_scalar: RwLock::new(None),
         })
     }
 
     /// Get a reference to the underlying cuDF scalar
     pub(crate) fn inner(&self) -> &UniquePtr<ffi::Scalar> {
-        &self.inner
+        &self.storage.inner
+    }
+
+    pub(crate) fn data_type_metadata(&self) -> &DataType {
+        &self.storage.data_type
+    }
+
+    pub(crate) fn cached_scalar_data(&self) -> Option<Arc<ArrayData>> {
+        self.cached_scalar.read().ok()?.as_ref().map(Arc::clone)
+    }
+
+    pub(crate) fn cache_scalar_data(&self, data: Arc<ArrayData>) {
+        if let Ok(mut cache) = self.cached_scalar.write() {
+            *cache = Some(data);
+        }
     }
 
     /// Return whether this scalar contains a valid value.
@@ -49,243 +61,20 @@ impl CuDFScalar {
         let stream = ffi::get_default_stream();
         Ok(self.inner().is_valid(stream_ref(&stream)?)?)
     }
-
-    /// Convert the cuDF scalar to a single-element Arrow array, copying data from GPU to host
-    ///
-    /// This copies the GPU data back to the CPU and creates an Arrow array containing a single
-    /// element.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The cuDF scalar cannot be converted to Arrow format
-    /// - There is an error copying data from GPU to host
-    /// - There is insufficient memory for the conversion
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use arrow::array::{Array, Int32Array, Scalar};
-    /// use libcudf_rs::CuDFScalar;
-    ///
-    /// // Create a cuDF scalar from an Arrow scalar
-    /// let array = Int32Array::from(vec![42]);
-    /// let scalar = Scalar::new(&array);
-    /// let cudf_scalar = CuDFScalar::try_from_arrow_host(scalar)?;
-    ///
-    /// // Convert back to Arrow (GPU -> CPU)
-    /// let arrow_array = cudf_scalar.to_arrow_host()?;
-    ///
-    /// // Verify the result
-    /// assert_eq!(arrow_array.len(), 1);
-    /// assert_eq!(arrow_array.null_count(), 0);
-    ///
-    /// // Downcast to specific type and get value
-    /// let int32_array = arrow_array
-    ///     .as_any()
-    ///     .downcast_ref::<Int32Array>()
-    ///     .expect("Expected Int32Array");
-    /// assert_eq!(int32_array.value(0), 42);
-    /// # Ok::<(), libcudf_rs::CuDFError>(())
-    /// ```
-    pub fn to_arrow_host(&self) -> Result<ArrayRef, CuDFError> {
-        let mut device_array = libcudf_sys::ArrowDeviceArray::new_cpu();
-
-        // Convert the scalar to Arrow format (copying from GPU to host)
-        // cuDF's to_arrow_array expects an ArrowDeviceArray pointer
-        unsafe {
-            let device_array_ptr =
-                &mut device_array as *mut libcudf_sys::ArrowDeviceArray as *mut u8;
-            let stream = ffi::get_default_stream();
-            let mr = ffi::get_current_device_resource_ref();
-            let column = ffi::make_column_from_scalar(
-                self.inner(),
-                1,
-                stream_ref(&stream)?,
-                resource_ref(&mr)?,
-            )?;
-            // The owning column remains alive through the Arrow conversion.
-            let column_view = column.view()?;
-            ffi::to_arrow_host_column(
-                &column_view,
-                device_array_ptr,
-                stream_ref(&stream)?,
-                resource_ref(&mr)?,
-            )?;
-            stream_ref(&stream)?.synchronize()?;
-        }
-
-        // Convert from FFI structures to Arrow ArrayData
-        // Extract just the ArrowArray part
-        let array_data =
-            unsafe { arrow::ffi::from_ffi_and_data_type(device_array.array, self.dt.clone())? };
-
-        // Create an ArrayRef from the ArrayData
-        Ok(arrow::array::make_array(array_data))
-    }
-
-    /// Convert an Arrow scalar to a cuDF scalar
-    ///
-    /// This creates a single-element column from the scalar, transfers it to GPU,
-    /// and extracts the scalar from that column.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The Arrow scalar cannot be converted to cuDF format
-    /// - There is insufficient GPU memory
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use arrow::array::{Int32Array, Scalar};
-    /// use libcudf_rs::CuDFScalar;
-    ///
-    /// let array = Int32Array::from(vec![42]);
-    /// let scalar = Scalar::new(&array);
-    /// let cudf_scalar = CuDFScalar::try_from_arrow_host(scalar)?;
-    /// # Ok::<(), libcudf_rs::CuDFError>(())
-    /// ```
-    pub fn try_from_arrow_host<T: Array>(scalar: Scalar<T>) -> Result<Self, CuDFError> {
-        // Convert scalar to a single-element array
-        let array = scalar.into_inner();
-
-        // Convert the array to a cuDF column (this copies to GPU)
-        let column = CuDFColumn::try_from_arrow_host(&array)?.into_view();
-
-        // Extract the scalar from the column at index 0
-        let stream = ffi::get_default_stream();
-        let mr = ffi::get_current_device_resource_ref();
-        let cudf_scalar =
-            ffi::get_element(column.inner(), 0, stream_ref(&stream)?, resource_ref(&mr)?)?;
-
-        Self::try_from_inner(cudf_scalar)
-    }
-
-    /// Get or compute the cached ArrayData for this scalar
-    ///
-    /// This method lazily converts the GPU scalar to CPU ArrayData and caches the results. This
-    /// avoids subsequent calls performing more expensive GPU->CPU transfer by returning the cached
-    /// data.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The scalar cannot be converted to Arrow format
-    /// - There is insufficient memory for the conversion
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use arrow::array::{Int32Array, Scalar};
-    /// use libcudf_rs::CuDFScalar;
-    ///
-    /// let array = Int32Array::from(vec![42]);
-    /// let scalar = Scalar::new(&array);
-    /// let cudf_scalar = CuDFScalar::try_from_arrow_host(scalar)?;
-    ///
-    /// // First call: converts GPU -> CPU and caches
-    /// let data1 = cudf_scalar.get_scalar_data()?;
-    ///
-    /// // Second call: returns cached data
-    /// let data2 = cudf_scalar.get_scalar_data()?;
-    ///
-    /// assert_eq!(data1.len(), 1);
-    /// assert_eq!(data2.len(), 1);
-    /// # Ok::<(), libcudf_rs::CuDFError>(())
-    /// ```
-    pub fn get_scalar_data(&self) -> Result<Arc<ArrayData>, CuDFError> {
-        if let Ok(cache) = self.cached_scalar.read() {
-            if let Some(cached_data) = cache.as_ref() {
-                return Ok(Arc::clone(cached_data));
-            }
-        }
-
-        let array_ref = self.to_arrow_host()?;
-        let array_data = Arc::new(array_ref.to_data());
-        if let Ok(mut cache) = self.cached_scalar.write() {
-            *cache = Some(Arc::clone(&array_data));
-        }
-
-        Ok(array_data)
-    }
 }
 
 impl Debug for CuDFScalar {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "CuDFScalar: type={}", self.dt)
+        write!(f, "CuDFScalar: type={}", self.storage.data_type)
     }
 }
 
 impl Clone for CuDFScalar {
     fn clone(&self) -> Self {
         Self {
-            inner: Arc::clone(&self.inner),
-            dt: self.dt.clone(),
+            storage: Arc::clone(&self.storage),
             cached_scalar: RwLock::new(None),
         }
-    }
-}
-
-unsafe impl Array for CuDFScalar {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn to_data(&self) -> ArrayData {
-        // WARNING: This performs a full GPU to CPU data transfer.
-        self.to_arrow_host()
-            .expect("Failed to convert GPU scalar to host Arrow")
-            .to_data()
-    }
-
-    fn into_data(self) -> ArrayData {
-        self.to_data()
-    }
-
-    fn data_type(&self) -> &DataType {
-        &self.dt
-    }
-
-    fn slice(&self, offset: usize, length: usize) -> ArrayRef {
-        if offset >= 1 || length == 0 {
-            arrow::array::new_empty_array(&self.dt)
-        } else {
-            Arc::new(Self {
-                inner: Arc::clone(&self.inner),
-                dt: self.dt.clone(),
-                cached_scalar: RwLock::new(None),
-            })
-        }
-    }
-
-    fn len(&self) -> usize {
-        1
-    }
-
-    fn is_empty(&self) -> bool {
-        false
-    }
-
-    fn offset(&self) -> usize {
-        0
-    }
-
-    fn nulls(&self) -> Option<&NullBuffer> {
-        None
-    }
-
-    fn get_buffer_memory_size(&self) -> usize {
-        self.get_scalar_data()
-            .map(|data| data.get_buffer_memory_size())
-            .unwrap_or(0)
-    }
-
-    fn get_array_memory_size(&self) -> usize {
-        // Array memory = buffer memory + null bitmap
-        self.get_scalar_data()
-            .map(|data| data.get_array_memory_size())
-            .unwrap_or(0)
     }
 }
 
@@ -800,6 +589,7 @@ mod tests {
             .expect("Failed to create scalar");
         let cloned = original.clone();
         assert_eq!(cloned.data_type(), original.data_type());
+        assert!(Arc::ptr_eq(&original.storage, &cloned.storage));
 
         Ok(())
     }

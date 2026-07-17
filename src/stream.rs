@@ -84,6 +84,8 @@ impl CuDFStream {
 /// cuDF should always return a valid stream view; this surfaces a Rust error if
 /// the FFI handle is unexpectedly null.
 pub(crate) fn stream_ref(stream: &UniquePtr<ffi::CudaStreamView>) -> Result<&ffi::CudaStreamView> {
+    #[cfg(test)]
+    crate::test_activity::record_stream_access();
     stream
         .as_ref()
         .ok_or(CuDFError::NullHandle("CUDA stream view"))

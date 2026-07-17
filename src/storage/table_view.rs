@@ -26,6 +26,13 @@ impl TableOwner {
             Self::Columns(columns) => columns[index].owner().clone(),
         }
     }
+
+    fn column_retained_device_memory_size(&self, index: usize) -> usize {
+        match self {
+            Self::Table(storage) => storage.device_memory_size(),
+            Self::Columns(columns) => columns[index].retained_device_memory_size(),
+        }
+    }
 }
 
 /// A non-owning view of a GPU table
@@ -37,21 +44,21 @@ pub struct CuDFTableView {
     // Keep cuDF owners alive until after the non-owning view is dropped.
     owner: TableOwner,
     num_rows: usize,
-    column_device_memory_sizes: Vec<usize>,
+    column_array_memory_sizes: Vec<usize>,
 }
 
 impl CuDFTableView {
-    pub(crate) fn from_shared_view(
+    pub(super) fn from_shared_view(
         inner: Arc<UniquePtr<ffi::TableView>>,
         owner: TableOwner,
         num_rows: usize,
-        column_device_memory_sizes: Vec<usize>,
+        column_array_memory_sizes: Vec<usize>,
     ) -> Self {
         Self {
             inner,
             owner,
             num_rows,
-            column_device_memory_sizes,
+            column_array_memory_sizes,
         }
     }
 
@@ -104,10 +111,10 @@ impl CuDFTableView {
     /// ```
     pub fn try_from_column_views(column_views: Vec<CuDFColumnView>) -> Result<Self, CuDFError> {
         let column_views = Arc::<[CuDFColumnView]>::from(column_views);
-        let column_device_memory_sizes = column_views
+        let column_array_memory_sizes = column_views
             .iter()
-            .map(CuDFColumnView::device_memory_size)
-            .collect();
+            .map(CuDFColumnView::get_array_memory_size)
+            .collect::<Result<Vec<_>, _>>()?;
         let view_ptrs = column_views
             .iter()
             .map(|view| {
@@ -125,7 +132,7 @@ impl CuDFTableView {
             inner: Arc::new(inner),
             owner: TableOwner::Columns(column_views),
             num_rows,
-            column_device_memory_sizes,
+            column_array_memory_sizes,
         })
     }
 
@@ -158,7 +165,7 @@ impl CuDFTableView {
     /// # Ok::<(), libcudf_rs::CuDFError>(())
     /// ```
     pub fn num_columns(&self) -> usize {
-        self.column_device_memory_sizes.len()
+        self.column_array_memory_sizes.len()
     }
 
     /// Check if the table view is empty
@@ -194,10 +201,11 @@ impl CuDFTableView {
             .into());
         }
         let inner = self.inner.column(index)?;
-        CuDFColumnView::try_from_inner_with_device_size(
+        CuDFColumnView::try_from_table_column(
             inner,
             self.owner.column_owner(usize_index),
-            self.column_device_memory_sizes.get(usize_index).copied(),
+            self.column_array_memory_sizes[usize_index],
+            self.owner.column_retained_device_memory_size(usize_index),
         )
     }
 
@@ -382,7 +390,7 @@ impl Clone for CuDFTableView {
             inner: Arc::clone(&self.inner),
             owner: self.owner.clone(),
             num_rows: self.num_rows,
-            column_device_memory_sizes: self.column_device_memory_sizes.clone(),
+            column_array_memory_sizes: self.column_array_memory_sizes.clone(),
         }
     }
 }
@@ -391,7 +399,7 @@ impl Clone for CuDFTableView {
 mod tests {
     use super::*;
     use crate::CuDFColumn;
-    use arrow::array::Int32Array;
+    use arrow::array::{Int32Array, StringArray};
 
     #[test]
     fn columns_from_composed_table_retain_exact_storage() -> Result<(), Box<dyn std::error::Error>>
@@ -417,6 +425,37 @@ mod tests {
             .downcast_ref::<Int32Array>()
             .ok_or("expected Int32Array")?;
         assert_eq!(host.values(), &[1, 2, 3]);
+        Ok(())
+    }
+
+    #[test]
+    fn cached_table_metadata_is_passive() -> Result<(), Box<dyn std::error::Error>> {
+        let column = CuDFColumn::try_from_arrow_host(&Int32Array::from(vec![1, 2, 3]))?;
+        let table = CuDFTableView::try_from_column_views(vec![column.into_view()])?;
+
+        crate::test_activity::reset();
+        assert_eq!(table.num_rows(), 3);
+        assert_eq!(table.num_columns(), 1);
+        assert!(!table.is_empty());
+        let column = table.column(0)?;
+        assert_eq!(column.len(), 3);
+        assert_eq!(crate::test_activity::accesses(), (0, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn table_columns_report_the_whole_retained_table() -> Result<(), Box<dyn std::error::Error>> {
+        let first = CuDFColumn::try_from_arrow_host(&StringArray::from(vec!["one", "two"]))?;
+        let first_array_bytes = first.device_memory_size();
+        let second = CuDFColumn::try_from_arrow_host(&StringArray::from(vec!["three", "four"]))?;
+        let table = crate::CuDFTable::try_from_columns(vec![first, second])?;
+        let retained_bytes = table.device_memory_size();
+        let view = table.into_view();
+        let column = view.column(0)?;
+
+        assert_eq!(column.get_array_memory_size()?, first_array_bytes);
+        assert_eq!(column.retained_device_memory_size(), retained_bytes);
+        assert_eq!(column.device_memory_size(), retained_bytes);
         Ok(())
     }
 }

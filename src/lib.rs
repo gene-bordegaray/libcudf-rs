@@ -18,32 +18,23 @@
 //! ```
 
 mod ast;
-mod binary_op;
 mod config;
 mod cudf_array;
 mod data_type;
 mod device_resource;
 mod errors;
-mod group_by;
-mod join;
+mod io;
 mod operations;
-mod pinned;
-mod sort;
 mod storage;
 mod stream;
+#[cfg(test)]
+mod test_activity;
 
 pub use ast::{CuDFAstExpression, CuDFAstNode, CuDFAstOperator, CuDFAstTableReference};
-pub use binary_op::{cudf_binary_op, CuDFBinaryOp};
 pub use cudf_array::*;
 pub use errors::{CuDFError, Result};
-pub use group_by::*;
-pub use join::{
-    cross_join, full_join, inner_join, left_anti_join, left_join, left_semi_join,
-    CuDFFilteredHashJoinArgs, CuDFHashJoin, CuDFNullEquality,
-};
-pub use operations::{apply_boolean_mask, cast, gather, gather_unchecked, slice_column};
-pub use pinned::{pin_record_batch, synchronize_default_stream, PinnedHostBuffer};
-pub use sort::{sort, sort_by_all, stable_sorted_order, SortOrder};
+pub use io::*;
+pub use operations::*;
 pub use storage::*;
 pub use stream::{CuDFStream, CuDFStreamFlags};
 
