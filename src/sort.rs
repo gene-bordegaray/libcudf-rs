@@ -55,7 +55,7 @@ impl SortOrder {
 /// ```no_run
 /// use libcudf_rs::{CuDFTable, SortOrder, sort};
 ///
-/// let table = CuDFTable::from_parquet("data.parquet")?;
+/// let table = CuDFTable::read_parquet("data.parquet")?;
 /// let view = table.into_view();
 ///
 /// // Sort by column 0 ascending, then column 2 descending as tiebreaker
@@ -97,12 +97,12 @@ pub fn sort(
                     )),
                 ))
             } else {
-                Ok(table.column(idx as i32))
+                table.column(idx as i32)
             }
         })
         .collect();
     let key_views = key_views?;
-    let keys_view = CuDFTableView::from_column_views(key_views)?;
+    let keys_view = CuDFTableView::try_from_column_views(key_views)?;
 
     let column_order_i32: Vec<i32> = sort_orders.iter().map(|&o| o.order() as i32).collect();
     let null_precedence_i32: Vec<i32> =
@@ -118,7 +118,7 @@ pub fn sort(
         stream_ref(&stream)?,
         resource_ref(&mr)?,
     )?;
-    Ok(CuDFTable::from_inner(inner))
+    CuDFTable::try_from_inner(inner)
 }
 
 /// Sort a table by all columns in lexicographic order
@@ -142,7 +142,7 @@ pub fn sort(
 /// ```no_run
 /// use libcudf_rs::{CuDFTable, SortOrder, sort_by_all};
 ///
-/// let table = CuDFTable::from_parquet("data.parquet")?;
+/// let table = CuDFTable::read_parquet("data.parquet")?;
 /// let view = table.into_view();
 ///
 /// // Sort by first column ascending (nulls last), second column descending (nulls first)
@@ -167,7 +167,7 @@ pub fn sort_by_all(
         stream_ref(&stream)?,
         resource_ref(&mr)?,
     )?;
-    Ok(CuDFTable::from_inner(inner))
+    CuDFTable::try_from_inner(inner)
 }
 
 /// Get the sorted order (indices) of a table
@@ -189,7 +189,7 @@ pub fn sort_by_all(
 /// ```no_run
 /// use libcudf_rs::{CuDFTable, SortOrder, stable_sorted_order};
 ///
-/// let table = CuDFTable::from_parquet("data.parquet")?;
+/// let table = CuDFTable::read_parquet("data.parquet")?;
 /// let view = table.into_view();
 ///
 /// let sort_orders = vec![SortOrder::AscendingNullsLast, SortOrder::DescendingNullsFirst];
@@ -213,7 +213,7 @@ pub fn stable_sorted_order(
         stream_ref(&stream)?,
         resource_ref(&mr)?,
     )?;
-    Ok(CuDFColumn::new(inner))
+    CuDFColumn::try_from_inner(inner)
 }
 
 #[cfg(test)]
@@ -225,7 +225,7 @@ mod tests {
     fn test_sort_ascending() -> Result<(), Box<dyn std::error::Error>> {
         let batch = record_batch!(("a", Int32, [3, 1, 4, 1, 5, 9, 2, 6]))?;
 
-        let table = CuDFTable::from_arrow_host(batch)?;
+        let table = CuDFTable::try_from_arrow_host(batch)?;
         let view = table.into_view();
 
         let sorted = sort(&view, &[0], &[SortOrder::AscendingNullsLast])?;
@@ -241,7 +241,7 @@ mod tests {
     fn test_sort_descending() -> Result<(), Box<dyn std::error::Error>> {
         let batch = record_batch!(("a", Int32, [3, 1, 4, 1, 5]))?;
 
-        let table = CuDFTable::from_arrow_host(batch)?;
+        let table = CuDFTable::try_from_arrow_host(batch)?;
         let view = table.into_view();
 
         let sorted = sort(&view, &[0], &[SortOrder::DescendingNullsLast])?;
@@ -260,7 +260,7 @@ mod tests {
             ("b", Int32, [10, 20, 30, 40, 50])
         )?;
 
-        let table = CuDFTable::from_arrow_host(batch)?;
+        let table = CuDFTable::try_from_arrow_host(batch)?;
         let view = table.into_view();
 
         // Sort by column A ascending, then column B ascending
@@ -288,7 +288,7 @@ mod tests {
             ("b", Int32, [10, 40, 30, 20, 50])
         )?;
 
-        let table = CuDFTable::from_arrow_host(batch)?;
+        let table = CuDFTable::try_from_arrow_host(batch)?;
         let view = table.into_view();
 
         // Sort by column A only - column B order should be preserved (stable sort)
@@ -312,7 +312,7 @@ mod tests {
             ("b", Int32, [10, 40, 30, 20, 50])
         )?;
 
-        let table = CuDFTable::from_arrow_host(batch)?;
+        let table = CuDFTable::try_from_arrow_host(batch)?;
         let view = table.into_view();
 
         // Sort by all columns

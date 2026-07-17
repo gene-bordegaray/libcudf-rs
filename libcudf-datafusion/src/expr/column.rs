@@ -14,11 +14,11 @@ pub struct CuDFColumnExpr {
 }
 
 impl CuDFColumnExpr {
-    pub fn from_host(inner: Column) -> Self {
+    pub fn from_datafusion(inner: Column) -> Self {
         Self { inner }
     }
 
-    pub(crate) fn host_column(&self) -> &Column {
+    pub(crate) fn datafusion_column(&self) -> &Column {
         &self.inner
     }
 }

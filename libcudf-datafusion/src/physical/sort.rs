@@ -30,8 +30,8 @@ pub struct CuDFSortExec {
 }
 
 impl CuDFSortExec {
-    pub fn try_new(inner: SortExec) -> Result<Self, DataFusionError> {
-        Ok(Self { inner })
+    pub fn new(inner: SortExec) -> Self {
+        Self { inner }
     }
 }
 
@@ -58,7 +58,7 @@ impl ExecutionPlan for CuDFSortExec {
         let inner = SortExec::new(self.inner.expr().clone(), children.swap_remove(0))
             .with_fetch(self.inner.fetch())
             .with_preserve_partitioning(self.inner.preserve_partitioning());
-        Ok(Arc::new(Self::try_new(inner)?))
+        Ok(Arc::new(Self::new(inner)))
     }
 
     fn execute(
@@ -128,7 +128,7 @@ impl Stream for CuDFSortStream {
         }
         match ready!(self.input.poll_next_unpin(cx)) {
             Some(Ok(batch)) => {
-                let view = CuDFTableView::from_record_batch(&batch).map_err(cudf_to_df)?;
+                let view = CuDFTableView::try_from_record_batch(&batch).map_err(cudf_to_df)?;
                 self.views.push(view);
                 cx.waker().wake_by_ref();
                 Poll::Pending
@@ -187,7 +187,7 @@ impl Stream for CuDFTopKStream {
 
         match ready!(self.input.poll_next_unpin(cx)) {
             Some(Ok(batch)) => {
-                let new_table = CuDFTableView::from_record_batch(&batch).map_err(cudf_to_df)?;
+                let new_table = CuDFTableView::try_from_record_batch(&batch).map_err(cudf_to_df)?;
 
                 let merged_table = if let Some(existing) = self.result.take() {
                     let views = vec![existing, new_table];
@@ -202,9 +202,10 @@ impl Stream for CuDFTopKStream {
                     let key_views = key_columns
                         .iter()
                         .map(|&i| merged_table.column(i as i32))
-                        .collect();
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(cudf_to_df)?;
                     let keys_view =
-                        CuDFTableView::from_column_views(key_views).map_err(cudf_to_df)?;
+                        CuDFTableView::try_from_column_views(key_views).map_err(cudf_to_df)?;
 
                     // Get sorted indices
                     let indices =

@@ -73,7 +73,7 @@ fn rescale_decimal(
             let array = scalar.to_arrow_host().map_err(cudf_to_df)?;
             let casted = arrow::compute::cast(array.as_ref(), &target_type)
                 .map_err(|err| DataFusionError::ArrowError(Box::new(err), None))?;
-            Ok(CuDFScalar::from_arrow_host(Scalar::new(casted))
+            Ok(CuDFScalar::try_from_arrow_host(Scalar::new(casted))
                 .map_err(cudf_to_df)?
                 .into())
         }

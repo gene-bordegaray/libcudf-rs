@@ -598,7 +598,7 @@ fn lower_literal_expr(
     ast: &mut CuDFAstExpression,
 ) -> Result<CuDFAstNode, DataFusionError> {
     let value = normalize_scalar_for_cudf(literal.value().clone())?;
-    let scalar = CuDFScalar::from_arrow_host(value.to_scalar()?).map_err(cudf_to_df)?;
+    let scalar = CuDFScalar::try_from_arrow_host(value.to_scalar()?).map_err(cudf_to_df)?;
     ast.literal(scalar).map_err(cudf_to_df)
 }
 
@@ -813,7 +813,7 @@ mod tests {
                 Arc::new(Int32Array::from(values)),
             ],
         )?;
-        Ok(CuDFTable::from_arrow_host(batch)?)
+        Ok(CuDFTable::try_from_arrow_host(batch)?)
     }
 
     fn make_nullable_table(
@@ -830,7 +830,7 @@ mod tests {
                 Arc::new(Int32Array::from(values)),
             ],
         )?;
-        Ok(CuDFTable::from_arrow_host(batch)?)
+        Ok(CuDFTable::try_from_arrow_host(batch)?)
     }
 
     fn filter_schema() -> Arc<Schema> {

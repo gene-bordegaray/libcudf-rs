@@ -188,7 +188,7 @@ fn filter_and_project(
         column_views.push(view.clone());
     }
 
-    let table_view = CuDFTableView::from_column_views(column_views).map_err(cudf_to_df)?;
+    let table_view = CuDFTableView::try_from_column_views(column_views).map_err(cudf_to_df)?;
 
     // Apply boolean mask using CuDF on GPU
     let filtered_table = apply_boolean_mask(&table_view, &bool_mask).map_err(cudf_to_df)?;
@@ -200,7 +200,7 @@ fn filter_and_project(
 
     let mut cudf_columns: Vec<Arc<dyn Array>> = Vec::with_capacity(num_cols);
     for i in 0..num_cols {
-        let col_view = table_view.column(i as i32);
+        let col_view = table_view.column(i as i32).map_err(cudf_to_df)?;
         cudf_columns.push(Arc::new(col_view));
     }
 

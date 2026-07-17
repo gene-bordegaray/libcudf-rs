@@ -20,8 +20,8 @@ use std::sync::Arc;
 /// for each group. Created with key columns and then used to perform
 /// multiple aggregations.
 pub struct CuDFGroupBy {
-    _ref: Option<Arc<dyn CuDFRef>>,
     inner: UniquePtr<ffi::GroupBy>,
+    _keepalive: Option<Arc<dyn CuDFRef>>,
 }
 
 impl CuDFGroupBy {
@@ -40,8 +40,8 @@ impl CuDFGroupBy {
             null_precedence,
         );
         Self {
-            _ref: Some(Arc::new(view)),
             inner,
+            _keepalive: Some(Arc::new(view)),
         }
     }
 
@@ -54,10 +54,10 @@ impl CuDFGroupBy {
     where
         I: IntoIterator<Item = AggregationRequest>,
     {
-        let mut _refs = Vec::new();
+        let mut keepalives = Vec::new();
         let mut requests_inner = aggregation_requests_create();
         for request in requests {
-            _refs.push(request._ref.clone());
+            keepalives.push(request.keepalive.clone());
             requests_inner.pin_mut().add(request.inner);
         }
 
@@ -67,7 +67,7 @@ impl CuDFGroupBy {
             self.inner
                 .aggregate(&requests_inner, stream_ref(&stream)?, resource_ref(&mr)?)?;
         let keys = gby_result.pin_mut().release_keys();
-        let keys = CuDFTable::from_ptr(keys);
+        let keys = CuDFTable::try_from_inner(keys)?;
 
         let mut results = Vec::with_capacity(gby_result.len());
         for i in 0..gby_result.len() {
@@ -75,7 +75,7 @@ impl CuDFGroupBy {
             let mut cols = Vec::with_capacity(released_result.len());
             for j in 0..released_result.len() {
                 let col = released_result.pin_mut().release(j);
-                cols.push(CuDFColumn::new(col));
+                cols.push(CuDFColumn::try_from_inner(col)?);
             }
 
             results.push(cols)
@@ -89,8 +89,8 @@ impl CuDFGroupBy {
 /// Specifies a column of values to aggregate and the aggregations to
 /// perform on it. Multiple aggregations can be added to a single request.
 pub struct AggregationRequest {
-    _ref: Option<Arc<dyn CuDFRef>>,
     inner: UniquePtr<ffi::AggregationRequest>,
+    keepalive: Option<Arc<dyn CuDFRef>>,
 }
 
 impl AggregationRequest {
@@ -101,8 +101,8 @@ impl AggregationRequest {
     pub fn from_column_view(view: CuDFColumnView) -> Self {
         let inner = aggregation_request_create(view.inner());
         Self {
-            _ref: Some(Arc::new(view)),
             inner,
+            keepalive: Some(Arc::new(view)),
         }
     }
 
@@ -125,7 +125,7 @@ pub struct GroupByAggregation {
 
 impl GroupByAggregation {
     /// Create a groupby aggregation from a cuDF aggregation pointer
-    pub fn new(inner: UniquePtr<ffi::GroupByAggregation>) -> Self {
+    pub(crate) fn from_inner(inner: UniquePtr<ffi::GroupByAggregation>) -> Self {
         Self { inner }
     }
 }
@@ -180,22 +180,24 @@ impl AggregationOp {
     pub fn group_by(&self) -> GroupByAggregation {
         use AggregationOp::*;
         match self {
-            SUM => GroupByAggregation::new(make_sum_aggregation_groupby()),
-            MIN => GroupByAggregation::new(make_min_aggregation_groupby()),
-            MAX => GroupByAggregation::new(make_max_aggregation_groupby()),
-            MEAN => GroupByAggregation::new(make_mean_aggregation_groupby()),
-            COUNT => {
-                GroupByAggregation::new(make_count_aggregation_groupby(NullPolicy::Exclude as i32))
-            }
-            COUNT_ALL => {
-                GroupByAggregation::new(make_count_aggregation_groupby(NullPolicy::Include as i32))
-            }
-            VARIANCE { ddof } => GroupByAggregation::new(make_variance_aggregation_groupby(*ddof)),
-            STD { ddof } => GroupByAggregation::new(make_std_aggregation_groupby(*ddof)),
-            NUNIQUE => GroupByAggregation::new(make_nunique_aggregation_groupby(
+            SUM => GroupByAggregation::from_inner(make_sum_aggregation_groupby()),
+            MIN => GroupByAggregation::from_inner(make_min_aggregation_groupby()),
+            MAX => GroupByAggregation::from_inner(make_max_aggregation_groupby()),
+            MEAN => GroupByAggregation::from_inner(make_mean_aggregation_groupby()),
+            COUNT => GroupByAggregation::from_inner(make_count_aggregation_groupby(
                 NullPolicy::Exclude as i32,
             )),
-            MEDIAN => GroupByAggregation::new(make_median_aggregation_groupby()),
+            COUNT_ALL => GroupByAggregation::from_inner(make_count_aggregation_groupby(
+                NullPolicy::Include as i32,
+            )),
+            VARIANCE { ddof } => {
+                GroupByAggregation::from_inner(make_variance_aggregation_groupby(*ddof))
+            }
+            STD { ddof } => GroupByAggregation::from_inner(make_std_aggregation_groupby(*ddof)),
+            NUNIQUE => GroupByAggregation::from_inner(make_nunique_aggregation_groupby(
+                NullPolicy::Exclude as i32,
+            )),
+            MEDIAN => GroupByAggregation::from_inner(make_median_aggregation_groupby()),
         }
     }
 }
@@ -316,10 +318,10 @@ mod tests {
         let values = Int32Array::from(vec![1, 2, 3, 10, 20]);
         let keys = Int32Array::from(vec![1, 1, 1, 2, 2]);
 
-        let values_col = CuDFColumn::from_arrow_host(&values)?;
+        let values_col = CuDFColumn::try_from_arrow_host(&values)?;
         let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int32, false)]));
         let keys_batch = RecordBatch::try_new(schema, vec![Arc::new(keys)])?;
-        let keys_table = CuDFTable::from_arrow_host(keys_batch)?;
+        let keys_table = CuDFTable::try_from_arrow_host(keys_batch)?;
         let groupby = CuDFGroupBy::from_table_view(keys_table.into_view());
 
         let mut request = AggregationRequest::from_column_view(values_col.into_view());
@@ -360,7 +362,7 @@ mod tests {
         )]));
         let keys_data = keys.to_data();
         let batch = RecordBatch::try_new(schema, vec![make_array(keys_data)])?;
-        CuDFTable::from_arrow_host(batch)
+        CuDFTable::try_from_arrow_host(batch)
     }
 
     fn run_single_group_agg<T: Array + Clone + 'static>(
@@ -370,7 +372,7 @@ mod tests {
         let n = values.len();
         let keys = Int32Array::from(vec![1; n]);
 
-        let values_col = CuDFColumn::from_arrow_host(values)?;
+        let values_col = CuDFColumn::try_from_arrow_host(values)?;
         let keys_table = make_keys_table(&keys)?;
         let groupby = CuDFGroupBy::from_table_view(keys_table.into_view());
 

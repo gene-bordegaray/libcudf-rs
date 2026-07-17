@@ -1,7 +1,4 @@
 #include "column.h"
-#include "cudf/null_mask.hpp"
-#include "cudf/types.hpp"
-#include <cuda_runtime_api.h>
 #include "data_type.h"
 #include "scalar.h"
 #include "libcudf-sys/src/lib.rs.h"
@@ -9,15 +6,10 @@
 #include <cinttypes>
 #include <cstdint>
 #include <cudf/column/column.hpp>
-#include <cudf/interop.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/unary.hpp>
-#include <cudf/strings/strings_column_view.hpp>
-#include <cudf/utilities/traits.hpp>
 
 #include <memory>
-#include <nanoarrow/nanoarrow.h>
-#include <nanoarrow/nanoarrow_device.h>
 
 
 namespace libcudf_bridge {
@@ -28,58 +20,35 @@ namespace libcudf_bridge {
     ColumnView::~ColumnView() = default;
 
     // Get number of elements
-    size_t ColumnView::size() const {
+    int32_t ColumnView::size() const {
         if (!inner) {
-            return 0;
+            throw std::runtime_error("Cannot get size of null column view");
         }
         return inner->size();
     }
 
-    // Get the column's data as an FFI Arrow Array
-    void ColumnView::to_arrow_array(
-        uint8_t *out_array_ptr,
-        const CudaStreamView &stream,
-        const DeviceAsyncResourceRef &mr) const {
-        if (!inner) {
-            throw std::runtime_error("Cannot convert null column view to arrow array");
-        }
-        auto device_array_unique = cudf::to_arrow_host(*this->inner, stream.inner, mr.inner);
-        auto *out_array = reinterpret_cast<ArrowDeviceArray*>(out_array_ptr);
-        *out_array = *device_array_unique.get();
-        device_array_unique.release();
-    }
-
     // Get the raw device pointer to the column view's data
-    [[nodiscard]] uint64_t ColumnView::data_ptr() const {
+    [[nodiscard]] uintptr_t ColumnView::head() const {
         if (!inner) {
-            return 0;
+            throw std::runtime_error("Cannot get data pointer of null column view");
         }
-        return reinterpret_cast<uint64_t>(inner->head());
+        return reinterpret_cast<uintptr_t>(inner->head());
     }
 
     // Get the data type of the column view
-    [[nodiscard]] std::unique_ptr<DataType> ColumnView::data_type() const {
+    [[nodiscard]] std::unique_ptr<DataType> ColumnView::type() const {
         if (!inner) {
             throw std::runtime_error("Cannot get data type of null column view");
         }
-        auto dtype = inner->type();
-        auto type_id = static_cast<int32_t>(dtype.id());
-
-        // Only pass scale for decimal types
-        if (dtype.id() == cudf::type_id::DECIMAL32 ||
-            dtype.id() == cudf::type_id::DECIMAL64 ||
-            dtype.id() == cudf::type_id::DECIMAL128) {
-            return std::make_unique<DataType>(type_id, dtype.scale());
-        }
-        return std::make_unique<DataType>(type_id);
+        return std::make_unique<DataType>(inner->type());
     }
 
-    // Clone this column view
-    [[nodiscard]] std::unique_ptr<ColumnView> ColumnView::clone() const {
-        auto cloned = std::make_unique<ColumnView>();
-        if (inner) {
-            cloned->inner = std::make_unique<cudf::column_view>(*inner);
+    std::unique_ptr<ColumnView> column_view_clone(const ColumnView& view) {
+        if (!view.inner) {
+            throw std::runtime_error("Cannot clone null column view");
         }
+        auto cloned = std::make_unique<ColumnView>();
+        cloned->inner = std::make_unique<cudf::column_view>(*view.inner);
         return cloned;
     }
 
@@ -93,96 +62,40 @@ namespace libcudf_bridge {
 
     // Returns how many nulls this column has
     [[nodiscard]] int32_t ColumnView::null_count() const {
-        if (inner) {
-            return inner->null_count();
-        }
-        return 0;
-    }
-
-    // Helper functions for memory size calculations
-    size_t calculate_buffer_memory_size(const cudf::column_view& view, const CudaStreamView& stream) {
-        size_t data_size = 0;
-        if (cudf::is_fixed_width(view.type())) {
-            data_size = cudf::size_of(view.type()) * view.size();
-        } else if (view.type().id() == cudf::type_id::STRING) {
-            auto const strings = cudf::strings_column_view(view);
-            data_size = ((view.size() + 1) * sizeof(cudf::size_type)) +
-                        static_cast<size_t>(strings.chars_size(stream.inner));
-        } else {
-            // For nested types recursively add child buffer sizes.
-            for (cudf::size_type i = 0; i < view.num_children(); ++i) {
-                data_size += calculate_buffer_memory_size(view.child(i), stream);
-            }
-        }
-
-        return data_size;
-    }
-
-    size_t calculate_null_mask_size(const cudf::column_view& view) {
-        size_t size = 0;
-
-        if (view.nullable()) {
-            size += cudf::bitmask_allocation_size_bytes(view.size());
-        }
-
-        for (cudf::size_type i = 0; i < view.num_children(); ++i) {
-            size += calculate_null_mask_size(view.child(i));
-        }
-
-        return size;
-    }
-
-    size_t calculate_array_memory_size(const cudf::column_view& view, const CudaStreamView& stream) {
-        return calculate_buffer_memory_size(view, stream) + calculate_null_mask_size(view);
-    }
-
-    // Get buffer memory size (data + offsets, no null mask)
-    [[nodiscard]] size_t ColumnView::get_buffer_memory_size(const CudaStreamView &stream) const {
         if (!inner) {
-            return 0;
+            throw std::runtime_error("Cannot get null count of null column view");
         }
-        return calculate_buffer_memory_size(*inner, stream);
+        return inner->null_count();
     }
 
-    // Get total array memory size (data + offsets + null mask + children)
-    [[nodiscard]] size_t ColumnView::get_array_memory_size(const CudaStreamView &stream) const {
+    [[nodiscard]] bool ColumnView::nullable() const {
         if (!inner) {
-            return 0;
+            throw std::runtime_error("Cannot inspect nullability of null column view");
         }
-        return calculate_array_memory_size(*inner, stream);
+        return inner->nullable();
     }
 
-    // Transfer the null buffer
-    [[nodiscard]] rust::Vec<uint8_t> ColumnView::get_null_buffer() const {
-        if (!inner || inner->null_count() == 0) {
-            return rust::Vec<uint8_t>();
+    [[nodiscard]] int32_t ColumnView::num_children() const {
+        if (!inner) {
+            throw std::runtime_error("Cannot inspect children of null column view");
         }
+        return inner->num_children();
+    }
 
-        const auto& view = *inner;
-
-        // Calculate null mask size
-        size_t mask_size = cudf::bitmask_allocation_size_bytes(view.size());
-
-        rust::Vec<uint8_t> host_buffer;
-        host_buffer.reserve(mask_size);
-
-        // Resize to actual size so cudaMemcpy has a valid destination
-        for (size_t i = 0; i < mask_size; ++i) {
-            host_buffer.push_back(0);
+    [[nodiscard]] std::unique_ptr<ColumnView> ColumnView::child(const int32_t index) const {
+        if (!inner) {
+            throw std::runtime_error("Cannot get child of null column view");
         }
+        auto result = std::make_unique<ColumnView>();
+        result->inner = std::make_unique<cudf::column_view>(inner->child(index));
+        return result;
+    }
 
-        cudaError_t err = cudaMemcpy(
-            host_buffer.data(),
-            view.null_mask(),
-            mask_size,
-            cudaMemcpyDeviceToHost
-        );
-
-        if (err != cudaSuccess) {
-            throw std::runtime_error(std::string("cudaMemcpy failed: ") + cudaGetErrorString(err));
+    [[nodiscard]] uintptr_t ColumnView::null_mask() const {
+        if (!inner) {
+            throw std::runtime_error("Cannot get null mask of null column view");
         }
-
-        return host_buffer;
+        return reinterpret_cast<uintptr_t>(inner->null_mask());
     }
 
     // Column implementation
@@ -192,9 +105,9 @@ namespace libcudf_bridge {
     Column::~Column() = default;
 
     // Get number of elements
-    size_t Column::size() const {
+    int32_t Column::size() const {
         if (!inner) {
-            return 0;
+            throw std::runtime_error("Cannot get size of null column");
         }
         return inner->size();
     }
@@ -210,20 +123,18 @@ namespace libcudf_bridge {
     }
 
     // Get the data type of the column
-    [[nodiscard]] std::unique_ptr<DataType> Column::data_type() const {
+    [[nodiscard]] std::unique_ptr<DataType> Column::type() const {
         if (!inner) {
             throw std::runtime_error("Cannot get data type of null column");
         }
-        auto dtype = inner->type();
-        auto type_id = static_cast<int32_t>(dtype.id());
+        return std::make_unique<DataType>(inner->type());
+    }
 
-        // Only pass scale for decimal types
-        if (dtype.id() == cudf::type_id::DECIMAL32 ||
-            dtype.id() == cudf::type_id::DECIMAL64 ||
-            dtype.id() == cudf::type_id::DECIMAL128) {
-            return std::make_unique<DataType>(type_id, dtype.scale());
+    size_t Column::alloc_size() const {
+        if (!inner) {
+            throw std::runtime_error("Cannot get allocation size of null column");
         }
-        return std::make_unique<DataType>(type_id);
+        return inner->alloc_size();
     }
 
     // Helper function to create Column from unique_ptr<cudf::column>
@@ -233,8 +144,37 @@ namespace libcudf_bridge {
         return c;
     }
 
+    std::unique_ptr<ColumnView> column_view_create(
+        const DataType& type,
+        int32_t size,
+        uintptr_t data,
+        uintptr_t null_mask,
+        int32_t null_count,
+        int32_t offset,
+        rust::Slice<const ColumnView *const> children) {
+        std::vector<cudf::column_view> child_views;
+        child_views.reserve(children.size());
+        for (const auto* child : children) {
+            if (child == nullptr || !child->inner) {
+                throw std::invalid_argument("Cannot construct a column view with a null child");
+            }
+            child_views.push_back(*child->inner);
+        }
+
+        auto result = std::make_unique<ColumnView>();
+        result->inner = std::make_unique<cudf::column_view>(
+            type.inner,
+            size,
+            reinterpret_cast<void const*>(data),
+            reinterpret_cast<cudf::bitmask_type const*>(null_mask),
+            null_count,
+            offset,
+            child_views);
+        return result;
+    }
+
     // Cast a column to a different data type
-    std::unique_ptr<Column> cast_column(
+    std::unique_ptr<Column> cast(
         const ColumnView &input,
         const DataType &target_type,
         const CudaStreamView &stream,
@@ -250,19 +190,16 @@ namespace libcudf_bridge {
     // Extract a scalar from a column at the specified index
     std::unique_ptr<Scalar> get_element(
         const ColumnView &column,
-        size_t index,
+        int32_t index,
         const CudaStreamView &stream,
         const DeviceAsyncResourceRef &mr) {
         if (!column.inner) {
             throw std::runtime_error("Cannot get element from null column view");
         }
-        if (index >= static_cast<size_t>(column.inner->size())) {
-            throw std::out_of_range("Index out of bounds for get_element");
-        }
         auto result = std::make_unique<Scalar>();
         result->inner = cudf::get_element(
             *column.inner,
-            static_cast<cudf::size_type>(index),
+            index,
             stream.inner,
             mr.inner);
         return result;

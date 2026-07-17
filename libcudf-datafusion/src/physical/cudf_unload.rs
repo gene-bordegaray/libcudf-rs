@@ -98,7 +98,7 @@ impl ExecutionPlan for CuDFUnloadExec {
                 Err(err) => return Err(err),
             };
 
-            let view = CuDFTableView::from_record_batch(&batch).map_err(cudf_to_df)?;
+            let view = CuDFTableView::try_from_record_batch(&batch).map_err(cudf_to_df)?;
             let host_batch = view.to_arrow_host().map_err(cudf_to_df)?;
             let num_rows = host_batch.num_rows();
             let columns = host_batch

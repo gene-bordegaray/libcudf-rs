@@ -14,16 +14,36 @@ use std::sync::Arc;
 ///
 /// This is a safe wrapper around cuDF's column type.
 pub struct CuDFColumn {
+    view: Arc<UniquePtr<ffi::ColumnView>>,
     pub(crate) inner: UniquePtr<libcudf_sys::ffi::Column>,
+    metadata: crate::column_view::ColumnViewMetadata,
 }
 
 impl CuDFColumn {
-    pub fn new(inner: UniquePtr<libcudf_sys::ffi::Column>) -> Self {
-        Self { inner }
+    pub(crate) fn try_from_inner(
+        inner: UniquePtr<libcudf_sys::ffi::Column>,
+    ) -> Result<Self, CuDFError> {
+        if inner.is_null() {
+            return Err(CuDFError::NullHandle("column"));
+        }
+        let device_memory_size = inner.alloc_size()?;
+        // `inner` is stored alongside the view and therefore outlives it.
+        let view = unsafe { inner.view() }?;
+        let metadata = crate::column_view::column_view_metadata(&view, Some(device_memory_size))?;
+        Ok(Self {
+            inner,
+            view: Arc::new(view),
+            metadata,
+        })
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.inner.size()
+        self.metadata.len()
+    }
+
+    /// Return the bytes allocated for this column in device memory.
+    pub fn device_memory_size(&self) -> usize {
+        self.metadata.device_memory_size()
     }
 
     /// Convert an Arrow array to a cuDF column
@@ -43,11 +63,11 @@ impl CuDFColumn {
     /// use libcudf_rs::CuDFColumn;
     ///
     /// let array = Int32Array::from(vec![1, 2, 3, 4, 5]);
-    /// let column = CuDFColumn::from_arrow_host(&array)?;
+    /// let column = CuDFColumn::try_from_arrow_host(&array)?;
     /// # Ok::<(), libcudf_rs::CuDFError>(())
     /// ```
-    pub fn from_arrow_host(array: &dyn Array) -> Result<Self, CuDFError> {
-        crate::config::ensure_pools_configured();
+    pub fn try_from_arrow_host(array: &dyn Array) -> Result<Self, CuDFError> {
+        crate::config::ensure_pools_configured()?;
         if arrow_type_to_cudf(array.data_type()).is_none() {
             return Err(CuDFError::ArrowError(ArrowError::NotYetImplemented(
                 format!("Arrow type {} not supported in CuDF", array.data_type()),
@@ -64,14 +84,14 @@ impl CuDFColumn {
         let stream = ffi::get_default_stream();
         let mr = ffi::get_current_device_resource_ref();
         let inner = unsafe {
-            ffi::column_from_arrow(
+            ffi::from_arrow_column(
                 schema_ptr,
                 array_ptr,
                 stream_ref(&stream)?,
                 resource_ref(&mr)?,
             )
         }?;
-        Ok(Self { inner })
+        Self::try_from_inner(inner)
     }
 
     /// Create a column by repeating a scalar value.
@@ -79,23 +99,24 @@ impl CuDFColumn {
     /// # Errors
     ///
     /// Returns an error if the column cannot be allocated on the GPU.
-    pub fn from_scalar(scalar: &CuDFScalar, len: usize) -> Result<Self, CuDFError> {
-        crate::config::ensure_pools_configured();
+    pub fn try_from_scalar(scalar: &CuDFScalar, len: usize) -> Result<Self, CuDFError> {
+        crate::config::ensure_pools_configured()?;
         let stream = ffi::get_default_stream();
         let mr = ffi::get_current_device_resource_ref();
-        Ok(Self::new(ffi::make_column_from_scalar(
+        Self::try_from_inner(ffi::make_column_from_scalar(
             scalar.inner(),
             len,
             stream_ref(&stream)?,
             resource_ref(&mr)?,
-        )?))
+        )?)
     }
 
     /// Return a [CuDFColumnView] pointing to this [CuDFColumn]. The current [CuDFColumn] will
     /// be kept alive at least until the [CuDFColumnView] is dropped.
     pub fn view(self: Arc<Self>) -> CuDFColumnView {
-        let view = self.inner.view();
-        CuDFColumnView::new_with_ref(view, Some(self))
+        let view = Arc::clone(&self.view);
+        let metadata = self.metadata.clone();
+        CuDFColumnView::from_shared_view(view, Some(self), metadata)
     }
 
     /// Consumes the current [CuDFColumn], returning a [CuDFColumnView] pointing to it.
@@ -105,22 +126,17 @@ impl CuDFColumn {
 
     /// Concatenate multiple [CuDFColumnView]s into a single [CuDFColumn].
     pub fn concat(views: Vec<CuDFColumnView>) -> Result<Self, CuDFError> {
-        // Keep the references alive until the concat_column_views operation has completed.
-        let mut _refs = Vec::with_capacity(views.len());
-        let views = views
-            .into_iter()
-            .map(|x| {
-                _refs.push(x._ref.clone());
-                x.into_inner()
-            })
-            .collect::<Vec<_>>();
+        let inner_views = views
+            .iter()
+            .map(CuDFColumnView::clone_inner)
+            .collect::<Result<Vec<_>, _>>()?;
         let stream = ffi::get_default_stream();
         let mr = ffi::get_current_device_resource_ref();
-        Ok(Self::new(libcudf_sys::ffi::concat_column_views(
-            &views,
+        Self::try_from_inner(libcudf_sys::ffi::concat_column_views(
+            &inner_views,
             stream_ref(&stream)?,
             resource_ref(&mr)?,
-        )?))
+        )?)
     }
 }
 
@@ -132,7 +148,7 @@ mod tests {
     #[test]
     fn test_column_from_arrow_int32() {
         let array = Int32Array::from(vec![1, 2, 3, 4, 5]);
-        let column = CuDFColumn::from_arrow_host(&array)
+        let column = CuDFColumn::try_from_arrow_host(&array)
             .expect("Failed to convert Arrow array to column")
             .into_view();
 
@@ -143,7 +159,7 @@ mod tests {
     #[test]
     fn test_column_from_arrow_string() {
         let array = StringArray::from(vec!["hello", "world", "test"]);
-        let column = CuDFColumn::from_arrow_host(&array)
+        let column = CuDFColumn::try_from_arrow_host(&array)
             .expect("Failed to convert Arrow array to column")
             .into_view();
 
@@ -154,7 +170,7 @@ mod tests {
     #[test]
     fn test_column_from_arrow_with_nulls() {
         let array = Int32Array::from(vec![Some(1), None, Some(3), None, Some(5)]);
-        let column = CuDFColumn::from_arrow_host(&array)
+        let column = CuDFColumn::try_from_arrow_host(&array)
             .expect("Failed to convert Arrow array to column")
             .into_view();
 
@@ -165,7 +181,7 @@ mod tests {
     #[test]
     fn test_to_arrow_host_int64() {
         let original = Int64Array::from(vec![100, 200, 300, 400, 500]);
-        let column = CuDFColumn::from_arrow_host(&original)
+        let column = CuDFColumn::try_from_arrow_host(&original)
             .expect("Failed to convert Arrow array to column")
             .into_view();
 
@@ -187,7 +203,7 @@ mod tests {
     #[test]
     fn test_to_arrow_host_float64() {
         let original = Float64Array::from(vec![1.5, 2.5, 3.5, 4.5, 5.5]);
-        let column = CuDFColumn::from_arrow_host(&original)
+        let column = CuDFColumn::try_from_arrow_host(&original)
             .expect("Failed to convert Arrow array to column")
             .into_view();
 
@@ -209,7 +225,7 @@ mod tests {
     #[test]
     fn test_to_arrow_host_string() {
         let original = StringArray::from(vec!["hello", "world", "test", "cudf", "rust"]);
-        let column = CuDFColumn::from_arrow_host(&original)
+        let column = CuDFColumn::try_from_arrow_host(&original)
             .expect("Failed to convert Arrow array to column")
             .into_view();
 
@@ -231,7 +247,7 @@ mod tests {
     #[test]
     fn test_to_arrow_host_with_nulls() {
         let original = Int32Array::from(vec![Some(1), None, Some(3), None, Some(5)]);
-        let column = CuDFColumn::from_arrow_host(&original)
+        let column = CuDFColumn::try_from_arrow_host(&original)
             .expect("Failed to convert Arrow array to column")
             .into_view();
 
@@ -262,7 +278,7 @@ mod tests {
     #[test]
     fn test_to_arrow_host_empty() {
         let original = Int32Array::from(Vec::<i32>::new());
-        let column = CuDFColumn::from_arrow_host(&original)
+        let column = CuDFColumn::try_from_arrow_host(&original)
             .expect("Failed to convert Arrow array to column")
             .into_view();
 
@@ -277,7 +293,7 @@ mod tests {
     #[test]
     fn test_to_arrow_host_roundtrip_preserves_data() {
         let original = Int32Array::from(vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100]);
-        let column = CuDFColumn::from_arrow_host(&original)
+        let column = CuDFColumn::try_from_arrow_host(&original)
             .expect("Failed to convert Arrow array to column")
             .into_view();
 

@@ -2,12 +2,7 @@
 #include "data_type.h"
 #include "libcudf-sys/src/lib.rs.h"
 
-#include <cudf/interop.hpp>
 #include <cudf/scalar/scalar.hpp>
-#include <cudf/column/column_factories.hpp>
-#include <cudf/types.hpp>
-#include <nanoarrow/nanoarrow.h>
-#include <nanoarrow/nanoarrow_device.h>
 #include <stdexcept>
 
 namespace libcudf_bridge {
@@ -17,144 +12,20 @@ namespace libcudf_bridge {
 
     Scalar::~Scalar() = default;
 
-    // Get the scalar's data as an FFI Arrow Array
-    void Scalar::to_arrow_array(
-        uint8_t *out_array_ptr,
-        const CudaStreamView &stream,
-        const DeviceAsyncResourceRef &mr) const {
-        if (!inner) {
-            throw std::runtime_error("Cannot convert null column view to arrow array");
-        }
-        std::unique_ptr<cudf::column> single_element_col =
-            cudf::make_column_from_scalar(*inner, 1, stream.inner, mr.inner);
-        auto device_array_unique = cudf::to_arrow_host(single_element_col->view(), stream.inner, mr.inner);
-        auto *out_array = reinterpret_cast<ArrowDeviceArray*>(out_array_ptr);
-        *out_array = *device_array_unique.get();
-        device_array_unique.release();
-    }
-
     // Check if the scalar is valid (not null)
-    bool Scalar::is_valid() const {
+    bool Scalar::is_valid(const CudaStreamView& stream) const {
         if (!inner) {
-            return false;
+            throw std::runtime_error("Cannot inspect validity of null scalar");
         }
-        return inner->is_valid();
+        return inner->is_valid(stream.inner);
     }
 
     // Get the data type of the scalar
-    [[nodiscard]] std::unique_ptr<DataType> Scalar::data_type() const {
-        auto dtype = inner->type();
-        auto type_id = static_cast<int32_t>(dtype.id());
-
-        // Only pass scale for decimal types
-        if (dtype.id() == cudf::type_id::DECIMAL32 ||
-            dtype.id() == cudf::type_id::DECIMAL64 ||
-            dtype.id() == cudf::type_id::DECIMAL128) {
-            return std::make_unique<DataType>(type_id, dtype.scale());
-        } else {
-            return std::make_unique<DataType>(type_id);
-        }
-    }
-
-    // Clone this scalar (deep copy)
-    [[nodiscard]] std::unique_ptr<Scalar> Scalar::clone() const {
-        auto cloned = std::make_unique<Scalar>();
-
+    [[nodiscard]] std::unique_ptr<DataType> Scalar::type() const {
         if (!inner) {
-            return cloned;
+            throw std::runtime_error("Cannot get data type of null scalar");
         }
-
-        // Get the scalar's type to determine which derived class to instantiate
-        auto dtype = inner->type();
-
-        // Create a new scalar of the same type using the polymorphic copy constructor
-        // We use a switch to dispatch to the correct derived type's copy constructor
-        switch (dtype.id()) {
-            case cudf::type_id::INT8:
-                cloned->inner = std::make_unique<cudf::numeric_scalar<int8_t>>(
-                    static_cast<cudf::numeric_scalar<int8_t> const&>(*inner));
-                break;
-            case cudf::type_id::INT16:
-                cloned->inner = std::make_unique<cudf::numeric_scalar<int16_t>>(
-                    static_cast<cudf::numeric_scalar<int16_t> const&>(*inner));
-                break;
-            case cudf::type_id::INT32:
-                cloned->inner = std::make_unique<cudf::numeric_scalar<int32_t>>(
-                    static_cast<cudf::numeric_scalar<int32_t> const&>(*inner));
-                break;
-            case cudf::type_id::INT64:
-                cloned->inner = std::make_unique<cudf::numeric_scalar<int64_t>>(
-                    static_cast<cudf::numeric_scalar<int64_t> const&>(*inner));
-                break;
-            case cudf::type_id::UINT8:
-                cloned->inner = std::make_unique<cudf::numeric_scalar<uint8_t>>(
-                    static_cast<cudf::numeric_scalar<uint8_t> const&>(*inner));
-                break;
-            case cudf::type_id::UINT16:
-                cloned->inner = std::make_unique<cudf::numeric_scalar<uint16_t>>(
-                    static_cast<cudf::numeric_scalar<uint16_t> const&>(*inner));
-                break;
-            case cudf::type_id::UINT32:
-                cloned->inner = std::make_unique<cudf::numeric_scalar<uint32_t>>(
-                    static_cast<cudf::numeric_scalar<uint32_t> const&>(*inner));
-                break;
-            case cudf::type_id::UINT64:
-                cloned->inner = std::make_unique<cudf::numeric_scalar<uint64_t>>(
-                    static_cast<cudf::numeric_scalar<uint64_t> const&>(*inner));
-                break;
-            case cudf::type_id::FLOAT32:
-                cloned->inner = std::make_unique<cudf::numeric_scalar<float>>(
-                    static_cast<cudf::numeric_scalar<float> const&>(*inner));
-                break;
-            case cudf::type_id::FLOAT64:
-                cloned->inner = std::make_unique<cudf::numeric_scalar<double>>(
-                    static_cast<cudf::numeric_scalar<double> const&>(*inner));
-                break;
-            case cudf::type_id::BOOL8:
-                cloned->inner = std::make_unique<cudf::numeric_scalar<bool>>(
-                    static_cast<cudf::numeric_scalar<bool> const&>(*inner));
-                break;
-            case cudf::type_id::STRING:
-                cloned->inner = std::make_unique<cudf::string_scalar>(
-                    static_cast<cudf::string_scalar const&>(*inner));
-                break;
-            case cudf::type_id::DECIMAL32:
-                cloned->inner = std::make_unique<cudf::fixed_point_scalar<numeric::decimal32>>(
-                    static_cast<cudf::fixed_point_scalar<numeric::decimal32> const&>(*inner));
-                break;
-            case cudf::type_id::DECIMAL64:
-                cloned->inner = std::make_unique<cudf::fixed_point_scalar<numeric::decimal64>>(
-                    static_cast<cudf::fixed_point_scalar<numeric::decimal64> const&>(*inner));
-                break;
-            case cudf::type_id::DECIMAL128:
-                cloned->inner = std::make_unique<cudf::fixed_point_scalar<numeric::decimal128>>(
-                    static_cast<cudf::fixed_point_scalar<numeric::decimal128> const&>(*inner));
-                break;
-            case cudf::type_id::TIMESTAMP_DAYS:
-                cloned->inner = std::make_unique<cudf::timestamp_scalar<cudf::timestamp_D>>(
-                    static_cast<cudf::timestamp_scalar<cudf::timestamp_D> const&>(*inner));
-                break;
-            case cudf::type_id::TIMESTAMP_SECONDS:
-                cloned->inner = std::make_unique<cudf::timestamp_scalar<cudf::timestamp_s>>(
-                    static_cast<cudf::timestamp_scalar<cudf::timestamp_s> const&>(*inner));
-                break;
-            case cudf::type_id::TIMESTAMP_MILLISECONDS:
-                cloned->inner = std::make_unique<cudf::timestamp_scalar<cudf::timestamp_ms>>(
-                    static_cast<cudf::timestamp_scalar<cudf::timestamp_ms> const&>(*inner));
-                break;
-            case cudf::type_id::TIMESTAMP_MICROSECONDS:
-                cloned->inner = std::make_unique<cudf::timestamp_scalar<cudf::timestamp_us>>(
-                    static_cast<cudf::timestamp_scalar<cudf::timestamp_us> const&>(*inner));
-                break;
-            case cudf::type_id::TIMESTAMP_NANOSECONDS:
-                cloned->inner = std::make_unique<cudf::timestamp_scalar<cudf::timestamp_ns>>(
-                    static_cast<cudf::timestamp_scalar<cudf::timestamp_ns> const&>(*inner));
-                break;
-            // Add more types as needed
-            default:
-                throw std::runtime_error("Unsupported scalar type for cloning");
-        }
-
-        return cloned;
+        return std::make_unique<DataType>(inner->type());
     }
+
 } // namespace libcudf_bridge

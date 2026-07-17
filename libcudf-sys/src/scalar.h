@@ -23,19 +23,11 @@ namespace libcudf_bridge {
 
         ~Scalar();
 
-        // Get the scalar's data as an FFI Arrow Array
-        void to_arrow_array(
-            uint8_t *out_array_ptr,
-            const CudaStreamView &stream,
-            const DeviceAsyncResourceRef &mr) const;
-
         // Check if the scalar is valid (not null)
-        [[nodiscard]] bool is_valid() const;
+        [[nodiscard]] bool is_valid(const CudaStreamView& stream) const;
 
         // Get the data type of the scalar
-        [[nodiscard]] std::unique_ptr<DataType> data_type() const;
+        [[nodiscard]] std::unique_ptr<DataType> type() const;
 
-        // Clone this scalar (deep copy)
-        [[nodiscard]] std::unique_ptr<Scalar> clone() const;
     };
 } // namespace libcudf_bridge

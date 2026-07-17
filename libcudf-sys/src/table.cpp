@@ -5,28 +5,56 @@
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 
-#include <nanoarrow/nanoarrow.h>
-#include <nanoarrow/nanoarrow_device.h>
-
-#include "cudf/interop.hpp"
 
 namespace libcudf_bridge {
+    std::unique_ptr<Table> create_empty_table() {
+        auto table = std::make_unique<Table>();
+        table->inner = std::make_unique<cudf::table>(
+            std::vector<std::unique_ptr<cudf::column>>{});
+        return table;
+    }
+
+    std::unique_ptr<Table> create_table_from_columns_move(
+        const rust::Slice<Column *const> columns) {
+        std::vector<std::unique_ptr<cudf::column>> cudf_columns;
+        cudf_columns.reserve(columns.size());
+        for (auto* column : columns) {
+            if (column == nullptr || !column->inner) {
+                throw std::invalid_argument("Cannot move a null column into a table");
+            }
+            cudf_columns.push_back(std::move(column->inner));
+        }
+
+        auto table = std::make_unique<Table>();
+        table->inner = std::make_unique<cudf::table>(std::move(cudf_columns));
+        return table;
+    }
+
+    ColumnRef::ColumnRef(const cudf::column& column) : inner(&column) {}
+
+    size_t ColumnRef::alloc_size() const {
+        if (!inner) {
+            throw std::runtime_error("Cannot get allocation size of null column reference");
+        }
+        return inner->alloc_size();
+    }
+
     // Table implementation
     Table::Table() : inner(nullptr) {
     }
 
     Table::~Table() = default;
 
-    size_t Table::num_columns() const {
+    int32_t Table::num_columns() const {
         if (!inner) {
-            return 0;
+            throw std::runtime_error("Cannot get column count of null table");
         }
         return inner->num_columns();
     }
 
-    size_t Table::num_rows() const {
+    int32_t Table::num_rows() const {
         if (!inner) {
-            return 0;
+            throw std::runtime_error("Cannot get row count of null table");
         }
         return inner->num_rows();
     }
@@ -40,7 +68,14 @@ namespace libcudf_bridge {
         return result;
     }
 
-    std::unique_ptr<ColumnVectorHelper> Table::release() const {
+    std::unique_ptr<ColumnRef> Table::get_column(const int32_t index) const {
+        if (!inner) {
+            throw std::runtime_error("Cannot get column from null table");
+        }
+        return std::make_unique<ColumnRef>(inner->get_column(index));
+    }
+
+    std::unique_ptr<ColumnVectorHelper> Table::release() {
         if (!inner) {
             throw std::runtime_error("Cannot release columns from null table");
         }
@@ -60,16 +95,16 @@ namespace libcudf_bridge {
 
     TableView::~TableView() = default;
 
-    size_t TableView::num_columns() const {
+    int32_t TableView::num_columns() const {
         if (!inner) {
-            return 0;
+            throw std::runtime_error("Cannot get column count of null table view");
         }
         return inner->num_columns();
     }
 
-    size_t TableView::num_rows() const {
+    int32_t TableView::num_rows() const {
         if (!inner) {
-            return 0;
+            throw std::runtime_error("Cannot get row count of null table view");
         }
         return inner->num_rows();
     }
@@ -81,9 +116,6 @@ namespace libcudf_bridge {
         std::vector<cudf::size_type> indices;
         indices.reserve(column_indices.size());
         for (const auto idx: column_indices) {
-            if (idx < 0 || idx >= inner->num_columns()) {
-                throw std::out_of_range("Column index out of bounds in select");
-            }
             indices.emplace_back(idx);
         }
 
@@ -96,45 +128,17 @@ namespace libcudf_bridge {
         if (!inner) {
             throw std::runtime_error("Cannot get column from null table view");
         }
-        if (index < 0 || index >= inner->num_columns()) {
-            throw std::out_of_range("Column index out of bounds");
-        }
         auto result = std::make_unique<ColumnView>();
         result->inner = std::make_unique<cudf::column_view>(inner->column(index));
         return result;
     }
 
-    void TableView::to_arrow_schema(uint8_t *out_schema_ptr) const {
-        if (!inner) {
-            throw std::runtime_error("Cannot convert null table view to arrow schema");
+    std::unique_ptr<TableView> table_view_clone(const TableView& view) {
+        if (!view.inner) {
+            throw std::runtime_error("Cannot clone null table view");
         }
-        std::vector<cudf::column_metadata> metadata(this->inner->num_columns());
-        auto schema_unique =
-                cudf::to_arrow_schema(*this->inner, cudf::host_span<cudf::column_metadata const>(metadata));
-        auto *out_schema = reinterpret_cast<ArrowSchema *>(out_schema_ptr);
-        *out_schema = *schema_unique.get();
-        schema_unique.release();
-    }
-
-    void TableView::to_arrow_array(
-        uint8_t *out_array_ptr,
-        const CudaStreamView &stream,
-        const DeviceAsyncResourceRef &mr) const {
-        if (!inner) {
-            throw std::runtime_error("Cannot convert null table view to arrow array");
-        }
-        auto device_array_unique = cudf::to_arrow_host(*this->inner, stream.inner, mr.inner);
-        auto *out_array = reinterpret_cast<ArrowArray *>(out_array_ptr);
-        // Extract just the ArrowArray from the ArrowDeviceArray
-        *out_array = device_array_unique->array;
-        device_array_unique.release();
-    }
-
-    [[nodiscard]] std::unique_ptr<TableView> TableView::clone() const {
         auto cloned = std::make_unique<TableView>();
-        if (inner) {
-            cloned->inner = std::make_unique<cudf::table_view>(*inner);
-        }
+        cloned->inner = std::make_unique<cudf::table_view>(*view.inner);
         return cloned;
     }
 
@@ -144,6 +148,9 @@ namespace libcudf_bridge {
         views.reserve(column_views.size());
 
         for (const auto *col_view_ptr: column_views) {
+            if (col_view_ptr == nullptr || !col_view_ptr->inner) {
+                throw std::invalid_argument("Cannot create a table view from a null column view");
+            }
             views.push_back(*col_view_ptr->inner);
         }
 

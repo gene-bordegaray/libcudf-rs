@@ -27,7 +27,7 @@ use std::sync::Arc;
 /// ```no_run
 /// use libcudf_rs::{CuDFTable, SortOrder, stable_sorted_order, gather};
 ///
-/// let table = CuDFTable::from_parquet("data.parquet")?;
+/// let table = CuDFTable::read_parquet("data.parquet")?;
 /// let view = table.into_view();
 ///
 /// // Get sorted indices
@@ -48,7 +48,7 @@ pub fn gather(table: &CuDFTableView, gather_map: &CuDFColumnView) -> Result<CuDF
         stream_ref(&stream)?,
         resource_ref(&mr)?,
     )?;
-    Ok(CuDFTable::from_inner(inner))
+    CuDFTable::try_from_inner(inner)
 }
 
 /// Filter a table using a boolean mask
@@ -81,11 +81,11 @@ pub fn gather(table: &CuDFTableView, gather_map: &CuDFColumnView) -> Result<CuDF
 /// let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
 /// let array = Int32Array::from(vec![1, 2, 3, 4, 5]);
 /// let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)])?;
-/// let table = CuDFTable::from_arrow_host(batch)?;
+/// let table = CuDFTable::try_from_arrow_host(batch)?;
 ///
 /// // Create a boolean mask
 /// let mask = BooleanArray::from(vec![true, false, true, false, true]);
-/// let mask_column = CuDFColumn::from_arrow_host(&mask)?;
+/// let mask_column = CuDFColumn::try_from_arrow_host(&mask)?;
 /// let mask_view = Arc::new(mask_column).view();
 ///
 /// // Filter the table
@@ -106,7 +106,7 @@ pub fn apply_boolean_mask(
         stream_ref(&stream)?,
         resource_ref(&mr)?,
     )?;
-    Ok(CuDFTable::from_inner(inner))
+    CuDFTable::try_from_inner(inner)
 }
 
 /// Create a sliced view of a column
@@ -134,7 +134,7 @@ pub fn apply_boolean_mask(
 /// use std::sync::Arc;
 ///
 /// let array = Int32Array::from(vec![1, 2, 3, 4, 5]);
-/// let column = CuDFColumn::from_arrow_host(&array)?;
+/// let column = CuDFColumn::try_from_arrow_host(&array)?;
 /// let column_view = Arc::new(column).view();
 ///
 /// // Get elements 1, 2, 3 (indices 1-3)
@@ -148,10 +148,7 @@ pub fn slice_column(
 ) -> Result<CuDFColumnView, CuDFError> {
     let stream = ffi::get_default_stream();
     let inner = ffi::slice_column(column.inner(), offset, length, stream_ref(&stream)?)?;
-    Ok(CuDFColumnView::new_with_ref(
-        inner,
-        Some(Arc::new(column.clone()) as Arc<dyn CuDFRef>),
-    ))
+    CuDFColumnView::try_from_inner(inner, Some(Arc::new(column.clone()) as Arc<dyn CuDFRef>))
 }
 
 /// Cast a column to a different data type on the GPU
@@ -179,13 +176,13 @@ pub fn cast(column: &CuDFColumnView, target_type: &DataType) -> Result<CuDFColum
     })?;
     let stream = ffi::get_default_stream();
     let mr = ffi::get_current_device_resource_ref();
-    let result = ffi::cast_column(
+    let result = ffi::cast(
         column.inner(),
         &cudf_dt,
         stream_ref(&stream)?,
         resource_ref(&mr)?,
     )?;
-    Ok(CuDFColumn::new(result))
+    CuDFColumn::try_from_inner(result)
 }
 
 #[cfg(test)]
@@ -196,7 +193,7 @@ mod tests {
     #[test]
     fn test_cast_int32_to_int64() -> Result<(), Box<dyn std::error::Error>> {
         let array = Int32Array::from(vec![1, 2, 3, 4, 5]);
-        let column = CuDFColumn::from_arrow_host(&array)?.into_view();
+        let column = CuDFColumn::try_from_arrow_host(&array)?.into_view();
 
         let casted = cast(&column, &DataType::Int64)?;
         let result = casted.into_view().to_arrow_host()?;
@@ -209,7 +206,7 @@ mod tests {
     #[test]
     fn test_cast_int32_to_float64() -> Result<(), Box<dyn std::error::Error>> {
         let array = Int32Array::from(vec![1, 2, 3]);
-        let column = CuDFColumn::from_arrow_host(&array)?.into_view();
+        let column = CuDFColumn::try_from_arrow_host(&array)?.into_view();
 
         let casted = cast(&column, &DataType::Float64)?;
         let result = casted.into_view().to_arrow_host()?;
@@ -222,7 +219,7 @@ mod tests {
     #[test]
     fn test_cast_float64_to_int64() -> Result<(), Box<dyn std::error::Error>> {
         let array = Float64Array::from(vec![1.9, 2.1, 3.5]);
-        let column = CuDFColumn::from_arrow_host(&array)?.into_view();
+        let column = CuDFColumn::try_from_arrow_host(&array)?.into_view();
 
         let casted = cast(&column, &DataType::Int64)?;
         let result = casted.into_view().to_arrow_host()?;
@@ -236,7 +233,7 @@ mod tests {
     #[test]
     fn test_cast_with_nulls() -> Result<(), Box<dyn std::error::Error>> {
         let array = Int32Array::from(vec![Some(1), None, Some(3), None, Some(5)]);
-        let column = CuDFColumn::from_arrow_host(&array)?.into_view();
+        let column = CuDFColumn::try_from_arrow_host(&array)?.into_view();
 
         let casted = cast(&column, &DataType::Int64)?;
         let view = casted.into_view();
@@ -258,7 +255,7 @@ mod tests {
     #[test]
     fn test_cast_int64_to_uint64() -> Result<(), Box<dyn std::error::Error>> {
         let array = Int64Array::from(vec![1, 2, 3]);
-        let column = CuDFColumn::from_arrow_host(&array)?.into_view();
+        let column = CuDFColumn::try_from_arrow_host(&array)?.into_view();
 
         let casted = cast(&column, &DataType::UInt64)?;
         let result = casted.into_view().to_arrow_host()?;
@@ -271,7 +268,7 @@ mod tests {
     #[test]
     fn test_cast_preserves_length() -> Result<(), Box<dyn std::error::Error>> {
         let array = Int32Array::from(vec![10, 20, 30, 40, 50]);
-        let column = CuDFColumn::from_arrow_host(&array)?.into_view();
+        let column = CuDFColumn::try_from_arrow_host(&array)?.into_view();
 
         let casted = cast(&column, &DataType::Float32)?;
         let view = casted.into_view();
@@ -282,7 +279,7 @@ mod tests {
     #[test]
     fn test_cast_unsupported_type_returns_error() -> Result<(), Box<dyn std::error::Error>> {
         let array = Int32Array::from(vec![1, 2, 3]);
-        let column = CuDFColumn::from_arrow_host(&array)?.into_view();
+        let column = CuDFColumn::try_from_arrow_host(&array)?.into_view();
 
         // Interval types are not supported by cuDF
         let result = cast(&column, &DataType::Null);

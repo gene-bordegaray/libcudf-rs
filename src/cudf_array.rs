@@ -39,7 +39,7 @@ impl From<CuDFScalar> for CuDFColumnViewOrScalar {
 /// let host_array = Int32Array::from(vec![1, 2, 3]);
 /// assert!(!is_cudf_array(&host_array));
 ///
-/// let gpu_array = CuDFColumn::from_arrow_host(&host_array)?.into_view();
+/// let gpu_array = CuDFColumn::try_from_arrow_host(&host_array)?.into_view();
 /// assert!(is_cudf_array(&gpu_array));
 /// # Ok::<(), libcudf_rs::CuDFError>(())
 /// ```
@@ -71,7 +71,7 @@ pub fn is_cudf_array(arr: &dyn Array) -> bool {
 /// assert!(!is_cudf_record_batch(&host_batch));
 ///
 /// // Create a GPU RecordBatch
-/// let gpu_array = CuDFColumn::from_arrow_host(&Int32Array::from(vec![1, 2, 3]))?.into_view();
+/// let gpu_array = CuDFColumn::try_from_arrow_host(&Int32Array::from(vec![1, 2, 3]))?.into_view();
 /// let gpu_batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(gpu_array)])?;
 /// assert!(is_cudf_record_batch(&gpu_batch));
 /// # Ok::<(), Box<dyn std::error::Error>>(())

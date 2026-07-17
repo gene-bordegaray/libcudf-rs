@@ -193,9 +193,7 @@ fn parquet_metadata_cached(
 
     let metadata = parquet_metadata(path)?;
     let _ = cache.set(Arc::clone(&metadata));
-    Ok(cache
-        .get()
-        .map_or(metadata, |metadata| Arc::clone(metadata)))
+    Ok(cache.get().map_or(metadata, Arc::clone))
 }
 
 fn parquet_columns_cached(
@@ -209,7 +207,7 @@ fn parquet_columns_cached(
     let metadata = source.metadata()?;
     let columns = Arc::new(parquet_columns(&metadata));
     let _ = cache.set(Arc::clone(&columns));
-    Ok(cache.get().map_or(columns, |columns| Arc::clone(columns)))
+    Ok(cache.get().map_or(columns, Arc::clone))
 }
 
 fn parquet_columns(metadata: &ParquetMetaData) -> HashSet<String> {

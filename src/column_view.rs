@@ -13,6 +13,30 @@ use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, OnceLock};
 
+const CUDF_NULL_MASK_PADDING: usize = 64;
+
+#[derive(Clone)]
+pub(crate) struct ColumnViewMetadata {
+    dt: DataType,
+    len: usize,
+    offset: usize,
+    null_count: usize,
+    nullable: bool,
+    buffer_memory_size: usize,
+    array_memory_size: usize,
+    device_memory_size: usize,
+}
+
+impl ColumnViewMetadata {
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(crate) fn device_memory_size(&self) -> usize {
+        self.device_memory_size
+    }
+}
+
 /// A view into a cuDF column stored in GPU memory
 ///
 /// This type wraps a cuDF column_view and implements Arrow's Array trait,
@@ -22,10 +46,10 @@ use std::sync::{Arc, OnceLock};
 /// column alive. It can be created from Arrow arrays (copying to GPU) or from
 /// existing cuDF columns.
 pub struct CuDFColumnView {
-    // Keep a ref to CuDF structs so that they live as long as this view exists
-    pub(crate) _ref: Option<Arc<dyn CuDFRef>>,
-    inner: UniquePtr<ffi::ColumnView>,
-    dt: DataType,
+    inner: Arc<UniquePtr<ffi::ColumnView>>,
+    // Keep cuDF owners alive until after the non-owning view is dropped.
+    pub(crate) keepalive: Option<Arc<dyn CuDFRef>>,
+    metadata: ColumnViewMetadata,
     null_buf: OnceLock<Option<NullBuffer>>,
 }
 
@@ -33,17 +57,36 @@ impl CuDFColumnView {
     /// Create a [CuDFColumnView] from a column view and optional table reference
     ///
     /// This is used internally to create column views that keep the source table or column alive
-    pub(crate) fn new_with_ref(
+    pub(crate) fn try_from_inner(
         inner: UniquePtr<ffi::ColumnView>,
-        _ref: Option<Arc<dyn CuDFRef>>,
+        keepalive: Option<Arc<dyn CuDFRef>>,
+    ) -> Result<Self, CuDFError> {
+        Self::try_from_inner_with_device_size(inner, keepalive, None)
+    }
+
+    pub(crate) fn try_from_inner_with_device_size(
+        inner: UniquePtr<ffi::ColumnView>,
+        keepalive: Option<Arc<dyn CuDFRef>>,
+        device_memory_size: Option<usize>,
+    ) -> Result<Self, CuDFError> {
+        let metadata = column_view_metadata(&inner, device_memory_size)?;
+        Ok(Self {
+            inner: Arc::new(inner),
+            keepalive,
+            metadata,
+            null_buf: OnceLock::new(),
+        })
+    }
+
+    pub(crate) fn from_shared_view(
+        inner: Arc<UniquePtr<ffi::ColumnView>>,
+        keepalive: Option<Arc<dyn CuDFRef>>,
+        metadata: ColumnViewMetadata,
     ) -> Self {
-        let cudf_dtype = inner.data_type();
-        let dt = cudf_type_to_arrow(&cudf_dtype);
-        let dt = dt.unwrap_or(DataType::Null);
         Self {
-            _ref,
             inner,
-            dt,
+            keepalive,
+            metadata,
             null_buf: OnceLock::new(),
         }
     }
@@ -52,19 +95,25 @@ impl CuDFColumnView {
         &self.inner
     }
 
-    /// Consume this wrapper and return the underlying cuDF column view
-    pub(crate) fn into_inner(self) -> UniquePtr<ffi::ColumnView> {
-        self.inner
+    pub(crate) fn clone_inner(&self) -> Result<UniquePtr<ffi::ColumnView>, CuDFError> {
+        let inner = self
+            .inner
+            .as_ref()
+            .as_ref()
+            .ok_or(CuDFError::NullHandle("column view"))?;
+        Ok(ffi::column_view_clone(inner)?)
     }
 
     /// Relabel this view's Arrow `DataType` without touching GPU memory.
     /// Used by [`record_batch_with_schema`](crate::record_batch_with_schema) to
     /// reconcile cuDF's max-precision decimals with declared schema types.
     pub fn with_data_type(self, dt: DataType) -> Self {
+        let mut metadata = self.metadata;
+        metadata.dt = dt;
         Self {
-            _ref: self._ref,
             inner: self.inner,
-            dt,
+            keepalive: self.keepalive,
+            metadata,
             null_buf: self.null_buf,
         }
     }
@@ -86,7 +135,7 @@ impl CuDFColumnView {
     /// use libcudf_rs::CuDFColumn;
     ///
     /// let array = Int32Array::from(vec![1, 2, 3, 4, 5]);
-    /// let column = CuDFColumn::from_arrow_host(&array)?.into_view();
+    /// let column = CuDFColumn::try_from_arrow_host(&array)?.into_view();
     /// // Do some GPU processing...
     /// let result = column.to_arrow_host()?;
     /// # Ok::<(), libcudf_rs::CuDFError>(())
@@ -104,8 +153,13 @@ impl CuDFColumnView {
                 &mut device_array as *mut libcudf_sys::ArrowDeviceArray as *mut u8;
             let stream = ffi::get_default_stream();
             let mr = ffi::get_current_device_resource_ref();
-            self.inner
-                .to_arrow_array(device_array_ptr, stream_ref(&stream)?, resource_ref(&mr)?);
+            ffi::to_arrow_host_column(
+                self.inner(),
+                device_array_ptr,
+                stream_ref(&stream)?,
+                resource_ref(&mr)?,
+            )?;
+            stream_ref(&stream)?.synchronize()?;
         }
 
         // Convert from FFI structures to Arrow ArrayData
@@ -118,25 +172,81 @@ impl CuDFColumnView {
 
     /// Return the device buffer memory used by this column view.
     pub fn get_buffer_memory_size(&self) -> Result<usize, CuDFError> {
-        let stream = ffi::get_default_stream();
-        Ok(self.inner().get_buffer_memory_size(stream_ref(&stream)?))
+        Ok(self.metadata.buffer_memory_size)
     }
 
     /// Return the total device memory used by this column view, including child buffers.
     pub fn get_array_memory_size(&self) -> Result<usize, CuDFError> {
+        Ok(self.metadata.array_memory_size)
+    }
+
+    /// Return the allocation retained by this view.
+    pub fn device_memory_size(&self) -> usize {
+        self.metadata.device_memory_size
+    }
+
+    /// Copy this view's physical null mask to host memory and cache it.
+    pub fn materialize_null_mask(&self) -> Result<(), CuDFError> {
+        if self.null_buf.get().is_some() {
+            return Ok(());
+        }
+        if self.metadata.null_count == 0 {
+            let _ = self.null_buf.set(None);
+            return Ok(());
+        }
         let stream = ffi::get_default_stream();
-        Ok(self.inner().get_array_memory_size(stream_ref(&stream)?))
+        stream_ref(&stream)?.synchronize()?;
+        let mask_bits = self
+            .metadata
+            .offset
+            .checked_add(self.metadata.len)
+            .ok_or_else(|| {
+                arrow_schema::ArrowError::ComputeError(
+                    "cuDF null-mask size overflowed usize".into(),
+                )
+            })?;
+        let mask_bits = i32::try_from(mask_bits).map_err(|_| {
+            arrow_schema::ArrowError::ComputeError(
+                "cuDF null-mask size exceeds cudf::size_type".into(),
+            )
+        })?;
+        let mask_size = ffi::bitmask_allocation_size_bytes(mask_bits, CUDF_NULL_MASK_PADDING);
+        let source = self.inner().null_mask()?;
+        if source == 0 {
+            return Err(CuDFError::NullHandle("column null mask"));
+        }
+        let mut null_bytes = vec![0; mask_size];
+        let status = unsafe {
+            ffi::cuda_memcpy(
+                null_bytes.as_mut_ptr() as usize,
+                source,
+                mask_size,
+                libcudf_sys::CUDA_MEMCPY_DEVICE_TO_HOST,
+            )
+        };
+        if status != libcudf_sys::CUDA_SUCCESS {
+            return Err(CuDFError::Cuda {
+                code: status,
+                message: ffi::cuda_get_error_string(status),
+            });
+        }
+        let buffer = Buffer::from_vec(null_bytes);
+        let nulls = NullBuffer::new(BooleanBuffer::new(
+            buffer,
+            self.metadata.offset,
+            self.metadata.len,
+        ));
+        let _ = self.null_buf.set(Some(nulls));
+        Ok(())
     }
 }
 
 impl Clone for CuDFColumnView {
     fn clone(&self) -> Self {
-        // Clone the view using the FFI clone method
-        let cloned_inner = self.inner.clone();
         Self {
-            _ref: self._ref.clone(),
-            inner: cloned_inner,
-            dt: self.dt.clone(),
+            inner: Arc::clone(&self.inner),
+            keepalive: self.keepalive.clone(),
+            metadata: self.metadata.clone(),
             null_buf: self.null_buf.clone(),
         }
     }
@@ -179,7 +289,7 @@ unsafe impl Array for CuDFColumnView {
     }
 
     fn data_type(&self) -> &DataType {
-        &self.dt
+        &self.metadata.dt
     }
 
     fn slice(&self, offset: usize, length: usize) -> ArrayRef {
@@ -187,42 +297,38 @@ unsafe impl Array for CuDFColumnView {
     }
 
     fn len(&self) -> usize {
-        self.inner.size()
+        self.metadata.len
     }
 
     fn is_empty(&self) -> bool {
-        self.inner.size() == 0
+        self.metadata.len == 0
     }
 
     fn offset(&self) -> usize {
-        self.inner.offset() as usize
+        self.metadata.offset
     }
 
     fn nulls(&self) -> Option<&NullBuffer> {
-        self.null_buf
-            .get_or_init(|| {
-                if self.null_count() == 0 {
-                    return None;
-                }
-                let null_bytes = self.inner().get_null_buffer();
-                let offset = self.inner().offset() as usize;
-                let length = self.inner().size();
-
-                let buffer = Buffer::from_vec(null_bytes);
-                let boolean_buffer = BooleanBuffer::new(buffer, offset, length);
-                Some(NullBuffer::new(boolean_buffer))
-            })
-            .as_ref()
+        if self.metadata.null_count == 0 {
+            return None;
+        }
+        if self.null_buf.get().is_none() {
+            debug_assert!(
+                false,
+                "CuDFColumnView::nulls(), implicit GPU->CPU copy detected. Call materialize_null_mask() explicitly."
+            );
+            self.materialize_null_mask()
+                .expect("failed to materialize cuDF null mask");
+        }
+        self.null_buf.get().and_then(Option::as_ref)
     }
 
     fn get_buffer_memory_size(&self) -> usize {
-        CuDFColumnView::get_buffer_memory_size(self)
-            .expect("failed to get cuDF column buffer memory size")
+        self.metadata.buffer_memory_size
     }
 
     fn get_array_memory_size(&self) -> usize {
-        CuDFColumnView::get_array_memory_size(self)
-            .expect("failed to get cuDF column array memory size")
+        self.metadata.array_memory_size
     }
 
     fn logical_nulls(&self) -> Option<NullBuffer> {
@@ -243,7 +349,7 @@ unsafe impl Array for CuDFColumnView {
     }
 
     fn null_count(&self) -> usize {
-        self.inner.null_count() as usize
+        self.metadata.null_count
     }
 
     fn logical_null_count(&self) -> usize {
@@ -253,9 +359,78 @@ unsafe impl Array for CuDFColumnView {
     }
 
     fn is_nullable(&self) -> bool {
-        // All cuDF columns can potentially have nulls
-        true
+        self.metadata.nullable
     }
+}
+
+pub(crate) fn column_view_metadata(
+    inner: &UniquePtr<ffi::ColumnView>,
+    device_memory_size: Option<usize>,
+) -> Result<ColumnViewMetadata, CuDFError> {
+    if inner.is_null() {
+        return Err(CuDFError::NullHandle("column view"));
+    }
+    let cudf_dtype = inner.data_type()?;
+    let dt = cudf_type_to_arrow(&cudf_dtype).unwrap_or(DataType::Null);
+    let len = crate::errors::cudf_size_to_usize(inner.size()?, "column-view size")?;
+    let offset = usize::try_from(inner.offset()?).map_err(|_| {
+        arrow_schema::ArrowError::ComputeError("cuDF column view has a negative offset".into())
+    })?;
+    let null_count = usize::try_from(inner.null_count()?).map_err(|_| {
+        arrow_schema::ArrowError::ComputeError("cuDF column view has a negative null count".into())
+    })?;
+    let nullable = inner.nullable()?;
+    let (mut buffer_memory_size, mut array_memory_size) = column_view_memory_sizes(inner)?;
+    let device_memory_size = device_memory_size.unwrap_or(array_memory_size);
+    if !ffi::is_fixed_width(&cudf_dtype) && device_memory_size > array_memory_size {
+        let null_mask_size = array_memory_size.saturating_sub(buffer_memory_size);
+        buffer_memory_size = device_memory_size.saturating_sub(null_mask_size);
+        array_memory_size = device_memory_size;
+    }
+    Ok(ColumnViewMetadata {
+        dt,
+        len,
+        offset,
+        null_count,
+        nullable,
+        buffer_memory_size,
+        array_memory_size,
+        device_memory_size,
+    })
+}
+
+pub(crate) fn column_view_memory_sizes(
+    inner: &UniquePtr<ffi::ColumnView>,
+) -> Result<(usize, usize), CuDFError> {
+    let Some(view) = inner.as_ref() else {
+        return Err(CuDFError::NullHandle("column view"));
+    };
+    let data_type = view.data_type()?;
+    let len = crate::errors::cudf_size_to_usize(view.size()?, "column-view size")?;
+    let mut buffer_size = if ffi::is_fixed_width(&data_type) {
+        ffi::size_of(&data_type)?.saturating_mul(len)
+    } else {
+        0
+    };
+    let mut array_size = buffer_size;
+    for index in 0..view.num_children()? {
+        let child = unsafe { view.child(index) }?;
+        let (child_buffer_size, child_array_size) = column_view_memory_sizes(&child)?;
+        buffer_size = buffer_size.saturating_add(child_buffer_size);
+        array_size = array_size.saturating_add(child_array_size);
+    }
+    if view.nullable()? {
+        let len = i32::try_from(len).map_err(|_| {
+            arrow_schema::ArrowError::ComputeError(
+                "cuDF column size exceeds cudf::size_type".to_string(),
+            )
+        })?;
+        array_size = array_size.saturating_add(ffi::bitmask_allocation_size_bytes(
+            len,
+            CUDF_NULL_MASK_PADDING,
+        ));
+    }
+    Ok((buffer_size, array_size))
 }
 
 #[cfg(test)]
@@ -267,7 +442,7 @@ mod tests {
     #[test]
     fn test_column_view_clone() -> Result<(), Box<dyn std::error::Error>> {
         let array = Int32Array::from(vec![1, 2, 3, 4, 5]);
-        let column = CuDFColumn::from_arrow_host(&array)
+        let column = CuDFColumn::try_from_arrow_host(&array)
             .expect("Failed to convert Arrow array to column")
             .into_view();
 
@@ -276,8 +451,8 @@ mod tests {
         assert_eq!(column.len(), 5);
         assert_eq!(cloned.len(), 5);
 
-        let original_ptr = column.inner.data_ptr();
-        let cloned_ptr = cloned.inner.data_ptr();
+        let original_ptr = column.inner.head()?;
+        let cloned_ptr = cloned.inner.head()?;
         assert_eq!(
             original_ptr, cloned_ptr,
             "Cloned view should point to the same GPU memory"
@@ -289,7 +464,7 @@ mod tests {
     #[test]
     fn test_string_column_view_memory_size() -> Result<(), Box<dyn std::error::Error>> {
         let array = StringArray::from(vec!["hello", "world", ""]);
-        let column = CuDFColumn::from_arrow_host(&array)?.into_view();
+        let column = CuDFColumn::try_from_arrow_host(&array)?.into_view();
 
         let size = column.get_array_memory_size()?;
         let min_offsets_and_chars =
@@ -302,7 +477,7 @@ mod tests {
     #[test]
     fn test_multiple_clones() -> Result<(), Box<dyn std::error::Error>> {
         let array = Int32Array::from(vec![10, 20, 30]);
-        let column = CuDFColumn::from_arrow_host(&array)
+        let column = CuDFColumn::try_from_arrow_host(&array)
             .expect("Failed to convert Arrow array to column")
             .into_view();
 
@@ -310,10 +485,10 @@ mod tests {
         let clone2 = column.clone();
         let clone3 = clone1.clone();
 
-        let ptr = column.inner.data_ptr();
-        assert_eq!(clone1.inner.data_ptr(), ptr);
-        assert_eq!(clone2.inner.data_ptr(), ptr);
-        assert_eq!(clone3.inner.data_ptr(), ptr);
+        let ptr = column.inner.head()?;
+        assert_eq!(clone1.inner.head()?, ptr);
+        assert_eq!(clone2.inner.head()?, ptr);
+        assert_eq!(clone3.inner.head()?, ptr);
 
         assert_eq!(column.len(), 3);
         assert_eq!(clone1.len(), 3);
@@ -321,7 +496,7 @@ mod tests {
         assert_eq!(clone3.len(), 3);
 
         drop(column);
-        assert_eq!(clone1.inner.data_ptr(), ptr);
+        assert_eq!(clone1.inner.head()?, ptr);
         assert_eq!(clone1.len(), 3);
 
         Ok(())
@@ -330,11 +505,11 @@ mod tests {
     #[test]
     fn test_column_data_is_on_gpu() -> Result<(), Box<dyn std::error::Error>> {
         let array = Int32Array::from(vec![1, 2, 3, 4, 5]);
-        let column = CuDFColumn::from_arrow_host(&array)
+        let column = CuDFColumn::try_from_arrow_host(&array)
             .expect("Failed to convert Arrow array to column")
             .into_view();
 
-        let ptr = column.inner.data_ptr();
+        let ptr = column.inner.head()?;
 
         assert_ne!(ptr, 0, "Column data pointer should not be null");
 
@@ -372,7 +547,7 @@ mod tests {
     #[test]
     fn test_get_buffer_memory_size_int32() -> Result<(), Box<dyn std::error::Error>> {
         let array = Int32Array::from(vec![1, 2, 3, 4, 5]);
-        let column = CuDFColumn::from_arrow_host(&array)
+        let column = CuDFColumn::try_from_arrow_host(&array)
             .expect("Failed to convert Arrow array to column")
             .into_view();
 
@@ -386,7 +561,7 @@ mod tests {
     fn test_get_buffer_memory_size_large() -> Result<(), Box<dyn std::error::Error>> {
         let data: Vec<i32> = (0..1_000_000).collect();
         let array = Int32Array::from(data);
-        let column = CuDFColumn::from_arrow_host(&array)
+        let column = CuDFColumn::try_from_arrow_host(&array)
             .expect("Failed to convert Arrow array to column")
             .into_view();
 
@@ -399,7 +574,7 @@ mod tests {
     #[test]
     fn test_get_array_memory_size_no_nulls() -> Result<(), Box<dyn std::error::Error>> {
         let array = Int32Array::from(vec![1, 2, 3, 4, 5]);
-        let column = CuDFColumn::from_arrow_host(&array)
+        let column = CuDFColumn::try_from_arrow_host(&array)
             .expect("Failed to convert Arrow array to column")
             .into_view();
 
@@ -418,7 +593,7 @@ mod tests {
     #[test]
     fn test_get_array_memory_size_with_nulls() -> Result<(), Box<dyn std::error::Error>> {
         let array = Int32Array::from(vec![Some(1), None, Some(3), None, Some(5)]);
-        let column = CuDFColumn::from_arrow_host(&array)
+        let column = CuDFColumn::try_from_arrow_host(&array)
             .expect("Failed to convert Arrow array to column")
             .into_view();
 
@@ -444,7 +619,7 @@ mod tests {
     #[test]
     fn test_nulls_no_nulls_returns_none() -> Result<(), Box<dyn std::error::Error>> {
         let array = Int32Array::from(vec![1, 2, 3, 4, 5]);
-        let column = CuDFColumn::from_arrow_host(&array)
+        let column = CuDFColumn::try_from_arrow_host(&array)
             .expect("Failed to convert Arrow array to column")
             .into_view();
 
@@ -457,10 +632,11 @@ mod tests {
     #[test]
     fn test_nulls_with_nulls_returns_buffer() -> Result<(), Box<dyn std::error::Error>> {
         let array = Int32Array::from(vec![Some(1), None, Some(3), None, Some(5)]);
-        let column = CuDFColumn::from_arrow_host(&array)
+        let column = CuDFColumn::try_from_arrow_host(&array)
             .expect("Failed to convert Arrow array to column")
             .into_view();
 
+        column.materialize_null_mask()?;
         let nulls = column.nulls();
         assert!(
             nulls.is_some(),
@@ -473,10 +649,11 @@ mod tests {
     #[test]
     fn test_nulls_correct_bit_pattern() -> Result<(), Box<dyn std::error::Error>> {
         let array = Int32Array::from(vec![Some(10), None, Some(30), None, Some(50)]);
-        let column = CuDFColumn::from_arrow_host(&array)
+        let column = CuDFColumn::try_from_arrow_host(&array)
             .expect("Failed to convert Arrow array to column")
             .into_view();
 
+        column.materialize_null_mask()?;
         let nulls = column.nulls().expect("Should have null buffer");
         assert!(nulls.is_valid(0), "Element 0 should be valid (Some(10))");
         assert!(nulls.is_null(1), "Element 1 should be null");
@@ -490,10 +667,11 @@ mod tests {
     #[test]
     fn test_nulls_cached_same_reference() -> Result<(), Box<dyn std::error::Error>> {
         let array = Int32Array::from(vec![Some(1), None, Some(3)]);
-        let column = CuDFColumn::from_arrow_host(&array)
+        let column = CuDFColumn::try_from_arrow_host(&array)
             .expect("Failed to convert Arrow array to column")
             .into_view();
 
+        column.materialize_null_mask()?;
         let nulls1 = column.nulls();
         let nulls2 = column.nulls();
 
@@ -514,10 +692,11 @@ mod tests {
     #[test]
     fn test_is_null_uses_null_buffer() -> Result<(), Box<dyn std::error::Error>> {
         let array = Int32Array::from(vec![Some(1), None, Some(3), None, Some(5)]);
-        let column = CuDFColumn::from_arrow_host(&array)
+        let column = CuDFColumn::try_from_arrow_host(&array)
             .expect("Failed to convert Arrow array to column")
             .into_view();
 
+        column.materialize_null_mask()?;
         assert!(!column.is_null(0), "Index 0 should not be null");
         assert!(column.is_null(1), "Index 1 should be null");
         assert!(!column.is_null(2), "Index 2 should not be null");
@@ -530,10 +709,11 @@ mod tests {
     #[test]
     fn test_is_valid_inverse_of_is_null() -> Result<(), Box<dyn std::error::Error>> {
         let array = Int32Array::from(vec![Some(1), None, Some(3)]);
-        let column = CuDFColumn::from_arrow_host(&array)
+        let column = CuDFColumn::try_from_arrow_host(&array)
             .expect("Failed to convert Arrow array to column")
             .into_view();
 
+        column.materialize_null_mask()?;
         for i in 0..3 {
             assert_eq!(
                 column.is_valid(i),
@@ -549,10 +729,11 @@ mod tests {
     #[test]
     fn test_null_count_matches_null_buffer() -> Result<(), Box<dyn std::error::Error>> {
         let array = Int32Array::from(vec![Some(1), None, Some(3), None, Some(5), None]);
-        let column = CuDFColumn::from_arrow_host(&array)
+        let column = CuDFColumn::try_from_arrow_host(&array)
             .expect("Failed to convert Arrow array to column")
             .into_view();
 
+        column.materialize_null_mask()?;
         let null_count = column.null_count();
 
         // Should have 3 nulls (indices 1, 3, 5)
@@ -573,10 +754,11 @@ mod tests {
             .map(|i| if i % 2 == 0 { Some(i) } else { None })
             .collect();
         let array = Int32Array::from(data);
-        let column = CuDFColumn::from_arrow_host(&array)
+        let column = CuDFColumn::try_from_arrow_host(&array)
             .expect("Failed to convert Arrow array to column")
             .into_view();
 
+        column.materialize_null_mask()?;
         let nulls = column.nulls().expect("Should have null buffer");
 
         // Verify pattern: even indices valid, odd indices null
@@ -597,10 +779,11 @@ mod tests {
     fn test_logical_nulls_equals_physical_nulls() -> Result<(), Box<dyn std::error::Error>> {
         // For primitive types, logical_nulls should equal physical nulls
         let array = Int32Array::from(vec![Some(1), None, Some(3)]);
-        let column = CuDFColumn::from_arrow_host(&array)
+        let column = CuDFColumn::try_from_arrow_host(&array)
             .expect("Failed to convert Arrow array to column")
             .into_view();
 
+        column.materialize_null_mask()?;
         let physical = column.nulls();
         let logical = column.logical_nulls();
 

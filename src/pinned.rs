@@ -47,7 +47,7 @@ unsafe impl Sync for PinnedHostBuffer {}
 
 impl PinnedHostBuffer {
     /// Allocate `bytes` of pinned host memory from cuDF's pinned MR.
-    fn new(bytes: usize) -> Result<Self> {
+    fn try_new(bytes: usize) -> Result<Self> {
         let ptr = pinned_mr().allocate_sync(bytes)? as *mut u8;
         Ok(Self { ptr, bytes })
     }
@@ -88,7 +88,7 @@ pub fn synchronize_default_stream() -> Result<()> {
 /// Empty buffers are passed through unchanged because `cudaMallocHost(0)` is
 /// not portable and a zero-byte buffer has no data to DMA.
 pub fn pin_record_batch(batch: RecordBatch) -> Result<RecordBatch> {
-    ensure_pools_configured();
+    ensure_pools_configured()?;
     let schema = batch.schema();
     let arrays = batch
         .columns()
@@ -146,7 +146,7 @@ fn pin_buffer(buf: &Buffer) -> Result<Buffer> {
         return Ok(buf.clone());
     }
 
-    let pinned = Arc::new(PinnedHostBuffer::new(bytes)?);
+    let pinned = Arc::new(PinnedHostBuffer::try_new(bytes)?);
     let dst = pinned.as_ptr();
     // SAFETY: `pinned` was just allocated with at least `bytes` capacity,
     // `buf.as_ptr()` is valid for `bytes` reads, and the regions do not
@@ -170,7 +170,7 @@ mod tests {
 
     #[test]
     fn pinned_host_buffer_round_trip() -> Result<()> {
-        let buf = PinnedHostBuffer::new(64)?;
+        let buf = PinnedHostBuffer::try_new(64)?;
         // SAFETY: we own the allocation and it has 64 bytes of capacity.
         unsafe {
             let slice = std::slice::from_raw_parts_mut(buf.as_ptr(), 64);
@@ -226,7 +226,7 @@ mod tests {
     #[test]
     fn drop_during_unwinding_does_not_double_panic() {
         let result = std::panic::catch_unwind(|| {
-            let _buf = PinnedHostBuffer::new(1024).expect("alloc");
+            let _buf = PinnedHostBuffer::try_new(1024).expect("alloc");
             panic!("simulated user panic");
         });
         assert!(

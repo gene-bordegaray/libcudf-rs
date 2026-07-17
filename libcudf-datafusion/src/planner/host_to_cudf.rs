@@ -54,7 +54,7 @@ impl PhysicalOptimizerRule for HostToCuDFRule {
             }
 
             if let Some(node) = plan.as_any().downcast_ref::<SortExec>() {
-                cudf_node = Some(Arc::new(CuDFSortExec::try_new(node.clone())?));
+                cudf_node = Some(Arc::new(CuDFSortExec::new(node.clone())));
             }
 
             if let Some(node) = plan.as_any().downcast_ref::<HashJoinExec>() {
@@ -85,9 +85,9 @@ impl PhysicalOptimizerRule for HostToCuDFRule {
                     }
 
                     if let Some(cp) = child.as_any().downcast_ref::<CoalescePartitionsExec>() {
-                        new_children.push(Arc::new(CuDFLoadExec::try_new(Arc::clone(cp.input()))?));
+                        new_children.push(Arc::new(CuDFLoadExec::new(Arc::clone(cp.input()))));
                     } else {
-                        new_children.push(Arc::new(CuDFLoadExec::try_new(Arc::clone(child))?));
+                        new_children.push(Arc::new(CuDFLoadExec::new(Arc::clone(child))));
                     }
                     changed = true;
                     continue;

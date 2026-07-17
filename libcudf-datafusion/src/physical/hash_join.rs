@@ -179,7 +179,7 @@ impl CuDFHashJoinExec {
     }
 
     /// Extract fields from a DataFusion `HashJoinExec` and call `try_new`.
-    pub fn from_hash_join_exec(node: &HashJoinExec) -> Result<Self, DataFusionError> {
+    pub fn try_from_hash_join_exec(node: &HashJoinExec) -> Result<Self, DataFusionError> {
         Self::try_new(
             node.left().clone(),
             node.right().clone(),
@@ -601,9 +601,10 @@ impl StreamingJoinState {
             .as_ref()
             .expect("build side should be initialized before finalizing");
         let left_view = Arc::clone(&build.left).view();
-        let empty_right =
-            CuDFTable::from_arrow_host(RecordBatch::new_empty(Arc::clone(&self.plan.right_schema)))
-                .map_err(cudf_to_df)?;
+        let empty_right = CuDFTable::try_from_arrow_host(RecordBatch::new_empty(Arc::clone(
+            &self.plan.right_schema,
+        )))
+        .map_err(cudf_to_df)?;
         let right_view = empty_right.into_view();
 
         let result = {
@@ -730,7 +731,7 @@ fn split_join_projection(
 fn batches_to_table(batches: &[RecordBatch]) -> Result<CuDFTable, libcudf_rs::CuDFError> {
     let views: Vec<CuDFTableView> = batches
         .iter()
-        .map(CuDFTableView::from_record_batch)
+        .map(CuDFTableView::try_from_record_batch)
         .collect::<Result<_, _>>()?;
     CuDFTable::concat(views)
 }
@@ -769,7 +770,9 @@ pub fn try_as_cudf_hash_join(
         return Ok(None);
     }
 
-    Ok(Some(Arc::new(CuDFHashJoinExec::from_hash_join_exec(node)?)))
+    Ok(Some(Arc::new(CuDFHashJoinExec::try_from_hash_join_exec(
+        node,
+    )?)))
 }
 
 #[cfg(test)]
@@ -898,14 +901,16 @@ mod tests {
                 PartitionMode::CollectLeft => {
                     // CuDFLoadExec intentionally coalesces host input partitions into one GPU
                     // partition. CollectLeft tests use that production upload path.
-                    let left = Arc::new(CuDFLoadExec::try_new(Arc::new(TestMemoryExec::try_new(
+                    let left = Arc::new(CuDFLoadExec::new(Arc::new(TestMemoryExec::try_new(
                         &left_partitions,
                         left_schema,
                         None,
-                    )?))?);
-                    let right = Arc::new(CuDFLoadExec::try_new(Arc::new(
-                        TestMemoryExec::try_new(&right_partitions, right_schema, None)?,
-                    ))?);
+                    )?)));
+                    let right = Arc::new(CuDFLoadExec::new(Arc::new(TestMemoryExec::try_new(
+                        &right_partitions,
+                        right_schema,
+                        None,
+                    )?)));
                     (left, right)
                 }
                 PartitionMode::Partitioned => {
@@ -1032,10 +1037,11 @@ mod tests {
         batch: RecordBatch,
         schema: SchemaRef,
     ) -> datafusion::common::Result<RecordBatch> {
-        let table = CuDFTable::from_arrow_host(batch).map_err(cudf_to_df)?;
+        let table = CuDFTable::try_from_arrow_host(batch).map_err(cudf_to_df)?;
         let num_rows = table.num_rows();
         let columns = table
             .into_columns()
+            .map_err(cudf_to_df)?
             .into_iter()
             .map(|column| Arc::new(column.into_view()) as Arc<dyn Array>)
             .collect();
@@ -1592,7 +1598,7 @@ mod tests {
             NullEquality::NullEqualsNothing,
             false,
         )?;
-        let cudf_inner = Arc::new(CuDFHashJoinExec::from_hash_join_exec(&inner_projected)?);
+        let cudf_inner = Arc::new(CuDFHashJoinExec::try_from_hash_join_exec(&inner_projected)?);
 
         // DataFusion validates on-key columns when replacing children, so this
         // fails before the GPU conversion gets another chance to run.

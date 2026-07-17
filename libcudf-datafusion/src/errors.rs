@@ -5,6 +5,8 @@ pub(crate) fn cudf_to_df(err: CuDFError) -> DataFusionError {
     match err {
         CuDFError::CuDFError(err) => DataFusionError::External(Box::new(err)),
         CuDFError::ArrowError(err) => DataFusionError::ArrowError(Box::new(err), None),
-        err @ CuDFError::NullHandle(_) => DataFusionError::External(Box::new(err)),
+        err @ (CuDFError::NullHandle(_) | CuDFError::Configuration(_) | CuDFError::Cuda { .. }) => {
+            DataFusionError::External(Box::new(err))
+        }
     }
 }

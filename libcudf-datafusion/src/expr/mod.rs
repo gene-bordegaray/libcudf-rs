@@ -48,13 +48,17 @@ pub(crate) fn expr_to_cudf_expr(
 ) -> Result<Arc<dyn PhysicalExpr>, DataFusionError> {
     let any = expr.as_any();
     if let Some(binary_op) = any.downcast_ref::<BinaryExpr>() {
-        return Ok(Arc::new(CuDFBinaryExpr::from_host(binary_op.clone())?));
+        return Ok(Arc::new(CuDFBinaryExpr::try_from_datafusion(
+            binary_op.clone(),
+        )?));
     };
     if let Some(column_expr) = any.downcast_ref::<Column>() {
-        return Ok(Arc::new(CuDFColumnExpr::from_host(column_expr.clone())));
+        return Ok(Arc::new(CuDFColumnExpr::from_datafusion(
+            column_expr.clone(),
+        )));
     };
     if let Some(literal) = any.downcast_ref::<Literal>() {
-        return Ok(Arc::new(CuDFLiteral::from_host(literal.clone())?));
+        return Ok(Arc::new(CuDFLiteral::try_from_datafusion(literal.clone())?));
     }
 
     not_impl_err!("Expression {expr} not supported in CuDF")

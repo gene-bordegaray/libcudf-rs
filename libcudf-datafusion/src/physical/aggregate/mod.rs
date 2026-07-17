@@ -238,7 +238,7 @@ impl ExecutionPlan for CuDFAggregateExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let cudf_cfg = CuDFConfig::from_config_options(context.session_config().options())?;
+        let cudf_cfg = CuDFConfig::try_get(context.session_config().options())?;
         let aggregate_chunk_target_bytes = cudf_cfg.aggregate_chunk_target_bytes;
         let input = self.input.execute(partition, context)?;
         let stream = stream::CuDFAggregateStream::new(
@@ -543,7 +543,7 @@ impl ExprKey {
         let column = if let Some(column) = expr.as_any().downcast_ref::<Column>() {
             column
         } else if let Some(column) = expr.as_any().downcast_ref::<CuDFColumnExpr>() {
-            column.host_column()
+            column.datafusion_column()
         } else {
             return Ok(None);
         };
@@ -738,7 +738,7 @@ mod test {
             schema.clone(),
             None,
         )?;
-        let load = CuDFLoadExec::try_new(Arc::new(root))?;
+        let load = CuDFLoadExec::new(Arc::new(root));
 
         let group_by = PhysicalGroupBy::new_single(vec![(col("c", &schema)?, "c".to_string())]);
 
@@ -782,7 +782,7 @@ mod test {
     ) -> Result<CuDFAggregateExec, Box<dyn Error>> {
         let schema = batch.schema();
         let root = TestMemoryExec::try_new(&[vec![batch]], Arc::clone(&schema), None)?;
-        let load = CuDFLoadExec::try_new(Arc::new(root))?;
+        let load = CuDFLoadExec::new(Arc::new(root));
         let group_by = PhysicalGroupBy::new_single(vec![(col("c", &schema)?, "c".to_string())]);
 
         Ok(CuDFAggregateExec::try_new(

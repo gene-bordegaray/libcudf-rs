@@ -312,7 +312,7 @@ impl CuDFAggregateStream {
 
         let _timer = self.group_by_metrics.emitting_time.timer();
         let num_rows = running.keys.num_rows();
-        let key_columns = running.keys.into_columns();
+        let key_columns = running.keys.into_columns().map_err(cudf_to_df)?;
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(self.output_schema.fields().len());
 
         for col in key_columns {
@@ -412,7 +412,7 @@ impl CuDFAggregateStream {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let table_view = CuDFTableView::from_column_views(column_views).map_err(cudf_to_df)?;
+        let table_view = CuDFTableView::try_from_column_views(column_views).map_err(cudf_to_df)?;
 
         Ok(CuDFGroupBy::from_table_view(table_view))
     }
@@ -434,7 +434,7 @@ impl CuDFAggregateStream {
                         if let Some(view) = arg.as_any().downcast_ref::<CuDFColumnView>() {
                             return Ok(view.clone());
                         }
-                        CuDFColumn::from_arrow_host(arg.as_ref())
+                        CuDFColumn::try_from_arrow_host(arg.as_ref())
                             .map(|col| col.into_view())
                             .map_err(cudf_to_df)
                     })

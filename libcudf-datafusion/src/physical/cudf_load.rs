@@ -31,18 +31,18 @@ pub struct CuDFLoadExec {
 }
 
 impl CuDFLoadExec {
-    pub fn try_new(input: Arc<dyn ExecutionPlan>) -> Result<Self, DataFusionError> {
+    pub fn new(input: Arc<dyn ExecutionPlan>) -> Self {
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(cudf_schema_compatibility_map(input.schema())),
             Partitioning::UnknownPartitioning(1),
             input.properties().emission_type,
             input.properties().boundedness,
         ));
-        Ok(Self {
+        Self {
             input,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
-        })
+        }
     }
 }
 
@@ -80,7 +80,7 @@ impl ExecutionPlan for CuDFLoadExec {
             );
         }
         let input = Arc::clone(&children[0]);
-        Ok(Arc::new(Self::try_new(input)?))
+        Ok(Arc::new(Self::new(input)))
     }
 
     fn execute(
@@ -91,7 +91,7 @@ impl ExecutionPlan for CuDFLoadExec {
         assert_eq_or_internal_err!(partition, 0, "CuDFLoadExec invalid partition {partition}");
 
         let input_partitions = self.input.output_partitioning().partition_count();
-        let cudf_cfg = CuDFConfig::from_config_options(context.session_config().options())?;
+        let cudf_cfg = CuDFConfig::try_get(context.session_config().options())?;
         let coalesce_target_rows = cudf_cfg.batch_size;
 
         // use a stream that allows each sender to put in at
@@ -199,11 +199,11 @@ impl CuDFRecordBatchReceiverStreamBuilder {
                     pin_timer.done();
 
                     let import_timer = ctx.metrics.import_time.timer();
-                    let table = CuDFTable::from_arrow_host(pinned_batch).map_err(cudf_to_df)?;
+                    let table = CuDFTable::try_from_arrow_host(pinned_batch).map_err(cudf_to_df)?;
                     import_timer.done();
 
                     let sync_timer = ctx.metrics.sync_time.timer();
-                    // Beware: `CuDFTable::from_arrow_host` internally uses the default stream.
+                    // Beware: `CuDFTable::try_from_arrow_host` internally uses the default stream.
                     // If we ever migrate that to a different stream, this call should 
                     // be updated to synchronize that stream.
                     synchronize_default_stream().map_err(cudf_to_df)?;
@@ -213,6 +213,7 @@ impl CuDFRecordBatchReceiverStreamBuilder {
                     let num_rows = table.num_rows();
                     let cudf_cols: Vec<Arc<dyn Array>> = table
                         .into_columns()
+                        .map_err(cudf_to_df)?
                         .into_iter()
                         .map(|c| Arc::new(c.into_view()) as Arc<dyn Array>)
                         .collect();

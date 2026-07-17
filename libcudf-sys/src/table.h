@@ -13,6 +13,16 @@ namespace libcudf_bridge {
     // Forward declaration
     struct ColumnVectorHelper;
 
+    // cxx cannot return `cudf::column const&` directly. This mechanical wrapper
+    // must not outlive the Table that owns the referenced column.
+    struct ColumnRef {
+        const cudf::column* inner;
+
+        explicit ColumnRef(const cudf::column& column);
+
+        [[nodiscard]] size_t alloc_size() const;
+    };
+
     // Opaque wrapper for cuDF table_view
     struct TableView {
         std::unique_ptr<cudf::table_view> inner;
@@ -22,10 +32,10 @@ namespace libcudf_bridge {
         ~TableView();
 
         // Get number of columns
-        [[nodiscard]] size_t num_columns() const;
+        [[nodiscard]] int32_t num_columns() const;
 
         // Get number of rows
-        [[nodiscard]] size_t num_rows() const;
+        [[nodiscard]] int32_t num_rows() const;
 
         // Select specific columns by indices
         [[nodiscard]] std::unique_ptr<TableView> select(rust::Slice<const int32_t> column_indices) const;
@@ -33,17 +43,6 @@ namespace libcudf_bridge {
         // Get column view at index
         [[nodiscard]] std::unique_ptr<ColumnView> column(int32_t index) const;
 
-        // Get the columns' data types as an FFI Arrow Schema
-        void to_arrow_schema(uint8_t *out_schema_ptr) const;
-
-        // Get the columns' data as an FFI Arrow Array
-        void to_arrow_array(
-            uint8_t *out_array_ptr,
-            const CudaStreamView &stream,
-            const DeviceAsyncResourceRef &mr) const;
-
-        // Clone this table view
-        [[nodiscard]] std::unique_ptr<TableView> clone() const;
     };
 
     // Opaque wrapper for cuDF table
@@ -55,15 +54,18 @@ namespace libcudf_bridge {
         ~Table();
 
         // Get number of columns
-        [[nodiscard]] size_t num_columns() const;
+        [[nodiscard]] int32_t num_columns() const;
 
         // Get number of rows
-        [[nodiscard]] size_t num_rows() const;
+        [[nodiscard]] int32_t num_rows() const;
 
         // Get a view of this table
         [[nodiscard]] std::unique_ptr<TableView> view() const;
 
-        [[nodiscard]] std::unique_ptr<ColumnVectorHelper> release() const;
+        // Get a const column reference at index
+        [[nodiscard]] std::unique_ptr<ColumnRef> get_column(int32_t index) const;
+
+        [[nodiscard]] std::unique_ptr<ColumnVectorHelper> release();
     };
 
     // Table factory functions
@@ -72,5 +74,7 @@ namespace libcudf_bridge {
     std::unique_ptr<Table> create_table_from_columns_move(rust::Slice<Column *const> columns);
 
     // TableView factory functions
+    std::unique_ptr<TableView> table_view_clone(const TableView& view);
+
     std::unique_ptr<TableView> create_table_view_from_column_views(rust::Slice<const ColumnView *const> column_views);
 } // namespace libcudf_bridge
